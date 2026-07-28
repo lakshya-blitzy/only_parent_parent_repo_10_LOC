@@ -1,0 +1,26 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+
+# Java build artifacts
+*.class
+classes/
+
+# Node build artifacts
+node_modules/
+
+# Local virtual environments (the provisioned venv lives outside the repo at
+# /opt/venvs/opprl10-py3.14.6, but ignore local ones so the tree stays clean)
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment overrides (only .env.example is committed)
+.env
+.env.local
+
+# Platform agent artifacts (screenshots / screen recordings)
+blitzy/

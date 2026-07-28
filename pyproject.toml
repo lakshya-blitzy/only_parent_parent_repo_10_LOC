@@ -1,0 +1,16 @@
+# Project metadata and runtime pin for the Python application (app.py).
+#
+# Deliberately dependency-free: every capability used by this repository
+# (http.server, json, datetime, os, sys, urllib, unittest, threading) comes
+# from the CPython standard library. Do not add dependencies here.
+[project]
+name = "only_parent_parent_repo_10_LOC"
+version = "1.1.0"
+description = "Multi-language sample repository exposing a uniform /health endpoint."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[tool.unittest]
+# Unit tests live as flat siblings at the repository root (test_app.py).
+# Run with: python -m unittest discover -s . -p "test_*.py" -v
