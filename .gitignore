@@ -1,24 +1,45 @@
-# Python build artifacts
-__pycache__/
-*.py[cod]
-*.pyc
-.pytest_cache/
+# ==============================================================================
+# .gitignore - build-artifact hygiene for this polyglot repository.
+# ==============================================================================
+# Every pattern below names an artifact that a build, an import or a test cycle
+# GENERATES. Nothing that is tracked - or that is meant to become tracked - is
+# listed here, and no broad catch-all (".env*", "*.json", "*.properties",
+# "build/") and no editor/OS block is used: an over-broad pattern would
+# silently drop a source file from the repository.
+#
+# Quality gate G8 requires the working tree to stay clean after a full
+# test-and-build cycle. It is checked with `git status --untracked-files=all`
+# AND a root directory listing; the listing is not redundant, because a
+# generated cache such as .pytest_cache/ writes its own nested .gitignore
+# containing "*", which can hide a stray directory from `git status` alone.
+# ==============================================================================
 
-# Java build artifacts
+# Python bytecode - written by `import app`, `py_compile` and `unittest`
+__pycache__/
+*.pyc
+
+# Java build output - `javac -d classes` writes classes/, plain `javac` writes
+# *.class beside the source (`java User.java` source-launch writes neither)
 *.class
 classes/
 
-# Node build artifacts
+# Node dependencies - this project is dependency-free, so nothing is installed
+# today; the pattern guarantees an installed tree could never be committed
 node_modules/
 
-# Local virtual environments (the provisioned venv lives outside the repo at
-# /opt/venvs/opprl10-py3.14.6, but ignore local ones so the tree stays clean)
+# Test cache - unittest is the runner here, so this is insurance for anyone
+# running pytest locally (see the nested-.gitignore note in the header)
+.pytest_cache/
+
+# Local virtual environments - the provisioned interpreter lives outside the
+# repository (/opt/venvs/opprl10-py3.14.6); ignore any locally created one
 .venv/
 venv/
 env/
 ENV/
 
-# Local environment overrides (only .env.example is committed)
+# Local environment overrides - real values are never committed. These are
+# exact names, so the committed reference file .env.example stays tracked.
 .env
 .env.local
 
