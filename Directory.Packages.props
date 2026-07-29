@@ -1,0 +1,28 @@
+<Project>
+
+  <!--
+    NuGet Central Package Management. Every PackageReference in this repository is declared
+    WITHOUT a Version attribute; the single authoritative version for each package lives here.
+
+    Note: CPM emits NU1507 when more than one NuGet source is configured, and NU1507 is fatal
+    under TreatWarningsAsErrors. This repository resolves against exactly one source
+    (nuget.org). If a second source is ever added, fix it with package source mapping -
+    never by relaxing the warning gate.
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <!--
+    Test-only dependencies. The production projects (Core and the three console apps) declare
+    zero PackageReference items and therefore carry no third-party surface.
+  -->
+  <ItemGroup>
+    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+
+</Project>

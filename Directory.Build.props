@@ -1,0 +1,37 @@
+<Project>
+
+  <!--
+    Single source of truth for target framework, language level, and build-quality policy for
+    EVERY project in this repository. No individual .csproj declares TargetFramework,
+    LangVersion, analyzer settings, or warning policy - all of it is inherited from here.
+    Retargeting the whole solution is therefore a one-line change.
+  -->
+  <PropertyGroup>
+    <!-- The ONLY TargetFramework declaration in the repository. -->
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!--
+    Quality gate: every compiler warning, code-analysis warning, and code-style violation
+    fails the build. Suppressions belong in .editorconfig (narrowly path-scoped and
+    commented), never in a project file.
+  -->
+  <PropertyGroup>
+    <AnalysisLevel>latest-Recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <CodeAnalysisTreatWarningsAsErrors>true</CodeAnalysisTreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- Reproducible builds; CI-specific source path mapping is enabled only on CI. -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+</Project>
