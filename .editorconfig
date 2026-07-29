@@ -1,0 +1,122 @@
+# EditorConfig is awesome: https://editorconfig.org
+# Conventions for this repository are enforced by tooling, not by convention alone.
+# EnforceCodeStyleInBuild=true in Directory.Build.props promotes the IDExxxx style rules
+# below into build diagnostics, and TreatWarningsAsErrors makes them fatal.
+root = true
+
+##########################################
+# All files
+##########################################
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+##########################################
+# Project system, MSBuild, and solution files
+##########################################
+[*.{csproj,props,targets,config,nuspec}]
+indent_size = 2
+
+[*.sln]
+indent_style = tab
+
+##########################################
+# Data / markup / docs
+##########################################
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.md]
+indent_size = 2
+# Markdown uses trailing double-space for hard line breaks.
+trim_trailing_whitespace = false
+
+[Dockerfile*]
+indent_size = 4
+
+[*.{sh,bash}]
+indent_size = 4
+
+##########################################
+# C# files
+##########################################
+[*.cs]
+indent_size = 4
+
+# --- using directives ---
+csharp_using_directive_placement = outside_namespace:warning
+dotnet_sort_system_directives_first = true
+dotnet_separate_import_directive_groups = false
+
+# --- namespaces ---
+csharp_style_namespace_declarations = file_scoped:warning
+
+# --- language keywords over BCL type names ---
+dotnet_style_predefined_type_for_locals_parameters_members = true:warning
+dotnet_style_predefined_type_for_member_access = true:warning
+
+# --- modifiers ---
+dotnet_style_require_accessibility_modifiers = for_non_interface_members:warning
+csharp_preferred_modifier_order = public,private,protected,internal,file,static,extern,new,virtual,abstract,sealed,override,readonly,unsafe,required,volatile,async:warning
+dotnet_style_readonly_field = true:warning
+
+# --- braces and blocks ---
+csharp_prefer_braces = true:warning
+csharp_new_line_before_open_brace = all
+csharp_new_line_before_else = true
+csharp_new_line_before_catch = true
+csharp_new_line_before_finally = true
+
+# --- expression-level preferences ---
+csharp_style_expression_bodied_methods = when_on_single_line:suggestion
+csharp_style_expression_bodied_properties = true:suggestion
+csharp_style_expression_bodied_accessors = true:suggestion
+dotnet_style_object_initializer = true:suggestion
+dotnet_style_collection_initializer = true:suggestion
+dotnet_style_prefer_auto_properties = true:warning
+csharp_prefer_simple_using_statement = true:suggestion
+csharp_style_prefer_primary_constructors = true:suggestion
+csharp_style_var_for_built_in_types = false:suggestion
+csharp_style_var_when_type_is_apparent = true:suggestion
+
+# --- null checking ---
+dotnet_style_coalesce_expression = true:warning
+dotnet_style_null_propagation = true:warning
+
+# --- unnecessary code ---
+dotnet_code_quality_unused_parameters = all:warning
+csharp_style_unused_value_expression_statement_preference = discard_variable:suggestion
+
+# --- naming: PascalCase for all public members (replaces the legacy snake_case /
+#     camelCase / default-package idioms of the ported sources) ---
+dotnet_naming_rule.public_members_pascal_case.severity = warning
+dotnet_naming_rule.public_members_pascal_case.symbols = public_symbols
+dotnet_naming_rule.public_members_pascal_case.style = pascal_case_style
+
+dotnet_naming_symbols.public_symbols.applicable_kinds = class,struct,interface,enum,property,method,event,delegate
+dotnet_naming_symbols.public_symbols.applicable_accessibilities = public,internal,protected,protected_internal
+
+dotnet_naming_style.pascal_case_style.capitalization = pascal_case
+
+dotnet_naming_rule.interfaces_start_with_i.severity = warning
+dotnet_naming_rule.interfaces_start_with_i.symbols = interface_symbols
+dotnet_naming_rule.interfaces_start_with_i.style = prefix_i_style
+
+dotnet_naming_symbols.interface_symbols.applicable_kinds = interface
+dotnet_naming_symbols.interface_symbols.applicable_accessibilities = *
+
+dotnet_naming_style.prefix_i_style.capitalization = pascal_case
+dotnet_naming_style.prefix_i_style.required_prefix = I
+
+##########################################
+# Test projects
+##########################################
+# CA1707 ("Identifiers should not contain underscores") collides with the universal xUnit
+# Method_Scenario_Expectation test-naming convention. The exemption is deliberately scoped to
+# the test tree only, so the zero-warning gate stays fully intact for production code.
+# This is done here rather than with a project-level <NoWarn> so it remains visible and narrow.
+[tests/**/*.cs]
+dotnet_diagnostic.CA1707.severity = none
