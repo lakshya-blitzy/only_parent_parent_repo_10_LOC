@@ -25,6 +25,38 @@
  * script expect; and HEAD is answered with 405, because the endpoint is
  * GET-only by design and no identified consumer issues a HEAD request.
  *
+ * Request validation is owned by this file rather than delegated to the
+ * runtime, because Node's default error paths emit responses that are off the
+ * frozen contract: a bare "400 Bad Request" with no body for anything the
+ * parser rejects, a chunked 400 carrying a `Date` header for a missing Host,
+ * and no response at all for CONNECT. Every one of those paths is intercepted
+ * here so that a client always receives the same three headers and the same
+ * JSON error shape the Python and Java implementations return:
+ *
+ *   400 Bad Request                    malformed request line, target or Host
+ *   404 Not Found                      any target other than the health route
+ *   405 Method Not Allowed             any method other than GET (+ Allow: GET)
+ *   414 URI Too Long                   request line >= 65536 bytes
+ *   431 Request Header Fields Too Large  header block, line or field cap exceeded
+ *   505 HTTP Version Not Supported     well-formed version with major != 1
+ *
+ * Node's HTTP parser (llhttp) is stricter than the hand-written parsers in
+ * app.py and User.java on three inputs, and more lenient on one. The
+ * divergences are accepted rather than papered over, because reconstructing a
+ * request the primary parser rejected would mean answering 200 on the strength
+ * of a second, unproven parser - a fail-open behaviour. Answering 400 is
+ * fail-closed, and every one of these responses is still on contract:
+ *
+ *   bare LF line endings      400 here, 200 in Python/Java. RFC 9112 section
+ *                             2.2 makes LF-only recognition a MAY, so both are
+ *                             conformant.
+ *   obs-fold continuation     400 here, 200 in Python/Java. RFC 9112 section
+ *                             5.2 names 400 as the preferred rejection.
+ *   invalid Content-Length    400 here for a GET; a non-GET still resolves to
+ *                             405 from the request line, matching the others.
+ *   >1 leading empty line     200 here, 400 in Python/Java. RFC 9112 section
+ *                             2.2 asks a server to ignore "at least one".
+ *
  * The module is dependency-free: everything below comes from the Node
  * standard library, so `node index.js` works on a bare runtime with no
  * install step, no node_modules directory and no lockfile.
@@ -199,14 +231,25 @@ function withLeadingSlash(value) {
 /**
  * Resolves the listener port from candidates given in precedence order.
  *
- * The value handed to server.listen must be a number, and it must be a valid
- * one: listening on NaN would silently bind an arbitrary ephemeral port, which
- * is far worse than reporting the bad value and using the documented default.
- * Each rejected candidate is named on stderr so the misconfiguration is
- * visible, and resolution then continues down the chain.
+ * The highest-precedence candidate that is present wins, and if that value is
+ * not a legal port the function throws rather than falling through to a lower
+ * one. Failing closed is the point: an operator who sets PORT=8O01 with a
+ * letter O has asked for a specific port, and quietly serving the default
+ * instead would leave a health probe pointed at nothing while the process
+ * reported itself up. Silently binding NaN - which listen() turns into an
+ * arbitrary ephemeral port - would be worse still.
+ *
+ * Parsing is a digit test rather than Number(), because Number("0x50") is 80:
+ * a hexadecimal typo would otherwise resolve to a real but unintended port.
+ * The accepted grammar is the same one Integer.parseInt and int() accept, so
+ * all three implementations reject the same values.
+ *
+ * Port 0 is legal: it is how a test binds an ephemeral port and reads the
+ * assignment back from the server.
  *
  * @param {Array<unknown>} candidates Values in precedence order.
  * @returns {number} A valid TCP port number.
+ * @throws {RangeError} When the winning candidate is not a port in 0-65535.
  */
 function resolvePort(candidates) {
   for (const candidate of candidates) {
@@ -214,11 +257,14 @@ function resolvePort(candidates) {
     if (value === undefined) {
       continue;
     }
-    const port = Number(value);
-    if (Number.isInteger(port) && port >= PORT_MIN && port <= PORT_MAX) {
-      return port;
+    if (!/^[+-]?\d+$/.test(value)) {
+      throw new RangeError(`invalid port ${JSON.stringify(value)}: expected an integer`);
     }
-    warn(`ignoring invalid port value ${JSON.stringify(value)}`);
+    const port = Number(value);
+    if (port < PORT_MIN || port > PORT_MAX) {
+      throw new RangeError(`invalid port ${port}: outside the range ${PORT_MIN}-${PORT_MAX}`);
+    }
+    return port;
   }
   return Number(DEFAULTS["node.port"]);
 }
@@ -282,6 +328,145 @@ const ALLOWED_METHODS = "GET";
  */
 const NOT_FOUND_BODY = JSON.stringify({ error: "Not Found" });
 const METHOD_NOT_ALLOWED_BODY = JSON.stringify({ error: "Method Not Allowed" });
+const BAD_REQUEST_BODY = JSON.stringify({ error: "Bad Request" });
+const URI_TOO_LONG_BODY = JSON.stringify({ error: "URI Too Long" });
+const HEADERS_TOO_LARGE_BODY = JSON.stringify({
+  error: "Request Header Fields Too Large",
+});
+const VERSION_NOT_SUPPORTED_BODY = JSON.stringify({
+  error: "HTTP Version Not Supported",
+});
+
+/* -------------------------------------------------------------------------- *
+ * Request validation - limits and grammar shared with app.py and User.java
+ * -------------------------------------------------------------------------- */
+
+/** Root path, and the value an empty target normalises to. */
+const ROOT_PATH = "/";
+
+/** Line terminator, and the version token every response status line carries. */
+const CRLF = "\r\n";
+const HTTP_VERSION_LINE = "HTTP/1.1";
+
+/** Separator that marks an absolute-form request target ("http://host/path"). */
+const SCHEME_SEPARATOR = "://";
+
+/**
+ * Size limits, identical to the constants in User.java and app.py so that a
+ * request at a boundary is answered with the same status by all three servers.
+ *
+ * A request line of exactly 65535 bytes is accepted (it is merely routed, and
+ * will normally 404); 65536 or more is 414. A single header line of 16384 bytes
+ * or more is 431, as is a header block above 16384 bytes in total or a field
+ * count above 100.
+ */
+const MAX_REQUEST_LINE_BYTES = 65536;
+const MAX_HEADER_LINE_BYTES = 16384;
+const MAX_HEADER_BLOCK_BYTES = 16384;
+const MAX_HEADER_FIELDS = 100;
+
+/**
+ * Parser buffer cap, set well above every limit above.
+ *
+ * The default (16 KiB) makes llhttp reject an over-long request line before the
+ * handler ever runs, which would answer 431 where the other two servers answer
+ * 414. Raising the cap lets an oversized-but-parseable request reach the
+ * handler, where the limits above classify it exactly as they do elsewhere. The
+ * largest request this policy can accept is a 65535-byte request line plus a
+ * 16384-byte header block, so 128 KiB leaves generous headroom while still
+ * bounding what a single connection may buffer.
+ */
+const MAX_HEADER_SIZE = 131072;
+
+/** Idle timeout for a persistent connection, matching the other two servers. */
+const KEEP_ALIVE_TIMEOUT_MS = 30000;
+
+/**
+ * Largest request body that is read and discarded before an answer is written.
+ *
+ * The endpoint never uses a request body, but it must still read one. A client
+ * that sends "POST /health" with a megabyte of content and "Connection: close"
+ * is still uploading when the 405 is ready, and answering-then-closing at that
+ * moment resets the connection: the client's send fails and the response it
+ * needed is lost. Draining first turns that reset into a readable answer.
+ *
+ * The drain is bounded so a declared body cannot occupy a connection
+ * indefinitely; past the bound the answer is written and the connection is
+ * retired, which is the same trade-off app.py and User.java make.
+ */
+const MAX_DRAIN_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Marker under which a decided-but-unwritten answer is parked on its socket.
+ *
+ * A request whose body is truncated reaches the handler first - so its answer is
+ * already known - and only then raises a parser error. Node delivers that error
+ * before the request stream reports the abort, so without this marker the error
+ * path would overwrite a correct 405 with a 400. Parking the answer lets the
+ * error path write what was already decided, which is what app.py and User.java
+ * do: they classify from the request line, and a truncated body does not change
+ * that classification.
+ */
+const PENDING_ANSWER = Symbol("pendingAnswer");
+
+/**
+ * Punctuation permitted in an RFC 9110 token, which is the grammar a method
+ * name must satisfy. A method built only from these characters and ALPHA/DIGIT
+ * is well formed but unsupported, so it earns 405; anything else is malformed
+ * and earns 400.
+ */
+const METHOD_TOKEN_SPECIALS = "!#$%&'*+-.^_`|~";
+
+/**
+ * A request target must be visible US-ASCII. Space terminates the target, and
+ * every other byte outside this range - control characters, TAB, and anything
+ * above 0x7E - makes the request line malformed.
+ */
+const TARGET_MIN_CHAR = 0x21;
+const TARGET_MAX_CHAR = 0x7e;
+
+/** A well-formed HTTP version token, captured so the major digit can be read. */
+const VERSION_PATTERN = /^HTTP\/(\d+)\.(\d+)$/;
+
+/**
+ * The version Node reports for a two-token request line ("GET /health"). That
+ * form is HTTP/0.9, which this policy rejects as malformed rather than
+ * unsupported, matching app.py and User.java.
+ */
+const HTTP_09_VERSION = "0.9";
+
+/**
+ * Reason phrases for the status codes written directly to a socket, where no
+ * ServerResponse object exists to supply one.
+ */
+const REASON_PHRASES = Object.freeze({
+  400: "Bad Request",
+  405: "Method Not Allowed",
+  414: "URI Too Long",
+  431: "Request Header Fields Too Large",
+  505: "HTTP Version Not Supported",
+});
+
+/** Response body for each status code written directly to a socket. */
+const ERROR_BODIES = Object.freeze({
+  400: BAD_REQUEST_BODY,
+  405: METHOD_NOT_ALLOWED_BODY,
+  414: URI_TOO_LONG_BODY,
+  431: HEADERS_TOO_LARGE_BODY,
+  505: VERSION_NOT_SUPPORTED_BODY,
+});
+
+/**
+ * The statuses that end the connection and announce it.
+ *
+ * These four say the byte stream itself could not be understood, so the parser
+ * cannot know where the next request would begin and reuse is unsafe. They are
+ * the only responses that carry a Connection header; 200, 404 and 405 never do,
+ * because a routing or method decision leaves the stream perfectly parseable.
+ * The split is by status code alone, so it is identical in all three languages
+ * regardless of which internal path produced the response.
+ */
+const CLOSING_STATUSES = Object.freeze([400, 414, 431, 505]);
 
 /**
  * Current UTC instant, truncated to whole seconds, with a trailing "Z".
@@ -345,28 +530,184 @@ function renderPayload(source) {
 }
 
 /**
+ * Reports whether a character is an ASCII letter.
+ *
+ * @param {string} character Single character.
+ * @returns {boolean} True for A-Z or a-z.
+ */
+function isAsciiLetter(character) {
+  return (character >= "A" && character <= "Z") || (character >= "a" && character <= "z");
+}
+
+/**
+ * Reports whether a character is an ASCII digit.
+ *
+ * @param {string} character Single character.
+ * @returns {boolean} True for 0-9.
+ */
+function isAsciiDigit(character) {
+  return character >= "0" && character <= "9";
+}
+
+/**
+ * Reports whether a string is a URI scheme: ALPHA followed by any number of
+ * ALPHA, DIGIT, "+", "-" or ".".
+ *
+ * Checking the scheme is what stops "//health" being mistaken for an
+ * absolute-form target: the text before the "://" must look like a scheme
+ * before any authority is stripped.
+ *
+ * @param {string} candidate Text before the "://" separator.
+ * @returns {boolean} True when the text is a syntactically valid scheme.
+ */
+function isScheme(candidate) {
+  if (candidate === "" || !isAsciiLetter(candidate.charAt(0))) {
+    return false;
+  }
+  for (let index = 1; index < candidate.length; index += 1) {
+    const current = candidate.charAt(index);
+    const allowed =
+      isAsciiLetter(current) ||
+      isAsciiDigit(current) ||
+      current === "+" ||
+      current === "-" ||
+      current === ".";
+    if (!allowed) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Reduces an absolute-form request target to its path.
+ *
+ * RFC 9112 permits "GET http://host/health HTTP/1.1" against an origin server,
+ * and a proxy-aware client may send exactly that. The authority is dropped so
+ * the path routes identically to the origin form. A target that is not
+ * absolute-form - including "//health", whose "" prefix is not a scheme - is
+ * returned unchanged.
+ *
+ * @param {string} target Raw request target.
+ * @returns {string} Target with any scheme and authority removed.
+ */
+function stripAuthority(target) {
+  const separator = target.indexOf(SCHEME_SEPARATOR);
+  if (separator <= 0 || !isScheme(target.slice(0, separator))) {
+    return target;
+  }
+  const authorityStart = separator + SCHEME_SEPARATOR.length;
+  const pathStart = target.indexOf("/", authorityStart);
+  return pathStart < 0 ? ROOT_PATH : target.slice(pathStart);
+}
+
+/**
  * Normalises a request target to a comparable path.
  *
- * Everything from the first "?" is dropped, so "/health?verbose=1" matches, and
- * exactly one trailing slash is removed when something is left in front of it,
- * so "/health/" matches while "/health//" deliberately does not. The function
- * is pure, which is what lets the tests assert its behaviour directly without
- * a server.
+ * The steps are, in order and identical to normalisePath in User.java and
+ * normalize_path in app.py: drop any scheme and authority, drop everything from
+ * the first "?", drop everything from the first "#", then remove exactly one
+ * trailing slash when something is left in front of it.
+ *
+ * What the function deliberately does NOT do matters as much as what it does.
+ * It performs no percent-decoding, so "/health%2f" stays distinct from
+ * "/health/"; it resolves no dot segments, so "/health/../health" does not
+ * reach the route; and it collapses no leading slashes, so "//health" and
+ * "///health" are distinct from "/health". Each of those transformations would
+ * widen the route to targets an operator did not configure.
+ *
+ * The function is pure, which is what lets the tests assert its behaviour
+ * directly without a server.
  *
  * @param {string} rawUrl Raw request target, e.g. req.url.
  * @returns {string} Normalised path, always starting with "/".
  */
 function normalizePath(rawUrl) {
-  const raw = typeof rawUrl === "string" && rawUrl !== "" ? rawUrl : "/";
-  const queryIndex = raw.indexOf("?");
-  const withoutQuery = queryIndex === -1 ? raw : raw.slice(0, queryIndex);
-  if (withoutQuery === "") {
-    return "/";
+  const raw = typeof rawUrl === "string" && rawUrl !== "" ? rawUrl : ROOT_PATH;
+  let path = stripAuthority(raw);
+  const queryIndex = path.indexOf("?");
+  if (queryIndex >= 0) {
+    path = path.slice(0, queryIndex);
   }
-  if (withoutQuery.length > 1 && withoutQuery.endsWith("/")) {
-    return withoutQuery.slice(0, -1);
+  const fragmentIndex = path.indexOf("#");
+  if (fragmentIndex >= 0) {
+    path = path.slice(0, fragmentIndex);
   }
-  return withoutQuery;
+  if (path.length > 1 && path.endsWith(ROOT_PATH)) {
+    path = path.slice(0, -1);
+  }
+  return path === "" ? ROOT_PATH : path;
+}
+
+/**
+ * Reports whether a method name is a well-formed RFC 9110 token.
+ *
+ * The distinction decides the status code: a token Node does not recognise
+ * ("FOO", or the lowercase "get") is a valid but unsupported method and earns
+ * 405 with an Allow header, while a non-token ("<script>alert(1)</script>") is
+ * a malformed request line and earns 400. Answering 405 to a non-token would
+ * imply the request was understood.
+ *
+ * @param {string} method Candidate method name.
+ * @returns {boolean} True when every character is tchar and the name is non-empty.
+ */
+function isMethodToken(method) {
+  if (typeof method !== "string" || method === "") {
+    return false;
+  }
+  for (const character of method) {
+    const allowed =
+      isAsciiLetter(character) ||
+      isAsciiDigit(character) ||
+      METHOD_TOKEN_SPECIALS.includes(character);
+    if (!allowed) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Reports whether a request target is non-empty visible US-ASCII.
+ *
+ * A target carrying a TAB, a control character or any byte above 0x7E is
+ * malformed: such a request line cannot be unambiguously delimited, and
+ * accepting it would let a caller smuggle a second line past the parser.
+ *
+ * @param {string} target Candidate request target.
+ * @returns {boolean} True when the target is safe to route.
+ */
+function isRequestTarget(target) {
+  if (typeof target !== "string" || target === "") {
+    return false;
+  }
+  for (let index = 0; index < target.length; index += 1) {
+    const code = target.charCodeAt(index);
+    if (code < TARGET_MIN_CHAR || code > TARGET_MAX_CHAR) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Strips control characters from text that is about to be written to stderr.
+ *
+ * Configuration values reach the startup banner, and a value carrying CR, LF or
+ * an escape sequence could forge a log line or drive a terminal escape. Each
+ * offending byte is replaced with "?" so the diagnostic stays one readable line.
+ *
+ * @param {string} text Text to sanitise.
+ * @returns {string} Text with every control character replaced.
+ */
+function sanitizeForLog(text) {
+  let sanitized = "";
+  const source = String(text);
+  for (let index = 0; index < source.length; index += 1) {
+    const code = source.charCodeAt(index);
+    sanitized += code < 0x20 || code === 0x7f ? "?" : source.charAt(index);
+  }
+  return sanitized;
 }
 
 /* -------------------------------------------------------------------------- *
@@ -377,9 +718,17 @@ function normalizePath(rawUrl) {
  * Writes a JSON response with exactly the contract headers.
  *
  * `sendDate` is switched off because Node would otherwise add a Date header
- * that neither the Python nor the Java implementation emits; suppressing it
- * gives the three implementations an identical header-name set. No Server
- * header is ever set, so the runtime version is not advertised.
+ * that neither the Python nor the Java implementation emits. `Connection` is
+ * removed for the same reason: Node adds `Connection: keep-alive` plus a
+ * `Keep-Alive` header on a persistent HTTP/1.1 response, which the other two
+ * servers do not, and removing it before writeHead() stops both from being
+ * computed. Persistence itself is unaffected - it is governed by the parser's
+ * own keep-alive decision, not by the header this function suppresses - so the
+ * connection is still reused across requests. No Server header is ever set, so
+ * the runtime version is not advertised.
+ *
+ * The result is the same three-header set in all three languages:
+ * Content-Type, Cache-Control and Content-Length, plus Allow on a 405.
  *
  * @param {import("node:http").ServerResponse} res Response to write.
  * @param {number} statusCode HTTP status code.
@@ -389,11 +738,17 @@ function normalizePath(rawUrl) {
  */
 function writeJson(res, statusCode, body, extraHeaders) {
   res.sendDate = false;
+  res.removeHeader("Connection");
   const headers = {
     "Content-Type": CONTENT_TYPE,
     "Cache-Control": CACHE_CONTROL,
     "Content-Length": Buffer.byteLength(body),
   };
+  if (CLOSING_STATUSES.includes(statusCode)) {
+    // Setting the header back is what makes Node end the connection after this
+    // response, which is the behaviour these four statuses require.
+    headers.Connection = "close";
+  }
   if (extraHeaders) {
     Object.assign(headers, extraHeaders);
   }
@@ -402,13 +757,260 @@ function writeJson(res, statusCode, body, extraHeaders) {
 }
 
 /**
+ * Writes a contract error response straight to a socket and closes it.
+ *
+ * Used on the paths where no ServerResponse exists: a request the parser
+ * rejected, and a CONNECT tunnel request. The status line, the three contract
+ * headers and the JSON body are identical to what writeJson would have
+ * produced, so a caller cannot tell which path answered it - including the
+ * Connection header, which is present for the four transport-error statuses and
+ * absent for 405, exactly as writeJson and the other two servers arrange it.
+ *
+ * The socket is always closed afterwards, whether or not the close was
+ * announced. A 405 raised from here follows a parser error, so the stream
+ * cannot be resumed even though the status alone does not say so; app.py and
+ * User.java likewise omit the header on a contract response that happens to be
+ * the connection's last.
+ *
+ * The function is safe to call on a socket that has already been answered or
+ * destroyed, which matters because a single malformed request can raise more
+ * than one parser error (a bad Transfer-Encoding, for instance, is reported
+ * after the response to that request has already been written).
+ *
+ * @param {import("node:net").Socket} socket Socket to answer.
+ * @param {number} statusCode One of the codes in REASON_PHRASES.
+ * @param {Record<string, string>} [extraHeaders] Additional headers, e.g. Allow.
+ * @returns {void}
+ */
+function writeTransportError(socket, statusCode, extraHeaders) {
+  if (!socket || socket.destroyed || !socket.writable) {
+    if (socket && !socket.destroyed) {
+      socket.destroy();
+    }
+    return;
+  }
+  const body = ERROR_BODIES[statusCode];
+  const lines = [
+    `${HTTP_VERSION_LINE} ${statusCode} ${REASON_PHRASES[statusCode]}`,
+    `Content-Type: ${CONTENT_TYPE}`,
+    `Cache-Control: ${CACHE_CONTROL}`,
+    `Content-Length: ${Buffer.byteLength(body)}`,
+  ];
+  if (CLOSING_STATUSES.includes(statusCode)) {
+    lines.push("Connection: close");
+  }
+  if (extraHeaders) {
+    for (const [name, value] of Object.entries(extraHeaders)) {
+      lines.push(`${name}: ${value}`);
+    }
+  }
+  try {
+    socket.end(`${lines.join(CRLF)}${CRLF}${CRLF}${body}`);
+  } catch {
+    // The peer vanished mid-write. There is nothing left to report to and
+    // nothing to clean up beyond the socket itself.
+    socket.destroy();
+  }
+}
+
+/**
+ * Reconstructs the byte length of the request line Node parsed.
+ *
+ * Node exposes the method, the raw target and the version separately rather
+ * than the line it read, but the line is exactly those three joined by single
+ * spaces, so the length is recoverable. It is needed because the 414 threshold
+ * is defined on the request line, and a request line of up to MAX_HEADER_SIZE
+ * bytes now reaches the handler rather than being rejected by the parser.
+ *
+ * @param {import("node:http").IncomingMessage} req Request to measure.
+ * @returns {number} Length in bytes of the request line, excluding CRLF.
+ */
+function requestLineLength(req) {
+  return (
+    Buffer.byteLength(req.method) +
+    1 +
+    Buffer.byteLength(req.url) +
+    1 +
+    Buffer.byteLength(`HTTP/${req.httpVersion}`)
+  );
+}
+
+/**
+ * Reports whether a request's header section exceeds any of the shared caps.
+ *
+ * Node's parser buffer is deliberately larger than every limit here, so the
+ * limits are enforced in this function instead. The block is measured the way
+ * the other two servers measure it - each field as "Name: Value" plus CRLF - so
+ * a request at a boundary is answered with the same status everywhere. A single
+ * over-long field is caught as well as an over-large total, because a 20 KiB
+ * value in one header would otherwise slip past a block check that only sums.
+ *
+ * @param {import("node:http").IncomingMessage} req Request to check.
+ * @returns {boolean} True when the request must be answered with 431.
+ */
+function headersTooLarge(req) {
+  const raw = req.rawHeaders;
+  if (raw.length / 2 > MAX_HEADER_FIELDS) {
+    return true;
+  }
+  let block = 0;
+  for (let index = 0; index < raw.length; index += 2) {
+    const text = Buffer.byteLength(raw[index]) + 2 + Buffer.byteLength(raw[index + 1]);
+    if (text >= MAX_HEADER_LINE_BYTES) {
+      return true;
+    }
+    block += text + CRLF.length;
+    if (block > MAX_HEADER_BLOCK_BYTES) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Reports whether a request declares a body that must be read before answering.
+ *
+ * A chunked request always has one. A Content-Length request has one unless the
+ * length is zero. Every other request - notably the GET this endpoint exists to
+ * serve - has none, and is answered without waiting for a stream event.
+ *
+ * @param {import("node:http").IncomingMessage} req Request to inspect.
+ * @returns {boolean} True when a body is declared.
+ */
+function hasRequestBody(req) {
+  if (req.headers["transfer-encoding"] !== undefined) {
+    return true;
+  }
+  const declared = req.headers["content-length"];
+  return declared !== undefined && declared !== "0";
+}
+
+/**
+ * Reads and discards a declared request body, then writes the response.
+ *
+ * The answer is decided before the drain starts, so a slow or oversized upload
+ * cannot change what the client is told - it only changes when the client is
+ * told it. Once the bound is reached the answer is written immediately and the
+ * connection is retired rather than reading further.
+ *
+ * @param {import("node:http").IncomingMessage} req Request being drained.
+ * @param {import("node:http").ServerResponse} res Response to write.
+ * @param {{status: number, body: string, headers?: Record<string, string>}} outcome
+ *   The already-decided answer.
+ * @returns {void}
+ */
+function drainThenRespond(req, res, outcome) {
+  const socket = req.socket;
+  let answered = false;
+  let drained = 0;
+  function respond() {
+    if (answered) {
+      return;
+    }
+    answered = true;
+    if (socket) {
+      socket[PENDING_ANSWER] = undefined;
+    }
+    if (res.writableEnded || !socket || socket.destroyed || !socket.writable) {
+      return;
+    }
+    writeJson(res, outcome.status, outcome.body, outcome.headers);
+  }
+  // Park the answer before the first drain event, so a parser error raised for a
+  // truncated body writes this answer instead of a generic 400.
+  if (socket) {
+    socket[PENDING_ANSWER] = respond;
+  }
+  req.on("data", (chunk) => {
+    drained += chunk.length;
+    if (drained > MAX_DRAIN_BYTES) {
+      respond();
+      socket.destroy();
+    }
+  });
+  req.on("end", respond);
+  // A client that vanished outright leaves nothing to answer: retire the parked
+  // answer so no later event writes to a dead socket.
+  const abandon = () => {
+    answered = true;
+    if (socket) {
+      socket[PENDING_ANSWER] = undefined;
+    }
+  };
+  req.on("aborted", abandon);
+  req.on("error", abandon);
+}
+
+/**
+ * Classifies a request line that Node's parser rejected.
+ *
+ * The parser error code alone is not enough. A header overflow must be decided
+ * from the code, because its raw packet is the mid-stream chunk that overflowed
+ * rather than the head of the request. Everything else is decided by re-reading
+ * the first line of the raw packet under the same grammar app.py and User.java
+ * apply, which is what lets an unsupported-but-valid method still earn 405 and
+ * a bad version still earn 505 instead of a blanket 400.
+ *
+ * HPE_INVALID_VERSION deserves particular care: Node raises it both for a
+ * malformed version token and for a request whose lines end in a bare LF, and
+ * in the second case the version token is perfectly well formed. The three arms
+ * below keep those apart - malformed token 400, well-formed non-1 major 505,
+ * well-formed 1.x (the bare-LF case) 400.
+ *
+ * @param {Error & {code?: string, rawPacket?: Buffer}} error Parser error.
+ * @returns {{status: number, headers?: Record<string, string>}} Response to send.
+ */
+function classifyParserError(error) {
+  const code = error && error.code;
+  if (code === "HPE_HEADER_OVERFLOW") {
+    return { status: 431 };
+  }
+  const raw = error && error.rawPacket ? error.rawPacket.toString("latin1") : "";
+  const lineEnd = raw.indexOf("\n");
+  const firstLine = (lineEnd < 0 ? raw : raw.slice(0, lineEnd)).replace(/\r$/, "");
+  if (Buffer.byteLength(firstLine) >= MAX_REQUEST_LINE_BYTES) {
+    return { status: 414 };
+  }
+  const parts = firstLine.split(" ");
+  if (parts.length !== 3) {
+    return { status: 400 };
+  }
+  const [method, target, version] = parts;
+  if (!isMethodToken(method) || !isRequestTarget(target)) {
+    return { status: 400 };
+  }
+  const versionMatch = VERSION_PATTERN.exec(version);
+  if (versionMatch === null) {
+    return { status: 400 };
+  }
+  if (Number(versionMatch[1]) !== 1) {
+    return { status: 505 };
+  }
+  if (method !== ALLOWED_METHODS) {
+    return { status: 405, headers: { Allow: ALLOWED_METHODS } };
+  }
+  // A well-formed GET/1.x line that the parser still rejected: bare LF
+  // terminators, an obs-fold continuation, or an unparseable Content-Length.
+  // The request is malformed even though its first line is not.
+  return { status: 400 };
+}
+
+/**
  * Creates the health server.
  *
- * Routing is deliberately explicit rather than table-driven: GET on the
- * configured path answers 200 with the payload, any other method answers 405
- * with an Allow header, and any other path answers 404. The configured path is
- * itself normalised once here, so a value written with a trailing slash still
- * matches the requests a client actually sends.
+ * Two parser options are set deliberately. `requireHostHeader: false` moves the
+ * missing-Host decision into this file: Node's own answer is a chunked 400 that
+ * carries a Date header, which is off the contract, so the check is made below
+ * instead. `maxHeaderSize` is raised above every size limit so an oversized but
+ * parseable request reaches the handler and is classified there rather than by
+ * the parser, which would report every overflow as 431 where the other two
+ * servers report 414 for an over-long request line.
+ *
+ * Validation order matches serveExchange in User.java and handle_one_request in
+ * app.py exactly, because the status a boundary request receives depends on it:
+ * request-line length, then request-line grammar, then version, then header
+ * limits, then Host, then method, then route. Host is checked before the method
+ * so a hostless POST answers 400 rather than 405.
  *
  * The server is returned rather than started, so the tests can drive it on an
  * ephemeral port (listen(0)) without competing for the configured one.
@@ -419,28 +1021,100 @@ function writeJson(res, statusCode, body, extraHeaders) {
 function createServer(config) {
   const resolved = config === undefined || config === null ? loadConfig() : config;
   const routePath = normalizePath(resolved.healthPath);
+  const options = { requireHostHeader: false, maxHeaderSize: MAX_HEADER_SIZE };
 
-  const server = http.createServer((req, res) => {
+  /**
+   * Decides the answer for one request without writing anything.
+   *
+   * The eight checks run in the same order as serveExchange in User.java and
+   * handle_one_request in app.py. The order is part of the contract: it decides
+   * which status a request that violates two rules at once receives.
+   *
+   * @param {import("node:http").IncomingMessage} req Request to classify.
+   * @returns {{status: number, body: string, headers?: Record<string, string>}}
+   */
+  const classify = (req) => {
+    if (requestLineLength(req) >= MAX_REQUEST_LINE_BYTES) {
+      return { status: 414, body: URI_TOO_LONG_BODY };
+    }
+    // Defence in depth: llhttp rejects a non-token method and a target carrying
+    // a control character before the handler runs, but a target byte above 0x7E
+    // can still arrive here, and the other two servers refuse it.
+    if (!isMethodToken(req.method) || !isRequestTarget(req.url)) {
+      return { status: 400, body: BAD_REQUEST_BODY };
+    }
+    // HTTP/0.9 has no version token at all, which this policy treats as a
+    // malformed request line; any other major version is understood but
+    // unsupported. Node reports 0.9 for a two-token request line, so the two
+    // cases are indistinguishable here and both resolve to 400.
+    if (req.httpVersion === HTTP_09_VERSION) {
+      return { status: 400, body: BAD_REQUEST_BODY };
+    }
+    if (req.httpVersionMajor !== 1) {
+      return { status: 505, body: VERSION_NOT_SUPPORTED_BODY };
+    }
+    if (headersTooLarge(req)) {
+      return { status: 431, body: HEADERS_TOO_LARGE_BODY };
+    }
+    // Host is mandatory from HTTP/1.1 onwards and optional in 1.0. It is
+    // checked before the method so a hostless POST answers 400, not 405.
+    if (req.httpVersionMinor >= 1 && req.headers.host === undefined) {
+      return { status: 400, body: BAD_REQUEST_BODY };
+    }
     if (req.method !== ALLOWED_METHODS) {
-      writeJson(res, 405, METHOD_NOT_ALLOWED_BODY, { Allow: ALLOWED_METHODS });
-      return;
+      return {
+        status: 405,
+        body: METHOD_NOT_ALLOWED_BODY,
+        headers: { Allow: ALLOWED_METHODS },
+      };
     }
     if (normalizePath(req.url) !== routePath) {
-      writeJson(res, 404, NOT_FOUND_BODY);
+      return { status: 404, body: NOT_FOUND_BODY };
+    }
+    return { status: 200, body: renderPayload(resolved) };
+  };
+
+  const server = http.createServer(options, (req, res) => {
+    const outcome = classify(req);
+    if (hasRequestBody(req)) {
+      drainThenRespond(req, res, outcome);
       return;
     }
-    writeJson(res, 200, renderPayload(resolved));
+    writeJson(res, outcome.status, outcome.body, outcome.headers);
   });
 
   // A malformed request line or header block never reaches the handler above.
-  // Answer with a bare 400 and close, echoing nothing back from the error.
+  // Answer on contract - same headers, same JSON shape - echoing nothing back
+  // from the error, so a caller learns no more from a rejected request than
+  // from an accepted one.
   server.on("clientError", (error, socket) => {
-    if ((error && error.code === "ECONNRESET") || !socket.writable) {
+    if (error && error.code === "ECONNRESET") {
       socket.destroy();
       return;
     }
-    socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    const pending = socket && socket[PENDING_ANSWER];
+    if (typeof pending === "function") {
+      // This request already reached the handler, so its answer is decided; the
+      // error concerns the body that followed, which cannot change it.
+      pending();
+      return;
+    }
+    const outcome = classifyParserError(error);
+    writeTransportError(socket, outcome.status, outcome.headers);
   });
+
+  // CONNECT never reaches the request handler: Node routes it to this event and
+  // closes the socket with no response at all when nothing is listening. The
+  // endpoint is GET-only, so the tunnel request is refused the same way any
+  // other unsupported method is.
+  server.on("connect", (req, socket) => {
+    writeTransportError(socket, 405, { Allow: ALLOWED_METHODS });
+  });
+
+  // Match the idle timeout the other two servers apply to a kept-alive socket,
+  // so a client that opens a connection and never speaks is reclaimed rather
+  // than holding a slot indefinitely.
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
 
   return server;
 }
@@ -459,6 +1133,16 @@ const SHUTDOWN_GRACE_MS = 1000;
  * are closed first; the unref'd fallback timer guarantees the process still
  * exits promptly if a socket refuses to go away, and being unref'd it never
  * holds the event loop open on its own.
+ *
+ * Termination convention. Because the shutdown completes normally, this process
+ * exits 0 for both SIGINT and SIGTERM. The other two implementations report
+ * their own runtime's convention for the same signals - app.py exits 0 on
+ * SIGINT and is terminated by SIGTERM (a shell reports 143), and the JVM in
+ * User.java reports 130 and 143 - so the exit STATUS is the one place these
+ * three servers deliberately differ. Everything an orchestrator depends on is
+ * identical: the listener is closed, the port is released, and stdout stays
+ * empty. Overriding a platform convention to align the numbers would buy
+ * nothing, so the difference is documented instead.
  *
  * @param {import("node:http").Server} server Server to close.
  * @returns {() => void} The shutdown handler, for symmetry and testability.
@@ -500,14 +1184,30 @@ function serve(options = {}) {
   const server = createServer(config);
 
   server.on("error", (error) => {
-    warn(`could not bind ${host}:${port} (${error.code || error.message})`);
+    // Almost always a port already in use. Report it as one readable line and
+    // fail closed: an orchestrator that cannot bind must not see a success code.
+    // The exit code is set rather than forced so the event loop drains and this
+    // diagnostic is flushed before the process goes away.
+    warn(
+      `cannot start the health server: could not bind ${sanitizeForLog(String(host))}:${port} ` +
+        `(${error.code || error.message})`,
+    );
     process.exitCode = 1;
   });
 
   server.listen(port, host, () => {
     const address = server.address();
     const boundPort = address && typeof address === "object" ? address.port : port;
-    warn(`health endpoint listening on http://${host}:${boundPort}${config.healthPath}`);
+    // Configured values reach this line, so control characters are stripped
+    // from them first: a health path carrying a CR and an LF would otherwise
+    // forge an extra startup line in whatever collects this process's stderr.
+    // The route printed is the NORMALISED one the listener actually answers on,
+    // not the raw configured string, so the banner cannot promise a route that
+    // does not exist.
+    const route = sanitizeForLog(normalizePath(config.healthPath));
+    warn(
+      `health endpoint listening on http://${sanitizeForLog(String(host))}:${boundPort}${route}`,
+    );
   });
 
   registerShutdown(server);
@@ -552,9 +1252,21 @@ const PROBE_TIMEOUT_MS = 2500;
  * @returns {Promise<number>} 0 when healthy, 1 otherwise.
  */
 function probe(options = {}) {
-  const config = options.config === undefined ? loadConfig(options) : options.config;
-  const host = probeHost(options.host === undefined ? config.host : options.host);
-  const port = options.port === undefined ? config.port : resolvePort([String(options.port)]);
+  let config;
+  let host;
+  let port;
+  try {
+    config = options.config === undefined ? loadConfig(options) : options.config;
+    host = probeHost(options.host === undefined ? config.host : options.host);
+    port = options.port === undefined ? config.port : resolvePort([String(options.port)]);
+  } catch (error) {
+    // A misconfigured port would otherwise produce an unparseable URL and be
+    // reported as "unreachable", sending an operator looking for a network
+    // fault instead of at the typo. Name the offending value and fail closed;
+    // the Python and Java probes both do exactly this.
+    warn(`probe cannot run: ${(error && error.message) || error}`);
+    return Promise.resolve(1);
+  }
   const timeout = options.timeout === undefined ? PROBE_TIMEOUT_MS : Number(options.timeout);
 
   return new Promise((resolve) => {
@@ -628,7 +1340,15 @@ function probe(options = {}) {
 if (require.main === module) {
   const args = process.argv.slice(2);
   if (args.includes("--serve")) {
-    serve();
+    try {
+      serve();
+    } catch (error) {
+      // A rejected port or an unreadable configuration is fatal: fail closed
+      // rather than serving a default nobody asked for. The exit code is set
+      // rather than forced so this line is flushed before the process ends.
+      warn(`cannot start the health server: ${(error && error.message) || error}`);
+      process.exitCode = 1;
+    }
   } else if (args.includes("--probe")) {
     probe()
       .then((code) => {
