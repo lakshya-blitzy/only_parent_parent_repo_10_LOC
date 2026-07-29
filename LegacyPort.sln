@@ -1,0 +1,59 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{35C2CA36-4D79-46B0-8592-69F223FE32AA}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Blitzy.LegacyPort.Core", "src\Blitzy.LegacyPort.Core\Blitzy.LegacyPort.Core.csproj", "{714C5696-1CDE-4CC0-8E15-23EE83194DC3}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Blitzy.LegacyPort.GreeterApp", "src\Blitzy.LegacyPort.GreeterApp\Blitzy.LegacyPort.GreeterApp.csproj", "{0B1E9322-8639-48B8-B079-F49235D9F29B}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Blitzy.LegacyPort.CalculatorApp", "src\Blitzy.LegacyPort.CalculatorApp\Blitzy.LegacyPort.CalculatorApp.csproj", "{6C55FF8E-520B-4E87-B7A6-32BC6B7BBA32}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Blitzy.LegacyPort.UserApp", "src\Blitzy.LegacyPort.UserApp\Blitzy.LegacyPort.UserApp.csproj", "{1743BB16-4839-46C0-87DA-7049C5A23A4F}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{333DC8C8-F846-4E04-A451-FD819529C81E}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Blitzy.LegacyPort.Core.Tests", "tests\Blitzy.LegacyPort.Core.Tests\Blitzy.LegacyPort.Core.Tests.csproj", "{887445FE-4A25-4E5E-B553-4971E9D46555}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{714C5696-1CDE-4CC0-8E15-23EE83194DC3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{714C5696-1CDE-4CC0-8E15-23EE83194DC3}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{714C5696-1CDE-4CC0-8E15-23EE83194DC3}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{714C5696-1CDE-4CC0-8E15-23EE83194DC3}.Release|Any CPU.Build.0 = Release|Any CPU
+		{0B1E9322-8639-48B8-B079-F49235D9F29B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0B1E9322-8639-48B8-B079-F49235D9F29B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0B1E9322-8639-48B8-B079-F49235D9F29B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0B1E9322-8639-48B8-B079-F49235D9F29B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6C55FF8E-520B-4E87-B7A6-32BC6B7BBA32}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6C55FF8E-520B-4E87-B7A6-32BC6B7BBA32}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6C55FF8E-520B-4E87-B7A6-32BC6B7BBA32}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6C55FF8E-520B-4E87-B7A6-32BC6B7BBA32}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1743BB16-4839-46C0-87DA-7049C5A23A4F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1743BB16-4839-46C0-87DA-7049C5A23A4F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1743BB16-4839-46C0-87DA-7049C5A23A4F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1743BB16-4839-46C0-87DA-7049C5A23A4F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{887445FE-4A25-4E5E-B553-4971E9D46555}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{887445FE-4A25-4E5E-B553-4971E9D46555}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{887445FE-4A25-4E5E-B553-4971E9D46555}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{887445FE-4A25-4E5E-B553-4971E9D46555}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{714C5696-1CDE-4CC0-8E15-23EE83194DC3} = {35C2CA36-4D79-46B0-8592-69F223FE32AA}
+		{0B1E9322-8639-48B8-B079-F49235D9F29B} = {35C2CA36-4D79-46B0-8592-69F223FE32AA}
+		{6C55FF8E-520B-4E87-B7A6-32BC6B7BBA32} = {35C2CA36-4D79-46B0-8592-69F223FE32AA}
+		{1743BB16-4839-46C0-87DA-7049C5A23A4F} = {35C2CA36-4D79-46B0-8592-69F223FE32AA}
+		{887445FE-4A25-4E5E-B553-4971E9D46555} = {333DC8C8-F846-4E04-A451-FD819529C81E}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {2D778EE1-D9A8-47DC-9169-28A5D03B1CE0}
+	EndGlobalSection
+EndGlobal
