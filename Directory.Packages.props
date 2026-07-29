@@ -1,28 +1,42 @@
 <Project>
 
   <!--
-    NuGet Central Package Management. Every PackageReference in this repository is declared
-    WITHOUT a Version attribute; the single authoritative version for each package lives here.
+    NuGet Central Package Management (CPM): this file is the single authoritative declaration of
+    every package version used anywhere in this repository. Each project cites a package by name
+    only, with no Version attribute, and the version is resolved from the matching entry below.
+    Citing a version in a project file while CPM is switched on is an error (NU1008), which is
+    precisely what makes version drift between projects structurally impossible.
 
-    Note: CPM emits NU1507 when more than one NuGet source is configured, and NU1507 is fatal
-    under TreatWarningsAsErrors. This repository resolves against exactly one source
-    (nuget.org). If a second source is ever added, fix it with package source mapping -
-    never by relaxing the warning gate.
+    A dependency bump is therefore a one-line change reviewed in one place, rather than an audit
+    of every project file in the solution.
+
+    NU1507: CPM warns when more than one package source is configured, and because
+    Directory.Build.props sets TreatWarningsAsErrors, that warning would fail the build. This
+    repository resolves against exactly one source (nuget.org). Should a second source ever
+    become necessary, the correct remedy is NuGet package source mapping - never relaxing the
+    warning gate, and never suppressing the diagnostic.
   -->
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
-    <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
   </PropertyGroup>
 
   <!--
-    Test-only dependencies. The production projects (Core and the three console apps) declare
-    zero PackageReference items and therefore carry no third-party surface.
+    Test-only packages. The four production projects - Blitzy.LegacyPort.Core plus the GreeterApp,
+    CalculatorApp, and UserApp console executables - cite zero packages, so the ported business
+    logic carries no third-party surface whatsoever and Core resolves to nothing but a framework
+    reference on Microsoft.NETCore.App. The sole consumer of the versions below is
+    tests/Blitzy.LegacyPort.Core.Tests.
+
+    Every version is an exact, deterministic pin read back from a resolved restore graph - never a
+    floating range, never a wildcard, never a moving target - and deliberately current rather than
+    the older floors an SDK test template would emit. Transitive dependencies are intentionally
+    left unpinned; NuGet resolves the full closure from these four roots.
   -->
   <ItemGroup>
-    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
   </ItemGroup>
 
 </Project>
