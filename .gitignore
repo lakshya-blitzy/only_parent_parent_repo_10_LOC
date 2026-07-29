@@ -1,86 +1,45 @@
-## .NET build output
+# Source hygiene for the .NET 8 (net8.0) solution in this repository.
+#
+# This file excludes GENERATED build output and per-developer editor state only. Every
+# hand-authored file stays tracked: LegacyPort.sln, global.json, Directory.Build.props,
+# Directory.Packages.props, .editorconfig, .dockerignore, Dockerfile, README.md,
+# .github/workflows/ci.yml, and every *.cs and *.csproj under src/ and tests/.
+# Never add a broad pattern such as *.json, *.props, *.sln, *.yml, *.config or .* - each
+# would hide one of those files. Ignoring global.json in particular would silently break
+# the SDK pin that makes this build reproducible.
+#
+# The Docker build context is filtered separately by .dockerignore, which has a different
+# consumer and therefore a different (partly overlapping) list. Neither file substitutes
+# for the other, and .github/ is excluded from the image context there - never here.
+
+# Build output. MSBuild writes each project to bin/<Configuration>/net8.0/ and keeps its
+# intermediate output, including the NuGet restore assets, under obj/.
 bin/
 obj/
+
+# Test and coverage output. The CI workflow writes its .trx to ./artifacts/test-results;
+# a local `dotnet test` without --results-directory writes to <project>/TestResults/.
 artifacts/
-[Dd]ebug/
-[Rr]elease/
-x64/
-x86/
-[Ww][Ii][Nn]32/
-[Aa][Rr][Mm]/
-[Aa][Rr][Mm]64/
-project.lock.json
-project.fragment.lock.json
-*.binlog
-
-## Test / coverage output
-[Tt]est[Rr]esult*/
+[Tt]est[Rr]esults/
 *.trx
+[Cc]overage*/
 *.coverage
-*.coverxml
-coverage*.json
-coverage*.xml
-coverage*.info
-*.opencover.xml
+*.coverlet.json
 
-## NuGet
-*.nupkg
-*.snupkg
-**/[Pp]ackages/*
-!**/[Pp]ackages/build/
-.nuget/
-*.nuget.props
-*.nuget.targets
-
-## Visual Studio / Rider / VS Code / user-specific files
+# IDE and editor state. Per-developer, machine-specific, never shared.
 .vs/
 .vscode/
 .idea/
 *.user
-*.userosscache
 *.suo
-*.sln.docstates
 *.userprefs
 *.DotSettings.user
-*.rsuser
-*.svclog
-*.vspscc
-*.vssscc
 
-## MSBuild / build engine noise
-*.tlog
-*.log
-*.pidb
-*.svclog
-*.ilk
-*.meta
-*.obj
-*.iobj
-*.pch
-*.pdb
-*.ipdb
-*.pgc
-*.pgd
-*.rsp
-*.sbr
-*.tlb
-*.tli
-*.tlh
-*.tmp
-*.tmp_proj
-*_wpftmp.csproj
-*.cache
+# NuGet package output. Nothing in this repository is packed for publication, so any
+# package file present locally is a build by-product.
+*.nupkg
+*.snupkg
 
-## Publish output
-publish/
-PublishScripts/
-*.[Pp]ublish.xml
-*.azurePubxml
-*.pubxml
-*.pubxml.user
-
-## OS noise
+# Operating-system and editor scratch files.
 .DS_Store
 Thumbs.db
-desktop.ini
-*~
