@@ -1,0 +1,40 @@
+# Keep the image build context minimal and deterministic: the SDK stage restores and builds
+# from source only, so no local build output, IDE state, or VCS metadata may leak in.
+
+## Build output
+**/bin/
+**/obj/
+artifacts/
+publish/
+**/*.binlog
+
+## Test / coverage output
+**/TestResults/
+**/*.trx
+**/coverage*.*
+
+## VCS and CI metadata (irrelevant to the image build)
+.git/
+.gitignore
+.gitattributes
+.github/
+
+## Container definitions themselves
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+## IDE / editor state
+.vs/
+.vscode/
+.idea/
+**/*.user
+**/*.suo
+**/*.DotSettings.user
+
+## Docs and OS noise
+README.md
+LICENSE
+**/.DS_Store
+**/Thumbs.db
+**/*~

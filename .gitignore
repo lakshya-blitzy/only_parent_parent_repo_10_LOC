@@ -1,0 +1,86 @@
+## .NET build output
+bin/
+obj/
+artifacts/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+project.lock.json
+project.fragment.lock.json
+*.binlog
+
+## Test / coverage output
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coverxml
+coverage*.json
+coverage*.xml
+coverage*.info
+*.opencover.xml
+
+## NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+.nuget/
+*.nuget.props
+*.nuget.targets
+
+## Visual Studio / Rider / VS Code / user-specific files
+.vs/
+.vscode/
+.idea/
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+*.userprefs
+*.DotSettings.user
+*.rsuser
+*.svclog
+*.vspscc
+*.vssscc
+
+## MSBuild / build engine noise
+*.tlog
+*.log
+*.pidb
+*.svclog
+*.ilk
+*.meta
+*.obj
+*.iobj
+*.pch
+*.pdb
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.tmp_proj
+*_wpftmp.csproj
+*.cache
+
+## Publish output
+publish/
+PublishScripts/
+*.[Pp]ublish.xml
+*.azurePubxml
+*.pubxml
+*.pubxml.user
+
+## OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
