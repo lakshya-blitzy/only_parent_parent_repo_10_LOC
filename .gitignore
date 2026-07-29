@@ -6,8 +6,11 @@ __pycache__/
 *.class
 classes/
 
-# Node dependencies
+# Node dependencies. With zero declared dependencies a lockfile records nothing,
+# yet `npm install` writes one and would otherwise dirty the working tree.
 node_modules/
+package-lock.json
+npm-shrinkwrap.json
 
 # Test cache
 .pytest_cache/

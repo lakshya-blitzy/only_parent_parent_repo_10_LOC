@@ -1,41 +1,36 @@
 /**
  * index.js - JavaScript application for only_parent_parent_repo_10_LOC.
  *
- * The file keeps its original job (printing the result of add(5, 7) five times)
- * and gains a uniform /health endpoint that is byte-compatible with the Python
- * and Java implementations in this repository.
+ * The file keeps its original job - printing the result of add(5, 7) five times -
+ * and gains a uniform /health endpoint whose response is byte-compatible with the
+ * Python and Java implementations in this repository.
  *
  * Three invocation modes, dispatched from the main-module guard at the bottom:
  *
- *   node index.js            legacy behaviour - prints "12" five times, exits 0
+ *   node index.js            default behaviour: prints "12" five times, exits 0
  *   node index.js --serve    binds host:port and serves the health endpoint
  *   node index.js --probe    requests its own endpoint, exits 0 (up) or 1 (down)
  *
- * The default mode is byte-identical to the pre-existing behaviour: it is
- * hashed by a committed baseline, so nothing outside the default branch may
- * ever write to stdout. Every diagnostic in this file goes to stderr.
+ * The default mode's stdout is hashed by a committed baseline, so nothing outside
+ * the default branch may write to stdout. Every diagnostic goes to stderr.
  *
- * The health response is a strict subset of the vocabulary in the IETF draft
- * "Health Check Response Format for HTTP APIs" (draft-inadarei-api-health-check-06):
- * a JSON body, a `status` field, and a 2xx code for a passing status, with
- * no-store caching so a health answer is never served from a cache. Two
- * deviations from that draft are deliberate: the response uses the plain
- * `application/json` media type rather than the draft's health-specific type,
- * because that is what generic tooling and the repository's verification
- * script expect; and HEAD is answered with 405, because the endpoint is
- * GET-only by design and no identified consumer issues a HEAD request.
+ * The response is a strict subset of the vocabulary in the IETF draft "Health
+ * Check Response Format for HTTP APIs" (draft-inadarei-api-health-check-06): a
+ * JSON body, a `status` field, a 2xx code for a passing status, and no-store
+ * caching so a health answer is never served from a cache. Two deviations from
+ * that draft are deliberate - the plain `application/json` media type rather than
+ * the draft's health-specific type, because plain JSON is what generic tooling
+ * parses; and HEAD answered 405, because the endpoint is GET-only by design.
  *
- * Reading and framing a request is the runtime's job. `node:http` is the whole
- * HTTP implementation here; this file supplies a plain request handler that
- * decides which of exactly three responses to write, and nothing else:
+ * `node:http` is the entire HTTP implementation. This file supplies a handler
+ * that writes exactly one of three responses:
  *
- *   200 OK                     GET on the configured health route
- *   404 Not Found              any other target
- *   405 Method Not Allowed     any other method (+ Allow: GET)
+ *   200  GET on the configured route   the health document
+ *   404  any other target              {"error":"not found"}
+ *   405  any other method              {"error":"method not allowed"}, Allow: GET
  *
- * The module is dependency-free: everything below comes from the Node
- * standard library, so `node index.js` works on a bare runtime with no
- * install step, no node_modules directory and no lockfile.
+ * Everything here comes from the Node standard library, so `node index.js` works
+ * on a bare runtime with no install step, no node_modules and no lockfile.
  */
 
 const http = require("node:http");
@@ -46,9 +41,7 @@ function add(a, b) {
   return a + b;
 }
 
-/* -------------------------------------------------------------------------- *
- * Configuration - single source of truth with a fixed override precedence
- * -------------------------------------------------------------------------- */
+// Configuration - single source of truth with a fixed override precedence.
 
 /**
  * Absolute path of the shared cross-language configuration file.
@@ -58,6 +51,50 @@ function add(a, b) {
  * still find the properties file that ships beside the script.
  */
 const CONFIG_FILE = path.join(__dirname, "app.config.properties");
+
+/**
+ * The properties grammar, in the exact terms `java.util.Properties.load` defines
+ * it. Whitespace is SPACE, TAB and FORM FEED only; a key is separated from its
+ * value by `=`, `:` or whitespace; `#` and `!` introduce a comment. These are
+ * what make one shared file mean one thing in three languages rather than three
+ * similar things.
+ */
+const PROPERTIES_WHITESPACE = " \t\f";
+const PROPERTIES_SEPARATORS = "=:";
+const PROPERTIES_COMMENTS = "#!";
+
+/**
+ * A `\uXXXX` escape is exactly four hexadecimal digits. Anything shorter or
+ * non-hexadecimal makes the document malformed rather than the escape literal,
+ * which is what `Properties.load` does and therefore what this must do.
+ */
+const PROPERTIES_ESCAPE_WIDTH = 4;
+const PROPERTIES_HEX_GRAMMAR = /^[0-9a-fA-F]{4}$/;
+const PROPERTIES_MALFORMED_ESCAPE = "malformed \\uxxxx encoding";
+
+/**
+ * The decoder every byte sequence this program reads passes through: the
+ * properties file, and the body of a probe answer.
+ *
+ * Fatal, so a sequence that is not valid UTF-8 raises instead of becoming U+FFFD.
+ * Both call sites need that for the same reason: silent replacement turns bytes
+ * the sibling implementations refuse into text that looks legitimate here.
+ *
+ * `ignoreBOM: true` KEEPS a leading U+FEFF rather than stripping it - the option
+ * name reads backwards. Both call sites need that too. `Properties.load` keeps
+ * the mark, so stripping it would make the same file produce a different first
+ * key here than in the other two implementations; and a probe answer that opens
+ * with a byte-order mark is refused as malformed by all three.
+ */
+const STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/**
+ * The two diagnostics the loader can emit, worded identically in all three
+ * implementations so one operator-facing message means one condition everywhere.
+ * An ABSENT file emits neither: it is the normal case.
+ */
+const CONFIG_UNREADABLE_WARNING = "cannot read the configuration file; using defaults";
+const CONFIG_MALFORMED_WARNING = "the configuration file is malformed; using defaults";
 
 /**
  * Built-in defaults, keyed by their properties-file key. These are the last
@@ -73,8 +110,8 @@ const DEFAULTS = Object.freeze({
 });
 
 /**
- * Environment variable that overrides each properties key. Documented for
- * operators in .env.example; asserted by the CI configuration gate.
+ * Environment variable that overrides each properties key. The same five
+ * variables are honoured, under the same names, by app.py and User.java.
  */
 const ENV_KEYS = Object.freeze({
   "app.name": "APP_NAME",
@@ -181,19 +218,15 @@ const PROBE_KEY_SET_REASON =
 const MAX_PROBE_BODY_BYTES = 8192;
 
 /**
- * Listener timeouts, all four of them, because Node's defaults are wrong for a
- * health endpoint in two directions at once.
- *
- * `headersTimeout` defaults to 60 s and `requestTimeout` to 300 s, so a client
- * that opens a connection and then trickles can hold a socket - and the memory
- * behind it - for five minutes; on a container whose only job is to answer a
- * 108-byte document in milliseconds, that is a slow-loris budget rather than a
- * grace period. `server.timeout` defaults to 0, meaning an established socket
- * that goes quiet is never reclaimed at all.
+ * Listener timeouts - all four, because Node's defaults are wrong for a health
+ * endpoint in two directions at once. `headersTimeout` defaults to 60 s and
+ * `requestTimeout` to 300 s, so a client that opens a connection and then
+ * trickles can hold a socket for five minutes; `server.timeout` defaults to 0,
+ * so an established socket that goes quiet is never reclaimed at all.
  *
  * `connectionsCheckingInterval` is how often the runtime sweeps for connections
- * that have outlived those budgets; it is a CONSTRUCTOR option rather than a
- * property, so it is passed to createServer() where it takes effect.
+ * that have outlived those budgets. It is a CONSTRUCTOR option rather than a
+ * property, which is why it is passed to createServer().
  */
 const CONNECTION_CHECK_INTERVAL_MS = 500;
 const HEADERS_TIMEOUT_MS = 10000;
@@ -202,38 +235,23 @@ const SOCKET_TIMEOUT_MS = 30000;
 const KEEP_ALIVE_TIMEOUT_MS = 5000;
 
 /**
- * Returns the first argument that is a supplied string, verbatim; undefined
- * when there is none.
+ * Returns the first argument that is a supplied string, verbatim; undefined when
+ * there is none.
  *
- * An environment variable set to the empty string is treated as absent rather
- * than as an override to the empty string: the response contract requires a
- * non-empty name and a dotted version, so an empty value must fall through to
- * the next source instead of producing a payload that violates the contract.
+ * An environment variable set to the empty string is absent rather than an
+ * override to the empty string: the contract requires a non-empty name and a
+ * dotted version, so an empty value falls through to the next source instead of
+ * producing a payload that violates it.
  *
- * ONLY the empty string is absent, and the winning value is returned exactly as
- * it was supplied. Both halves of that sentence are correctness requirements
- * rather than preferences, because the same precedence chain exists in app.py
- * and User.java and all three must agree on every input:
- *
- *   * app.py resolves with `if override:` and User.java with
- *     `!fromEnvironment.isEmpty()`, so a whitespace-only value is a SUPPLIED
- *     value in both. Trimming before the presence test - which this function
- *     used to do - silently erased it here, and a supplied-but-invalid PORT of
- *     "   " then fell through to the built-in default instead of being
- *     rejected. That is precisely the failure fail-closed exists to prevent:
- *     the operator asked for a specific port, so a healthy process listening
- *     somewhere they are not watching is worse than a refusal. Whitespace is
- *     now carried through to `resolvePort`, which rejects it.
- *   * Neither sibling trims the value it returns either, so trimming here would
- *     make a configured name, version, path or host differ across the three
- *     implementations for the same input. Values that legitimately need
- *     trimming are trimmed at the point of use: `resolvePort` trims before
- *     parsing, exactly as User.java's `raw.trim()` and app.py's
- *     `int(str(value).strip())` do, and the properties parser already trims
- *     what it reads from the file.
- *
- * @param {...unknown} candidates Values in precedence order.
- * @returns {string|undefined} The first supplied value, exactly as supplied.
+ * ONLY the empty string is absent, and the winner is returned exactly as it was
+ * supplied. Both halves are correctness requirements. app.py resolves with
+ * `if override:` and User.java with `!fromEnvironment.isEmpty()`, so a
+ * whitespace-only value is a SUPPLIED value in all three and is carried through
+ * to resolvePort, which REJECTS it rather than falling back to a port the
+ * operator did not ask for. Neither sibling trims what it returns either, so
+ * trimming here would make a configured name, version, path or host differ
+ * across the three for one input. Values that need trimming are trimmed at the
+ * point of use.
  */
 function firstNonEmpty(...candidates) {
   for (const candidate of candidates) {
@@ -248,90 +266,249 @@ function firstNonEmpty(...candidates) {
  * Writes a diagnostic to stderr.
  *
  * Every message this module emits goes through here, and two guarantees follow
- * from that being a single exit rather than a convention every call site has to
- * remember.
- *
- * Nothing reaches stdout: stdout carries the legacy output that a committed hash
- * asserts byte for byte, so a single stray console.log would break backward
- * compatibility.
- *
- * And no caller can forge a log line. The text is stripped of control characters
- * by sanitizeForLog before the newline is appended, so a configured value
- * carrying a CR and an LF cannot produce a second line in whatever collects this
- * process's stderr, and a terminal escape sequence cannot rewrite what an
- * operator sees. sanitizeForLog is declared further down the file; function
- * declarations are hoisted, so the call below resolves.
- *
- * @param {string} message Human-readable diagnostic, without a trailing newline.
- * @returns {void}
+ * from that being one exit rather than a per-call-site convention. Nothing
+ * reaches stdout, which carries the legacy output a committed hash asserts byte
+ * for byte. And no caller can forge a log line: the text is stripped of control
+ * characters by sanitizeForLog before the newline is appended, so a configured
+ * value carrying CR and LF cannot produce a second line and an escape sequence
+ * cannot rewrite what an operator sees. sanitizeForLog is declared further down;
+ * function declarations are hoisted, so the call below resolves.
  */
 function warn(message) {
   process.stderr.write(`index.js: ${sanitizeForLog(String(message))}\n`);
 }
 
 /**
- * Parses Java-native `key=value` properties text.
+ * Splits properties text into natural lines on CRLF, LF or CR.
  *
- * Blank lines are skipped, `#` and `!` introduce comments, and only the first
- * `=` separates key from value so a value may itself contain `=`. Keys and
- * values are trimmed; a line with no `=` and a line with an empty key are both
- * ignored rather than producing a bogus entry.
+ * Deliberately not `split(/\r?\n/)`, which leaves a lone CR inside a line, and
+ * deliberately not a broader line-break class: `java.util.Properties` recognises
+ * only these three terminators, and FORM FEED in particular is whitespace WITHIN
+ * a line for it, so treating it as a break would truncate a value the Java
+ * loader reads whole.
+ */
+function splitNaturalLines(text) {
+  const lines = [];
+  let current = "";
+  let index = 0;
+  while (index < text.length) {
+    const char = text.charAt(index);
+    if (char === "\r") {
+      lines.push(current);
+      current = "";
+      index += text.charAt(index + 1) === "\n" ? 2 : 1;
+      continue;
+    }
+    if (char === "\n") {
+      lines.push(current);
+      current = "";
+      index += 1;
+      continue;
+    }
+    current += char;
+    index += 1;
+  }
+  lines.push(current);
+  return lines;
+}
+
+/**
+ * Counts the backslashes that end a natural line.
  *
- * @param {string} text Raw file contents.
- * @returns {Record<string, string>} Parsed key/value pairs.
+ * An ODD count continues the logical line onto the next natural line; an EVEN
+ * count means the final backslash was itself escaped and the line ends here.
+ */
+function trailingBackslashes(text) {
+  let count = 0;
+  let at = text.length - 1;
+  while (at >= 0 && text.charAt(at) === "\\") {
+    count += 1;
+    at -= 1;
+  }
+  return count;
+}
+
+/**
+ * Returns the first index at or after `start` that is not properties whitespace.
+ */
+function skipPropertiesWhitespace(text, start) {
+  let at = start;
+  while (at < text.length && PROPERTIES_WHITESPACE.includes(text.charAt(at))) {
+    at += 1;
+  }
+  return at;
+}
+
+/**
+ * Resolves the escape sequences `java.util.Properties.load` resolves.
+ *
+ * `\t`, `\n`, `\r` and `\f` become their control characters and `\uXXXX` becomes
+ * its code unit. Every OTHER escaped character becomes itself, which is how an
+ * escaped space, `=`, `:`, `#` or backslash carries a separator or a comment
+ * marker into a key or a value. A capital `\U` is not a unicode escape - it
+ * yields `U` - and a lone backslash at the very end of the text is dropped.
+ *
+ * @throws {RangeError} On a `\uXXXX` escape that is not four hexadecimal digits.
+ */
+function unescapeProperties(raw) {
+  let out = "";
+  let index = 0;
+  while (index < raw.length) {
+    const char = raw.charAt(index);
+    index += 1;
+    if (char !== "\\") {
+      out += char;
+      continue;
+    }
+    if (index >= raw.length) {
+      break;
+    }
+    const escape = raw.charAt(index);
+    index += 1;
+    if (escape === "u") {
+      const digits = raw.slice(index, index + PROPERTIES_ESCAPE_WIDTH);
+      if (!PROPERTIES_HEX_GRAMMAR.test(digits)) {
+        throw new RangeError(PROPERTIES_MALFORMED_ESCAPE);
+      }
+      out += String.fromCharCode(Number.parseInt(digits, 16));
+      index += PROPERTIES_ESCAPE_WIDTH;
+    } else if (escape === "t") {
+      out += "\t";
+    } else if (escape === "n") {
+      out += "\n";
+    } else if (escape === "r") {
+      out += "\r";
+    } else if (escape === "f") {
+      out += "\f";
+    } else {
+      out += escape;
+    }
+  }
+  return out;
+}
+
+/**
+ * Parses properties text exactly as `java.util.Properties.load` parses it.
+ *
+ * This is the shared configuration grammar, shared by implementation rather than
+ * by convention: app.config.properties is the single source of truth for three
+ * languages and User.java reads it with `Properties.load`, so the other two must
+ * read it the same way or one file means two things. Four cases decide that - a
+ * value's trailing whitespace, a `:` or whitespace separator, an escape sequence,
+ * and a continuation line - and each changes what the endpoint publishes.
+ *
+ * The grammar, in order:
+ *
+ *   - Natural lines break on CRLF, LF or CR. Leading whitespace is skipped; an
+ *     exhausted line is blank and skipped; a first non-whitespace character of
+ *     `#` or `!` makes the line a comment, and that test applies to the FIRST
+ *     natural line of a logical line only.
+ *   - A line ending in an ODD number of backslashes continues: the final
+ *     backslash is dropped and the next natural line is appended with its own
+ *     leading whitespace stripped.
+ *   - The key ends at the first UNESCAPED `=`, `:`, SPACE, TAB or FORM FEED.
+ *     Whitespace after it is skipped, one optional `=` or `:` is consumed, and
+ *     whitespace after that is skipped. The rest is the value, whose TRAILING
+ *     whitespace is preserved.
+ *   - Both halves are then unescaped, and the last occurrence of a repeated key
+ *     wins.
+ *
+ * A byte-order mark is not stripped, because `Properties.load` does not strip
+ * one: a file saved with a BOM has a first key of `\ufeffapp.name` in all three
+ * implementations rather than a working key in one and a broken key in two.
+ *
+ * The result has a null prototype, so a file containing `__proto__=x` yields an
+ * ordinary entry named `__proto__` exactly as it does in Python and Java.
+ *
+ * @throws {RangeError} On a malformed `\uXXXX` escape.
  */
 function parseProperties(text) {
-  const props = {};
-  for (const rawLine of String(text).split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line === "" || line.startsWith("#") || line.startsWith("!")) {
+  const props = Object.create(null);
+  const lines = splitNaturalLines(String(text));
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    index += 1;
+    const start = skipPropertiesWhitespace(line, 0);
+    if (start >= line.length) {
       continue;
     }
-    const separator = line.indexOf("=");
-    if (separator === -1) {
+    if (PROPERTIES_COMMENTS.includes(line.charAt(start))) {
       continue;
     }
-    const key = line.slice(0, separator).trim();
-    if (key === "") {
-      continue;
+    let logical = line.slice(start);
+    while (trailingBackslashes(logical) % 2 === 1) {
+      logical = logical.slice(0, -1);
+      if (index >= lines.length) {
+        break;
+      }
+      const follow = lines[index];
+      index += 1;
+      logical += follow.slice(skipPropertiesWhitespace(follow, 0));
     }
-    props[key] = line.slice(separator + 1).trim();
+    let cursor = 0;
+    while (cursor < logical.length) {
+      const char = logical.charAt(cursor);
+      if (char === "\\") {
+        cursor += 2;
+        continue;
+      }
+      if (
+        PROPERTIES_SEPARATORS.includes(char) ||
+        PROPERTIES_WHITESPACE.includes(char)
+      ) {
+        break;
+      }
+      cursor += 1;
+    }
+    const keyEnd = Math.min(cursor, logical.length);
+    let after = skipPropertiesWhitespace(logical, keyEnd);
+    if (after < logical.length && PROPERTIES_SEPARATORS.includes(logical.charAt(after))) {
+      after = skipPropertiesWhitespace(logical, after + 1);
+    }
+    props[unescapeProperties(logical.slice(0, keyEnd))] = unescapeProperties(
+      logical.slice(after),
+    );
   }
   return props;
 }
 
 /**
- * Reads and parses the properties file, tolerating its absence.
+ * Reads the shared properties file and parses it with the shared grammar.
  *
- * A missing file is not an error: the built-in defaults are a complete
- * configuration on their own, so the application still starts and still serves
- * a valid payload. Any other failure (unreadable file, bad permissions) is
- * reported on stderr because it is a real misconfiguration an operator should
- * see, and it still falls back to the defaults rather than refusing to start.
+ * The file is read as BYTES and decoded by a FATAL UTF-8 decoder, matching
+ * `Files.newBufferedReader(location, UTF_8)` in User.java and the strict decode
+ * in app.py. A lossy decode substitutes U+FFFD for every malformed sequence, so
+ * a file Java refuses to read at all would become a configuration full of
+ * replacement characters here - and that configuration reaches the payload.
  *
- * @param {string} file Path of the properties file.
- * @returns {Record<string, string>} Parsed pairs, or an empty object.
+ * Three outcomes, the same three in all three implementations. An ABSENT file is
+ * silent, because the defaults are a complete configuration. A file that cannot
+ * be READ, or is not UTF-8, emits one warning. A MALFORMED file - a `\uXXXX`
+ * escape that is not four hex digits - emits one warning. Neither warning
+ * carries the path or the underlying message, because that text embeds the path.
  */
 function readProperties(file) {
+  let text;
   try {
-    return parseProperties(fs.readFileSync(file, "utf8"));
+    text = STRICT_UTF8_DECODER.decode(fs.readFileSync(file));
   } catch (error) {
     if (error && error.code !== "ENOENT") {
-      // The category is reported and nothing else. The path is a deployment
-      // detail and the error message embeds it, so neither reaches the line -
-      // the file is one command away from the operator reading it.
-      warn("cannot read the configuration file; using defaults");
+      warn(CONFIG_UNREADABLE_WARNING);
     }
-    return {};
+    return Object.create(null);
+  }
+  try {
+    return parseProperties(text);
+  } catch (malformed) {
+    warn(CONFIG_MALFORMED_WARNING);
+    return Object.create(null);
   }
 }
 
 /**
  * Ensures a request path starts with a slash, so a value configured as
  * "healthz" still matches the request target "/healthz".
- *
- * @param {string} value Configured path.
- * @returns {string} Path guaranteed to begin with "/".
  */
 function withLeadingSlash(value) {
   return value.startsWith("/") ? value : `/${value}`;
@@ -341,30 +518,22 @@ function withLeadingSlash(value) {
  * Resolves the listener port from candidates given in precedence order.
  *
  * The highest-precedence candidate that is present wins, and if that value is
- * not a legal port the function throws rather than falling through to a lower
- * one. Failing closed is the point: an operator who sets PORT=8O01 with a
- * letter O has asked for a specific port, and quietly serving the default
- * instead would leave a health probe pointed at nothing while the process
- * reported itself up. Silently binding NaN - which listen() turns into an
- * arbitrary ephemeral port - would be worse still.
+ * not a legal port the function THROWS rather than falling through to a lower
+ * one. Failing closed is the point: an operator who sets PORT=8O01 with a letter
+ * O has asked for a specific port, and quietly serving the default instead would
+ * leave a health probe pointed at nothing while the process reported itself up.
+ * Silently binding NaN - which listen() turns into an arbitrary ephemeral port -
+ * would be worse.
  *
- * Parsing is a digit test rather than Number(), because Number("0x50") is 80:
- * a hexadecimal typo would otherwise resolve to a real but unintended port.
- * The accepted grammar is the same one Integer.parseInt and int() accept, so
- * all three implementations reject the same values.
+ * Parsing is a digit test rather than Number(), because Number("0x50") is 80: a
+ * hexadecimal typo would otherwise resolve to a real but unintended port. The
+ * accepted grammar is the one Integer.parseInt and int() accept.
  *
- * Surrounding whitespace is removed before that test and nowhere else, which is
- * what makes PORT=" 8080 " resolve to 8080 here just as it does in User.java's
- * `Integer.parseInt(raw.trim())` and app.py's `int(str(value).strip())` - while
+ * Surrounding whitespace is removed before that test and nowhere else, so
+ * PORT=" 8080 " resolves to 8080 here just as it does in the siblings, while
  * PORT="   " trims to the empty string, fails the digit test and is REJECTED
- * rather than skipped. A supplied value is always graded; only a value that was
- * never supplied at all falls through to the next candidate.
+ * rather than skipped. Port 0 is legal: it is how a test binds an ephemeral port.
  *
- * Port 0 is legal: it is how a test binds an ephemeral port and reads the
- * assignment back from the server.
- *
- * @param {Array<unknown>} candidates Values in precedence order.
- * @returns {number} A valid TCP port number.
  * @throws {RangeError} When the winning candidate is not a port in 0-65535.
  */
 function resolvePort(candidates) {
@@ -391,23 +560,18 @@ function resolvePort(candidates) {
 /**
  * Loads the effective configuration.
  *
- * Precedence, highest first: environment variable, then the properties file,
- * then the built-in default. The port has one extra rung above all of those -
- * the universal PORT variable - so PORT beats NODE_PORT beats `node.port`
- * beats 8001.
- *
- * A variable set to the empty string is the ONLY value treated as absent; every
- * other supplied value wins its rung and is used exactly as supplied. app.py and
- * User.java resolve the same chain the same way, so the three implementations
- * agree on every input - including the awkward ones, where a supplied but
+ * Precedence, highest first: environment variable, then the properties file, then
+ * the built-in default. The port has one extra rung above all of those - the
+ * universal PORT variable - so PORT beats NODE_PORT beats `node.port` beats 8001.
+ * app.py and User.java resolve the same chain the same way, so the three
+ * implementations agree on every input, including the awkward ones: a supplied but
  * unusable port is refused by all three rather than quietly replaced.
  *
- * Both the file path and the environment map are injectable so that callers
- * (notably the unit tests) can assert the precedence chain without mutating
+ * Both the file path and the environment map are injectable so that callers -
+ * notably the unit tests - can assert the precedence chain without mutating
  * process.env for the whole process.
  *
  * @param {{file?: string, env?: Record<string, string|undefined>}} [options]
- * @returns {Readonly<{name: string, version: string, healthPath: string, host: string, port: number}>}
  */
 function loadConfig(options = {}) {
   const file = options.file === undefined ? CONFIG_FILE : options.file;
@@ -418,7 +582,7 @@ function loadConfig(options = {}) {
   return Object.freeze({
     name: pick("app.name"),
     version: pick("app.version"),
-    healthPath: withLeadingSlash(pick("health.path")),
+    healthPath: configRoute(pick("health.path")),
     host: pick("app.host"),
     port: resolvePort([
       env[UNIVERSAL_PORT_ENV],
@@ -436,9 +600,6 @@ function loadConfig(options = {}) {
  * a name that appears in the published payload, and a host that appears in a
  * diagnostic. For both, the only real constraint is that they can be printed on
  * one line - which is also what stops either of them forging a second one.
- *
- * @param {unknown} text Candidate value.
- * @returns {boolean} True when the value is safe to publish and to print.
  */
 function isSingleLineText(text) {
   if (typeof text !== "string" || text === "") {
@@ -461,9 +622,6 @@ function isSingleLineText(text) {
  * server's job - so that a health path carrying a space, a CR or an LF is
  * refused where it is configured instead of becoming an injected request line in
  * probe().
- *
- * @param {unknown} target Candidate request target.
- * @returns {boolean} True when every character is visible US-ASCII.
  */
 function isRequestTarget(target) {
   if (typeof target !== "string" || target === "") {
@@ -481,39 +639,34 @@ function isRequestTarget(target) {
 /**
  * Refuses a configuration this endpoint must not publish.
  *
- * Configuration is an input, and every value it carries ends up either in the
- * public health document or in the route that serves it. Without this check a
- * non-empty but malformed value was accepted verbatim: `APP_VERSION` of
- * `not-a-version` was served inside a 200 response whose `status` field read
- * `UP`, so the endpoint attested to its own health while describing itself in a
- * form no consumer of the frozen contract could parse. A health endpoint that
- * reports success while breaking its own contract is worse than one that refuses
- * to start, because nothing downstream can tell.
+ * Configuration is an input, and every value it carries reaches either the public
+ * health document or the route that serves it. The case this exists for is a
+ * non-empty but MALFORMED value: an `APP_VERSION` of `not-a-version` would
+ * otherwise be served inside a 200 response whose `status` field read `UP`, so the
+ * endpoint would attest to its own health while describing itself in a form no
+ * consumer of the frozen contract can parse - which is worse than refusing to
+ * start, because nothing downstream can tell.
  *
  * Four rules, identical in app.py and User.java:
  *
- *   - `name` is non-empty and carries no control character. It is a payload
- *     field, and a control character in it would also break the single-line
- *     startup banner and diagnostics.
- *   - `version` matches VERSION_GRAMMAR exactly.
- *   - `healthPath` begins with "/" and is a valid request target.
+ *   - `name` is non-empty and carries no control character (it is a payload field,
+ *     and a control character would also break the single-line banner);
+ *   - `version` matches VERSION_GRAMMAR exactly;
+ *   - `healthPath` is non-empty and the route it reduces to through configRoute is
+ *     a valid request target that is not a NETWORK_PATH_PREFIX network-path
+ *     reference - the ROUTE is graded rather than the raw value, so what is
+ *     validated is exactly what will be served;
  *   - `host` is non-empty and carries no control character.
  *
- * Enforced at both of the points where a bad value would otherwise become
- * observable: creating the server, before the socket is bound, so a misconfigured
- * process never listens at all; and running the probe, so a probe cannot report
- * healthy a configuration the server would refuse to serve.
+ * Enforced at both points where a bad value would become observable: creating the
+ * server, before the socket is bound; and running the probe, so a probe cannot
+ * report healthy a configuration the server would refuse to serve.
  *
- * No message quotes the offending value. The key names the setting, which is all
- * an operator needs in order to find it, and withholding the value is what lets
- * probe() print this message verbatim without a configured string reaching a log
- * line. The port is deliberately NOT checked here: resolvePort already grades it
- * at the point of use, where the failure can be reported as the transport fault
- * it is.
+ * No message quotes the offending value - the key names the setting, and
+ * withholding the value is what lets probe() print this message verbatim without a
+ * configured string reaching a log line. The port is deliberately NOT checked
+ * here: resolvePort grades it at the point of use.
  *
- * @param {{name?: string, version?: string, healthPath?: string, host?: string}} config
- *   Configuration to check, normally from loadConfig.
- * @returns {void}
  * @throws {RangeError} On the first rule that fails.
  */
 function validateConfig(config) {
@@ -530,11 +683,11 @@ function validateConfig(config) {
       "invalid app.version: it must be a three-part dotted numeric version",
     );
   }
-  if (
-    typeof config.healthPath !== "string" ||
-    !config.healthPath.startsWith(ROOT_PATH) ||
-    !isRequestTarget(config.healthPath)
-  ) {
+  if (typeof config.healthPath !== "string" || config.healthPath === "") {
+    throw new RangeError("invalid health.path: it is not a valid request target");
+  }
+  const route = configRoute(config.healthPath);
+  if (route.startsWith(NETWORK_PATH_PREFIX) || !isRequestTarget(route)) {
     throw new RangeError("invalid health.path: it is not a valid request target");
   }
   if (!isSingleLineText(config.host)) {
@@ -544,9 +697,7 @@ function validateConfig(config) {
   }
 }
 
-/* -------------------------------------------------------------------------- *
- * Health payload - the frozen response contract
- * -------------------------------------------------------------------------- */
+// Health payload - the frozen response contract.
 
 /** The single value the `status` field may take while the process is serving. */
 const HEALTH_STATUS = "UP";
@@ -569,12 +720,22 @@ const ALLOWED_METHODS = "GET";
 const NOT_FOUND_BODY = JSON.stringify({ error: "Not Found" });
 const METHOD_NOT_ALLOWED_BODY = JSON.stringify({ error: "Method Not Allowed" });
 
-/* -------------------------------------------------------------------------- *
- * Health payload construction and route normalisation
- * -------------------------------------------------------------------------- */
+// Health payload construction and route normalisation.
 
 /** Root path, and the value an empty or query-only target normalises to. */
 const ROOT_PATH = "/";
+
+/**
+ * A target beginning with this is a network-path reference - RFC 3986 section 4.2
+ * reads `//health` as an authority named `health`, not as a path. All three
+ * implementations refuse such a value where it is CONFIGURED, because not all
+ * three platform servers can route it: CPython's request parser folds an inbound
+ * `//health` down to `/health` and the JDK's URI parser resolves it to an empty
+ * path, so a route this runtime would serve happily is a route the other two
+ * answer 404 - a configuration-dependent cross-language outage in which one
+ * implementation reports itself up and the others cannot answer at all.
+ */
+const NETWORK_PATH_PREFIX = "//";
 
 /**
  * Marks an absolute-form request target, as in `GET http://host/health`.
@@ -582,8 +743,6 @@ const ROOT_PATH = "/";
  * RFC 9112 section 3.2.2 requires a server to accept this form even though almost
  * no client emits it, and all three implementations reduce it to its path so that
  * the same request reaches the same route in every one of them.
- *
- * @type {string}
  */
 const SCHEME_SEPARATOR = "://";
 
@@ -594,23 +753,17 @@ const SCHEME_SEPARATOR = "://";
  * strip it before sending - so this is stripped defensively, and because the same
  * function normalises the CONFIGURED health path, where one could be written by
  * hand.
- *
- * @type {string}
  */
 const FRAGMENT_MARKER = "#";
 
 /**
  * Current UTC instant, truncated to whole seconds, with a trailing "Z".
  *
- * toISOString() yields milliseconds ("...T13:47:08.123Z"); stripping the
- * fractional part gives the fixed-width form the Python and Java
- * implementations also emit, which keeps the rendered body the same length in
- * all three languages. This is the only non-deterministic field in the
- * payload, which is why every automated assertion against it checks the format
+ * toISOString() yields milliseconds; stripping the fractional part gives the
+ * fixed-width form app.py and User.java also emit, which keeps the rendered body
+ * the same length in all three. This is the only non-deterministic field in the
+ * payload, which is why every automated assertion against it checks the FORMAT
  * and never the value.
- *
- * @param {Date} [now] Instant to format; defaults to the current time.
- * @returns {string} e.g. "2026-07-28T13:47:08Z".
  */
 function currentTimestamp(now = new Date()) {
   return now.toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -624,9 +777,6 @@ function currentTimestamp(now = new Date()) {
  * order, so the object literal below is what fixes the field order on the
  * wire. Nothing else is reported: four fields and no more is the whole
  * disclosure of this network-reachable surface.
- *
- * @param {ReturnType<typeof loadConfig>} [config] Effective configuration.
- * @returns {{name: string, version: string, timestamp: string, status: string}}
  */
 function buildPayload(config) {
   const resolved = config === undefined || config === null ? loadConfig() : config;
@@ -641,16 +791,12 @@ function buildPayload(config) {
 /**
  * Renders the health payload as compact JSON.
  *
- * No replacer and no space argument are passed, so the output carries no
- * whitespace and matches the Python (compact separators) and Java (hand-built
- * string) renderings byte for byte.
+ * No replacer and no space argument, so the output carries no whitespace and
+ * matches the Python (compact separators) and Java (hand-built string) renderings
+ * byte for byte.
  *
- * Accepts either an already-built payload or a configuration object, so callers
- * that have a payload in hand do not have to rebuild it - and so a caller that
- * has neither can simply call renderPayload().
- *
- * @param {object} [source] A payload (recognised by its `status` field) or a config.
- * @returns {string} Compact JSON document.
+ * Accepts either an already-built payload - recognised by its `status` field - or
+ * a configuration, so a caller with either in hand, or neither, can call it.
  */
 function renderPayload(source) {
   const payload =
@@ -663,23 +809,25 @@ function renderPayload(source) {
 /**
  * Normalises a request target to a comparable path.
  *
- * Two steps, in order and identical to normalisePath in User.java and
- * normalize_path in app.py: drop everything from the first "?", then remove
- * exactly one trailing slash when something is left in front of it.
+ * Four reductions, in this order and identical to normalisePath in User.java and
+ * normalize_path in app.py: an absolute-form target is reduced to its path,
+ * everything from the first "?" is dropped, everything from a "#" is dropped, and
+ * one trailing slash is removed when something is left in front of it.
  *
- * What the function deliberately does NOT do matters as much as what it does.
- * It performs no percent-decoding, so "/health%2f" stays distinct from
- * "/health/"; it resolves no dot segments, so "/health/../health" does not
- * reach the route; and it collapses no leading slashes, so "//health" and
- * "///health" are distinct from "/health". Each of those transformations would
- * widen the route to targets an operator did not configure.
+ * What it deliberately does NOT do matters as much. No percent-decoding, so
+ * "/health%2f" stays distinct from "/health/"; no dot-segment resolution, so
+ * "/health/../health" does not reach the route; no collapsing of leading slashes,
+ * so "//health" is distinct from "/health". Each of those would widen the route
+ * to targets an operator did not configure.
  *
- * The function is pure and total - an absent, empty or query-only target
- * normalises to the root rather than throwing - which is what lets the tests
- * assert its behaviour directly without a server.
+ * All three omissions hold in the other two implementations too, as pure functions.
+ * ON THE WIRE the leading-slash one does not, and only in app.py: CPython's request
+ * parser folds an inbound "//health" down to "/health" before any handler runs, so
+ * that one target is served there and refused here. app.py records the fold at the
+ * function it affects; the half all three can refuse is the CONFIGURED route, which
+ * validateConfig refuses everywhere.
  *
- * @param {string} rawUrl Raw request target, e.g. req.url.
- * @returns {string} Normalised path.
+ * Pure and total: an absent, empty or query-only target normalises to the root.
  */
 function normalizePath(rawUrl) {
   const raw = typeof rawUrl === "string" && rawUrl !== "" ? rawUrl : ROOT_PATH;
@@ -699,10 +847,23 @@ function normalizePath(rawUrl) {
 }
 
 /**
- * Reports whether a character is an unaccented ASCII letter.
+ * Reduces a CONFIGURED health path to the route the endpoint will answer on.
  *
- * @param {string} current A single character.
- * @returns {boolean} `true` for A-Z and a-z only.
+ * Two steps, in this order and identical in app.py's `config_route` and
+ * User.java's `configRoute`: a missing leading slash is supplied, then
+ * normalizePath performs the same four reductions it performs on a request
+ * target. `health`, `/health` and `/health/` therefore all describe one route.
+ *
+ * Both loadConfig and validateConfig go through this function, which is what
+ * makes the route that is VALIDATED and the route that is SERVED the same string
+ * by construction rather than by two code paths agreeing.
+ */
+function configRoute(value) {
+  return normalizePath(withLeadingSlash(value));
+}
+
+/**
+ * Reports whether a character is an unaccented ASCII letter.
  */
 function isAsciiLetter(current) {
   return (current >= "a" && current <= "z") || (current >= "A" && current <= "Z");
@@ -712,9 +873,6 @@ function isAsciiLetter(current) {
  * Reports whether a string is a URI scheme as RFC 3986 defines one.
  *
  * ALPHA followed by any number of ALPHA, DIGIT, `+`, `-` or `.`.
- *
- * @param {string} candidate The text before `://` in a request target.
- * @returns {boolean} `true` when it could be a scheme.
  */
 function isScheme(candidate) {
   if (candidate === "" || !isAsciiLetter(candidate.charAt(0))) {
@@ -749,9 +907,6 @@ function isScheme(candidate) {
  * contain `://` - a redirect parameter such as `/health?next=http://elsewhere/` -
  * has `/health?next=http` before the separator, which is not a scheme, so it is
  * returned completely untouched.
- *
- * @param {string} target The request target as it arrived.
- * @returns {string} The path component of an absolute-form target, or the target.
  */
 function stripAuthority(target) {
   const separator = target.indexOf(SCHEME_SEPARATOR);
@@ -769,9 +924,6 @@ function stripAuthority(target) {
  * Configuration values reach the startup banner, and a value carrying CR, LF or
  * an escape sequence could forge a log line or drive a terminal escape. Each
  * offending byte is replaced with "?" so the diagnostic stays one readable line.
- *
- * @param {string} text Text to sanitise.
- * @returns {string} Text with every control character replaced.
  */
 function sanitizeForLog(text) {
   let sanitized = "";
@@ -783,35 +935,24 @@ function sanitizeForLog(text) {
   return sanitized;
 }
 
-/* -------------------------------------------------------------------------- *
- * HTTP server
- * -------------------------------------------------------------------------- */
+// HTTP server.
 
 /**
  * Writes a JSON response carrying exactly the contract headers.
  *
- * Two suppressions are load-bearing rather than cosmetic. `sendDate` is
- * switched off because Node would otherwise add a `Date` header that the Python
- * implementation does not emit. `Connection` is removed for the same reason:
- * Node adds `Connection: keep-alive` plus a `Keep-Alive` header on a persistent
- * HTTP/1.1 response, and removing the header before writeHead() stops both from
- * being computed. Persistence itself is unaffected - it is governed by the
- * parser's own keep-alive decision rather than by the header suppressed here -
- * so the connection is still reused across requests. No `Server` header is ever
- * set, so the runtime version is not advertised.
+ * Two suppressions are load-bearing rather than cosmetic. `sendDate` is switched
+ * off because Node would otherwise add a `Date` header the Python implementation
+ * does not emit. `Connection` is removed for the same reason: Node adds
+ * `Connection: keep-alive` plus a `Keep-Alive` header on a persistent HTTP/1.1
+ * response, and removing the header before writeHead() stops both from being
+ * computed. Persistence itself is unaffected - it is governed by the parser's own
+ * keep-alive decision - so connections are still reused. No `Server` header is
+ * ever set, so the runtime version is not advertised.
  *
- * The result is the same three-header set the other two implementations emit:
- * Content-Type, Cache-Control and Content-Length, plus Allow on a 405.
- *
- * `Content-Length` is the BYTE length rather than the character count, so a
- * multi-byte character in a configured value cannot desynchronise the
- * advertised length from the body.
- *
- * @param {import("node:http").ServerResponse} res Response to write.
- * @param {number} statusCode 200, 404 or 405.
- * @param {string} body Already-rendered JSON document.
- * @param {Record<string, string>} [extraHeaders] Additional headers, e.g. Allow.
- * @returns {void}
+ * The result is the same three-header set the other two emit - Content-Type,
+ * Cache-Control and Content-Length - plus Allow on a 405. `Content-Length` is the
+ * BYTE length rather than the character count, so a multi-byte character in a
+ * configured value cannot desynchronise the advertised length from the body.
  */
 function writeJson(res, statusCode, body, extraHeaders) {
   res.sendDate = false;
@@ -831,39 +972,36 @@ function writeJson(res, statusCode, body, extraHeaders) {
 /**
  * Builds an unstarted HTTP server for the health endpoint.
  *
- * The handler is three lines of routing over `node:http`: a method other than
- * GET is 405 with an `Allow` header, a target that does not normalise to the
- * configured route is 404, and everything else is the health document. There is
- * no fourth outcome, and nothing here reads the request body - the endpoint
- * answers from configuration and the clock alone.
+ * The handler has three outcomes over `node:http`: a method other than GET is 405
+ * with an `Allow` header, a target that does not normalise to the configured route
+ * is 404, and everything else is the health document. There is no fourth outcome,
+ * and nothing here reads the request body - the endpoint answers from
+ * configuration and the clock alone.
  *
- * Configuration is resolved ONCE here rather than per request, so every response
- * a given server produces describes the same application; the Python and Java
- * implementations snapshot at construction for the same reason. Reloading is
- * what a restart is for.
+ * The route is derived with configRoute rather than normalizePath, so a health
+ * path configured without a leading slash is SERVED on the same route
+ * validateConfig graded and the same route app.py and User.java serve.
  *
- * It is also VALIDATED here, before any socket exists. A server that bound a
- * port and then answered 200/UP with a malformed version would have published
- * the very thing the validation exists to refuse, and would have looked healthy
- * while doing it - so the refusal happens at construction, where the caller's own
- * catch block learns about the typo rather than a monitoring system three layers
- * away.
+ * Configuration is resolved ONCE here rather than per request, so every response a
+ * given server produces describes the same application; app.py and User.java
+ * snapshot at construction for the same reason. Reloading is what a restart is for.
+ *
+ * It is also VALIDATED here, before any socket exists. A server that bound a port
+ * and then answered 200/UP with a malformed version would publish the very thing
+ * the validation exists to refuse, and would look healthy while doing it - so the
+ * refusal happens at construction, where the caller's own catch block learns about
+ * the typo rather than a monitoring system three layers away.
  *
  * The four listener budgets are applied here too, for the reason given at their
- * declaration: Node's defaults let a client that trickles hold a socket for five
- * minutes and never reclaim one that goes quiet.
+ * declaration. The server is RETURNED rather than started, so the tests can drive
+ * it on an ephemeral port without competing for the configured one.
  *
- * The server is returned rather than started, so the tests can drive it on an
- * ephemeral port (listen(0)) without competing for the configured one.
- *
- * @param {ReturnType<typeof loadConfig>} [config] Effective configuration.
- * @returns {import("node:http").Server} An unstarted HTTP server.
  * @throws {RangeError} When the configuration cannot be published.
  */
 function createServer(config) {
   const resolved = config === undefined || config === null ? loadConfig() : config;
   validateConfig(resolved);
-  const routePath = normalizePath(resolved.healthPath);
+  const routePath = configRoute(resolved.healthPath);
 
   const server = http.createServer(
     {
@@ -891,9 +1029,7 @@ function createServer(config) {
   return server;
 }
 
-/* -------------------------------------------------------------------------- *
- * Process modes - serve and probe
- * -------------------------------------------------------------------------- */
+// Process modes - serve and probe.
 
 /** How long a graceful shutdown may take before the process exits anyway. */
 const SHUTDOWN_GRACE_MS = 1000;
@@ -901,22 +1037,17 @@ const SHUTDOWN_GRACE_MS = 1000;
 /**
  * Registers a graceful shutdown on the signals a container runtime sends.
  *
- * Open keep-alive sockets would otherwise keep server.close() pending, so they
- * are closed first; the unref'd fallback timer guarantees the process still
- * exits promptly if a socket refuses to go away, and being unref'd it never
- * holds the event loop open on its own.
+ * Open keep-alive sockets would keep server.close() pending, so they are closed
+ * first; the unref'd fallback timer guarantees the process still exits promptly if
+ * a socket refuses to go away, and being unref'd it never holds the event loop
+ * open on its own.
  *
- * Termination convention. Because the shutdown completes normally, this process
- * exits 0 for both SIGINT and SIGTERM. The other two implementations report
- * their own runtime's convention for the same signals - app.py exits 0 on
- * SIGINT and is terminated by SIGTERM (a shell reports 143), and the JVM in
- * User.java reports 130 and 143 - so the exit STATUS is the one place these
- * three servers deliberately differ. Everything an orchestrator depends on is
- * identical: the listener is closed, the port is released, and stdout stays
- * empty. Overriding a platform convention to align the numbers would buy
- * nothing, so the difference is documented instead.
+ * Because the shutdown completes normally, this process exits 0 for both SIGINT
+ * and SIGTERM, while app.py exits 0 on SIGINT and is terminated by SIGTERM, and
+ * the JVM in User.java reports 130 and 143. Exit STATUS is the one place these
+ * three servers deliberately differ; everything an orchestrator depends on is
+ * identical - the listener is closed, the port is released, stdout stays empty.
  *
- * @param {import("node:http").Server} server Server to close.
  * @returns {() => void} The shutdown handler, for symmetry and testability.
  */
 function registerShutdown(server) {
@@ -947,7 +1078,6 @@ function registerShutdown(server) {
  *
  * @param {{config?: object, host?: string, port?: number|string,
  *          file?: string, env?: Record<string, string|undefined>}} [options]
- * @returns {import("node:http").Server} The listening server.
  * @throws {RangeError} When the configuration cannot be published.
  */
 function serve(options = {}) {
@@ -979,7 +1109,7 @@ function serve(options = {}) {
     // stderr. The route printed is the NORMALISED one the listener actually
     // answers on, not the raw configured string, so the banner cannot promise a
     // route that does not exist.
-    const route = normalizePath(config.healthPath);
+    const route = configRoute(config.healthPath);
     warn(`health endpoint listening on http://${String(host)}:${boundPort}${route}`);
   });
 
@@ -987,30 +1117,21 @@ function serve(options = {}) {
   return server;
 }
 
-/* -------------------------------------------------------------------------- *
- * Self-check
- *
- * The container HEALTHCHECK, written in-process precisely so that the image
- * needs no HTTP client of its own: the slim Node image ships neither curl nor
- * wget, and adding one would enlarge the image, widen its attack surface and
- * hand a post-exploitation attacker a download-and-run helper.
- *
- * A probe is a CLIENT, and a client is only as safe as its behaviour against a
- * peer that does not cooperate. Three properties are therefore built in rather
- * than assumed: the destination is selected from a loopback allowlist and never
- * derived from configuration, the exchange is bounded in time AND in bytes, and
- * the verdict comes from parsing the document against the frozen contract rather
- * than from looking for a fragment inside it.
- * -------------------------------------------------------------------------- */
+// Self-check.
+//
+// A probe is a CLIENT, and a client is only as safe as its behaviour against a
+// peer that does not cooperate. Three properties are built in rather than
+// assumed: the destination is selected from a loopback allowlist and never
+// derived from configuration, the exchange is bounded in time AND in bytes, and
+// the verdict comes from parsing the document against the frozen contract rather
+// than from looking for a fragment inside it. It is written in-process rather
+// than as a shell-out because a slim runtime image ships neither curl nor wget.
 
 /**
  * Returns true when every character is an ASCII digit and there is at least one.
  *
  * ASCII only, deliberately: a near-miss address spelled with an Arabic-Indic
  * digit must not be graded loopback.
- *
- * @param {string} candidate Candidate octet.
- * @returns {boolean} True for a run of one or more ASCII digits.
  */
 function isAsciiDigits(candidate) {
   if (candidate === "") {
@@ -1030,13 +1151,11 @@ function isAsciiDigits(candidate) {
  *
  * Written out rather than delegated to a general address parser for the same
  * reason normalizePath is written out rather than delegated to a URL parser: a
- * general parser accepts spellings this module has no reason to accept -
- * `127.1`, `0x7f.0.0.1`, a bare decimal integer - and each of them is a
- * different way to write a destination the allowlist would then have to reason
- * about. Four decimal octets or nothing.
- *
- * @param {string} candidate Configured host, already trimmed.
- * @returns {boolean} True only for `127.b.c.d` with four octets in 0-255.
+ * general parser accepts spellings this module has no reason to accept - `127.1`,
+ * `0x7f.0.0.1`, a bare decimal integer - and each is a different way to write a
+ * destination the allowlist would then have to reason about. Four decimal octets
+ * or nothing, and surrounding whitespace is not tolerated because no loader
+ * trims it.
  */
 function isIpv4Loopback(candidate) {
   if (!candidate.startsWith(IPV4_LOOPBACK_PREFIX)) {
@@ -1057,33 +1176,27 @@ function isIpv4Loopback(candidate) {
  * This is an ALLOWLIST, and that is the whole point. `app.host` is an input: it
  * comes from a properties file and from `APP_HOST` in the environment, both of
  * which an operator, an orchestrator or a compromised sidecar can set. Rewriting
- * only the wildcard spellings and using everything else verbatim - which is what
- * this function used to do - made the container HEALTHCHECK a general-purpose
- * outbound HTTP client aimed wherever that input pointed: a probe that reports
- * healthy because some other machine is healthy, and an egress request the
- * deployment never asked for. So the destination is not derived from the
- * configured value at all; it is SELECTED from a fixed set of loopback forms, and
- * a value outside that set is replaced rather than honoured.
+ * only the wildcard spellings and using everything else verbatim would make this
+ * self-check a general-purpose outbound HTTP client aimed wherever that input
+ * pointed - a probe that reports healthy because some OTHER machine is healthy,
+ * and an egress request the deployment never asked for. So the destination is not
+ * derived from the configured value at all; it is SELECTED from a fixed set of
+ * loopback forms, and a value outside that set is replaced rather than honoured.
  *
- *   | Configured host                    | Probe destination                  |
- *   | ---------------------------------- | ---------------------------------- |
- *   | unset, empty, whitespace, 0.0.0.0, | 127.0.0.1 - a wildcard names every |
- *   | ::, [::], *                        | interface, not a destination       |
- *   | localhost                          | 127.0.0.1 - mapped, never resolved |
- *   | anything in 127.0.0.0/8            | itself                             |
- *   | ::1, [::1], the expanded form      | [::1] - bracketed for the URL      |
- *   | anything else                      | 127.0.0.1, with one warning; the   |
- *   |                                    | configured value is never logged   |
+ * A wildcard spelling (unset, empty, whitespace, 0.0.0.0, ::, [::], *) becomes
+ * 127.0.0.1, because a wildcard names every interface and not a destination;
+ * `localhost` is MAPPED to 127.0.0.1 rather than resolved; an address in
+ * 127.0.0.0/8 is kept as configured; the IPv6 loopback in any spelling becomes
+ * the bracketed [::1]; anything else becomes 127.0.0.1 with one warning that
+ * never quotes the configured value. app.py and User.java apply the same
+ * selection.
  *
- * Replacing rather than refusing is deliberate. A refusal would report the
+ * Replacing rather than refusing is deliberate: a refusal would report the
  * application unhealthy because its BIND address is unusual, which is a
- * misdiagnosis: the listener may well be serving perfectly on an interface this
- * probe is not allowed to dial. Probing loopback answers the question the probe
- * is actually asking - is the process in this container serving? - and the
- * warning is what tells an operator the configured value was not used. app.py and
- * User.java apply the identical table.
+ * misdiagnosis - the listener may be serving perfectly on an interface this probe
+ * is not allowed to dial. The warning is what tells an operator the configured
+ * value was not used.
  *
- * @param {string|undefined} host Configured bind address.
  * @returns {string} 127.0.0.1, [::1], or a 127.0.0.0/8 address as configured.
  */
 function probeAuthority(host) {
@@ -1116,10 +1229,6 @@ const JSON_SIMPLE_ESCAPES = Object.freeze({
 
 /**
  * Advances past JSON insignificant whitespace.
- *
- * @param {string} text Document being read.
- * @param {number} at Cursor.
- * @returns {number} The first index at or after `at` that is not whitespace.
  */
 function skipJsonWhitespace(text, at) {
   let cursor = at;
@@ -1136,8 +1245,6 @@ function skipJsonWhitespace(text, at) {
 /**
  * Reads one RFC 8259 string literal.
  *
- * @param {string} text Document being read.
- * @param {number} at Index of the opening quotation mark.
  * @returns {{value: string, cursor: number}|null} The decoded value and the
  *   index after the closing quote, or null when the literal is malformed.
  */
@@ -1180,60 +1287,77 @@ function readJsonString(text, at) {
 }
 
 /**
- * Reads a flat JSON object whose every member value is a string.
+ * Reports whether any object in an ALREADY-VALID JSON document names a member twice.
  *
- * JSON.parse would be shorter, but it resolves a repeated key by keeping the
- * LAST occurrence and says nothing about it, which silently turns a
- * contradictory document into a plausible one: a body carrying
- * `"status":"DOWN","status":"UP"` parses as healthy. RFC 8259 calls such an
- * object's behaviour unpredictable, so the probe refuses it rather than picking a
- * member on the endpoint's behalf. app.py refuses it through an
- * `object_pairs_hook` and User.java through the same algorithm as this reader, so
- * all three refuse the same documents.
+ * `JSON.parse` resolves a repeated name by keeping the LAST occurrence and says
+ * nothing about it, which silently turns a contradictory document into a plausible
+ * one: `"status":"UP","status":"DOWN"` parses into an object reporting DOWN. RFC
+ * 8259 calls such an object's behaviour unpredictable, so the probe refuses it
+ * rather than picking a member on the endpoint's behalf.
  *
- * Anything that is not exactly a flat object of string values yields null: a
- * nested object, an array, a numeric or boolean member, a missing quote, a
- * repeated key, or a single byte of trailing content after the closing brace.
+ * This runs as part of the PARSE step rather than after the field rules, and that
+ * placement is the contract: app.py refuses a repeat through an
+ * `object_pairs_hook` and User.java through its reader's own member map, and both
+ * fire while the document is being parsed - so grading a duplicate later here
+ * would report a FIELD reason for a body the other two call malformed.
  *
- * @param {string} text Candidate JSON document.
- * @returns {Map<string, string>|null} The members in order, or null.
+ * The scan assumes `text` has already been accepted by `JSON.parse`, so it
+ * validates nothing: it only has to find the member names, which it does with a
+ * container stack so that a string inside an array is never mistaken for one.
+ * Names are compared DECODED, so `"a"` and `"\u0061"` collide exactly as they do
+ * in the siblings, and EVERY object is examined at every depth, because the
+ * sibling hooks apply at every depth too.
  */
-function readFlatStringObject(text) {
-  const members = new Map();
+function repeatsMember(text) {
+  // One frame per open container: a Set of the member names seen so far for an
+  // object, and null for an array. Arrays hold no names, but they must still be
+  // tracked, or a string element would be read as a member name.
+  const stack = [];
+  let expectName = false;
   let cursor = skipJsonWhitespace(text, 0);
-  if (text.charAt(cursor) !== "{") {
-    return null;
+  while (cursor < text.length) {
+    const character = text.charAt(cursor);
+    if (character === '"') {
+      const literal = readJsonString(text, cursor);
+      if (literal === null) {
+        // Unreachable for a document JSON.parse accepted, and reported as a
+        // repeat rather than ignored: a probe that cannot read a body must never
+        // be the reason that body passes.
+        return true;
+      }
+      const names = stack[stack.length - 1];
+      if (expectName && names) {
+        if (names.has(literal.value)) {
+          return true;
+        }
+        names.add(literal.value);
+        expectName = false;
+      }
+      cursor = literal.cursor;
+    } else if (character === "{") {
+      stack.push(new Set());
+      expectName = true;
+      cursor += 1;
+    } else if (character === "[") {
+      stack.push(null);
+      expectName = false;
+      cursor += 1;
+    } else if (character === "}" || character === "]") {
+      stack.pop();
+      expectName = false;
+      cursor += 1;
+    } else if (character === ",") {
+      expectName = stack.length > 0 && stack[stack.length - 1] !== null;
+      cursor += 1;
+    } else {
+      // A colon, or one character of a number, `true`, `false` or `null`. Stepping
+      // over it one character at a time is enough: none of them can contain a
+      // quotation mark, a bracket or a comma.
+      cursor += 1;
+    }
+    cursor = skipJsonWhitespace(text, cursor);
   }
-  cursor = skipJsonWhitespace(text, cursor + 1);
-  if (text.charAt(cursor) === "}") {
-    return skipJsonWhitespace(text, cursor + 1) === text.length ? members : null;
-  }
-  for (;;) {
-    const key = readJsonString(text, cursor);
-    if (key === null) {
-      return null;
-    }
-    cursor = skipJsonWhitespace(text, key.cursor);
-    if (text.charAt(cursor) !== ":") {
-      return null;
-    }
-    cursor = skipJsonWhitespace(text, cursor + 1);
-    const value = readJsonString(text, cursor);
-    if (value === null || members.has(key.value)) {
-      return null;
-    }
-    members.set(key.value, value.value);
-    cursor = skipJsonWhitespace(text, value.cursor);
-    const delimiter = text.charAt(cursor);
-    if (delimiter === ",") {
-      cursor = skipJsonWhitespace(text, cursor + 1);
-      continue;
-    }
-    if (delimiter === "}") {
-      return skipJsonWhitespace(text, cursor + 1) === text.length ? members : null;
-    }
-    return null;
-  }
+  return false;
 }
 
 /**
@@ -1244,7 +1368,6 @@ function readFlatStringObject(text) {
  * reporting itself down is reported as down rather than as whichever of its other
  * fields happened also to be wrong.
  *
- * @param {Record<string, unknown>} document Parsed health document.
  * @returns {string|null} A fixed-category reason, or null when all four hold.
  */
 function fieldRejection(document) {
@@ -1270,27 +1393,25 @@ function fieldRejection(document) {
  * call, and so that all three implementations can be held to the same wording: an
  * operator greps one deployment's logs, not one language's.
  *
- * The rules, in the order they are applied - and the order is part of the
- * contract, because it decides which of two simultaneous faults is reported:
+ * The rules, in the order applied - and the order is part of the contract, because
+ * it decides which of two simultaneous faults is reported:
  *
  *   1. the body fits inside MAX_PROBE_BODY_BYTES;
  *   2. the response code is exactly 200 - the IETF health-check draft couples a
  *      passing status to a 2xx code, and this contract narrows that to one code;
- *   3. the body is JSON, with nothing trailing it;
+ *   3. the body decodes as UTF-8, is JSON with nothing trailing it, and names no
+ *      member twice. ONE step, because all three are what the siblings settle
+ *      while parsing, and splitting them would change which of two simultaneous
+ *      faults gets reported;
  *   4. the body is a JSON OBJECT;
  *   5. it carries exactly PAYLOAD_KEYS, in that order;
- *   6. the four field rules of fieldRejection;
- *   7. no key appears twice and every member is a string - the check the strict
- *      reader exists for, applied last because it is the only one that cannot be
- *      stated against a parsed document.
+ *   6. the four field rules of fieldRejection, which also refuse a nested or
+ *      numeric member, since one that is not a string cannot satisfy its rule.
  *
- * A parse is what makes this fail closed. The defect this replaces tested the raw
- * body for the fragment `"status":"UP"`, so a truncated, unparseable body that
- * happened to contain those bytes was graded healthy; every rule here is stated
- * against a parsed document instead.
+ * Every rule is stated against a PARSED document, and that is what makes the
+ * verdict fail closed: a truncated, unparseable body that happens to contain the
+ * bytes `"status":"UP"` proves nothing and is graded on rule 3.
  *
- * @param {number} status HTTP status code the endpoint answered with.
- * @param {Buffer|string} body Response body as received.
  * @returns {string|null} A fixed-category reason, or null when the answer is good.
  */
 function probeRejection(status, body) {
@@ -1303,11 +1424,24 @@ function probeRejection(status, body) {
   if (status !== 200) {
     return `the endpoint answered status ${Number(status)}`;
   }
-  const text = buffer.toString("utf8");
+  // Decode and parse under ONE catch, because a body that is not UTF-8 and a body
+  // that is not JSON are the same fact to a probe, and because that is where the
+  // siblings put the boundary: app.py catches UnicodeDecodeError and ValueError
+  // together, and User.java's strict decoder throws its reader's exception. The
+  // decoder is FATAL: a lossy decode substitutes U+FFFD, so a body carrying
+  // `c3 28` inside its name field would decode to a schema-valid document and be
+  // graded healthy here while both siblings refused the same bytes.
+  let text;
   let parsed;
   try {
+    text = STRICT_UTF8_DECODER.decode(buffer);
     parsed = JSON.parse(text);
   } catch {
+    return "body is not the expected JSON document";
+  }
+  // Part of the parse step, before any field is graded: see repeatsMember for why
+  // the placement rather than the rule is what keeps the three verdicts identical.
+  if (repeatsMember(text)) {
     return "body is not the expected JSON document";
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -1317,14 +1451,7 @@ function probeRejection(status, body) {
   if (keys.length !== PAYLOAD_KEYS.length || keys.some((key, at) => key !== PAYLOAD_KEYS[at])) {
     return PROBE_KEY_SET_REASON;
   }
-  const fieldReason = fieldRejection(parsed);
-  if (fieldReason !== null) {
-    return fieldReason;
-  }
-  if (readFlatStringObject(text) === null) {
-    return "body is not the expected JSON document";
-  }
-  return null;
+  return fieldRejection(parsed);
 }
 
 /** Self-probe deadline. Short, because a health check must answer quickly. */
@@ -1332,11 +1459,11 @@ const PROBE_TIMEOUT_MS = 2500;
 
 /**
  * Requests this application's own health endpoint and reports the verdict as a
- * process exit code.
+ * process exit code, which is the whole machine-readable result - a container
+ * runtime can read it without an HTTP client of its own.
  *
- * This is what the container HEALTHCHECK runs, and it is deliberately strict: 0
- * is returned only when the endpoint answers 200 AND the body satisfies the
- * frozen contract. Every other outcome - refused connection, expired deadline,
+ * Deliberately strict: 0 only when the endpoint answers 200 AND the body satisfies
+ * the frozen contract. Every other outcome - refused connection, expired deadline,
  * wrong status code, oversized body, unparseable body, a document that merely
  * looks right, anything unforeseen - yields 1, because a probe that cannot PROVE
  * health must not report it.
@@ -1344,23 +1471,21 @@ const PROBE_TIMEOUT_MS = 2500;
  * The exchange is bounded twice, because either bound alone can be defeated:
  *
  *   - an ABSOLUTE deadline, armed BEFORE the request object exists, so a name
- *     resolution or a connect that hangs is inside the budget rather than ahead
- *     of it. The request-level `timeout` option is an inactivity timer and cannot
- *     do this: a peer that sends one byte just inside every interval satisfies
- *     all of them and keeps the probe alive for as long as it likes;
+ *     resolution or a connect that hangs is inside the budget. The request-level
+ *     `timeout` option is an inactivity timer and cannot do this: a peer that
+ *     sends one byte just inside every interval satisfies all of them;
  *   - a ceiling of MAX_PROBE_BODY_BYTES, enforced as chunks ARRIVE rather than
  *     after the body is complete, so an endpoint that streams without end is
  *     bounded in memory as well as in time.
  *
- * `http.request` is used rather than `fetch`, and that is also a security choice
- * rather than a stylistic one: `http.request` consults no proxy configuration,
- * whereas an environment-aware client can be redirected by an injected
- * `HTTP_PROXY` - which was demonstrated in the Python implementation to let a
- * fabricated document answer a self-check on behalf of a process that was not
- * running at all. A loopback self-check must never be proxied.
+ * `http.request` is used rather than `fetch`, and that is a security choice: it
+ * consults no proxy configuration, whereas an environment-aware client can be
+ * redirected by an injected `HTTP_PROXY` - demonstrated in the Python
+ * implementation to let a fabricated document answer a self-check on behalf of a
+ * process that was not running at all. A loopback self-check must never be proxied.
  *
- * The verdict is returned rather than passed to process.exit so the unit tests
- * can call probe() without killing the test runner.
+ * The verdict is returned rather than passed to process.exit so the unit tests can
+ * call probe() without killing the test runner.
  *
  * @param {{config?: object, host?: string, port?: number|string, timeout?: number,
  *          file?: string, env?: Record<string, string|undefined>}} [options]
@@ -1401,7 +1526,7 @@ function probe(options = {}) {
   }
   // The NORMALISED route, which is the one the listener actually answers on, so
   // the probe cannot ask for a target the endpoint would 404.
-  const route = normalizePath(config.healthPath);
+  const route = configRoute(config.healthPath);
   if (!isRequestTarget(route)) {
     warn("probe cannot run: the configured health path is not a valid request target");
     return Promise.resolve(1);
@@ -1421,10 +1546,6 @@ function probe(options = {}) {
      * 0/1 contract total: the timer is cleared so the process is not held open,
      * the request is destroyed so no descriptor outlives the verdict, and a
      * second call from a later event is ignored.
-     *
-     * @param {number} code 0 when healthy, 1 otherwise.
-     * @param {string} [detail] Fixed-category diagnostic for an unhealthy verdict.
-     * @returns {void}
      */
     const finish = (code, detail) => {
       if (settled) {
@@ -1514,14 +1635,10 @@ function probe(options = {}) {
   });
 }
 
-/* -------------------------------------------------------------------------- *
- * Entry point
- * -------------------------------------------------------------------------- *
- * The guard is what makes this file both runnable and importable: requiring it
- * produces no output at all, while running it keeps the behaviour it has always
- * had. An unrecognised flag falls through to the default branch - the legacy
- * invocation never fails, and there is no usage error to print.
- * -------------------------------------------------------------------------- */
+// Entry point. The guard is what makes this file both runnable and importable:
+// requiring it produces no output at all, while running it dispatches the three
+// modes. An unrecognised flag falls through to the default branch, so the legacy
+// invocation never fails and there is no usage error to print.
 
 if (require.main === module) {
   const args = process.argv.slice(2);
@@ -1547,10 +1664,9 @@ if (require.main === module) {
         process.exit(1);
       });
   } else {
-    // The six statements below are the original program, moved verbatim out of
-    // module scope and into this branch. Same statements, same order, same
-    // count: the five writes are the output contract, hashed by a committed
-    // baseline, so they are neither de-duplicated nor collapsed into a loop.
+    // The five writes are the output contract: their number, order and exact
+    // bytes are hashed by a committed baseline, so they are neither
+    // de-duplicated nor collapsed into a loop.
     const result = add(5, 7);
     console.log(result);
     console.log(result);
@@ -1584,6 +1700,7 @@ module.exports = {
   healthPayload: buildPayload,
   renderPayload,
   normalizePath,
+  configRoute,
   stripAuthority,
   sanitizeForLog,
   createServer,

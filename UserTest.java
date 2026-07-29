@@ -1,148 +1,70 @@
 /*
- * =============================================================================
  * UserTest.java - the assertion harness for User.java (feature F-009).
- * =============================================================================
  *
  * HOW TO RUN
- * ----------
- *   java UserTest.java            From the repository root, with no classpath,
- *                                 no build step and no test framework. The JDK's
- *                                 multi-file source launcher resolves and
- *                                 compiles the sibling User.java automatically.
+ *   java UserTest.java              From the repository root, with no classpath,
+ *                                   no build step and no test framework: the
+ *                                   JDK's multi-file source launcher resolves
+ *                                   and compiles the sibling User.java.
  *   javac -Xlint:all -d /tmp/out User.java UserTest.java
- *   java -cp /tmp/out UserTest    The compiled equivalent, used by the CI job
- *                                 that also asserts zero compiler warnings.
+ *   java -cp /tmp/out UserTest      The compiled equivalent.
  *
  * Exit status is the whole contract: 0 when every check passed, 1 when any check
- * failed or anything unexpected was thrown. The final line reports the number of
- * checks executed, which the continuous-integration gate reads to prove that a
- * non-zero number of checks actually ran - a harness that silently executes
- * nothing while exiting 0 is worse than no harness at all.
+ * failed or anything unexpected was thrown. The final line reports how many
+ * checks executed, so a caller can require that number to exceed zero - a
+ * harness that silently runs nothing while exiting 0 is worse than none.
  *
- * ZERO DEPENDENCIES
- * -----------------
- * JDK only. There is no JUnit, TestNG, AssertJ or Hamcrest here, and no Maven,
- * Gradle or wrapper anywhere in the repository. Installing a runner tree into a
- * repository this small would be disproportionate and would destroy the
- * zero-dependency property that the application itself preserves, so the
+ * ZERO DEPENDENCIES. JDK only, with no JUnit, TestNG, AssertJ or Hamcrest and no
+ * Maven, Gradle or wrapper anywhere in the repository: a runner tree would
+ * destroy the zero-dependency property the application itself preserves, so the
  * assertion engine below is roughly forty lines of plain Java. The HTTP client
- * used by the live-routing section is java.net.http from the standard module
- * graph, exactly as the application's own self-check uses it.
+ * the live-routing section uses is java.net.http from the standard module graph,
+ * exactly as the application's own self-check uses it.
  *
- * DEFAULT UNNAMED PACKAGE - DELIBERATE
- * ------------------------------------
- * There is deliberately no package declaration. That is what lets
- * "java UserTest.java" resolve the sibling User class from source, and it is
- * what makes User's package-private helpers - configProperties, resolve,
- * resolvePort, the accessors, timestamp, jsonEscape, renderPayload,
- * healthPayload, normalisePath, createServer, startServer and probe - reachable
- * from here. Those members carry default access precisely so that this file can
- * exercise them without any of them being widened to public for testing.
+ * DEFAULT UNNAMED PACKAGE - DELIBERATE. There is no package declaration, which
+ * is what lets "java UserTest.java" resolve the sibling User class from source
+ * and what makes User's package-private members reachable from here without any
+ * of them being widened to public for testing.
  *
- * WHAT IS ASSERTED, AND WHY EACH GROUP EXISTS
- * -------------------------------------------
- *   A  Preserved legacy behaviour. The original program printed "Test" and
- *      exited 0, and that must remain byte-identical: the backward-compatibility
- *      requirement is the one constraint that outranks the new feature. This
- *      section runs the default mode in an ISOLATED CHILD JVM and reads its exit
- *      status and its two streams as raw bytes. See "WHY A CHILD JVM" below -
- *      the isolation is what makes the check trustworthy, not merely tidy.
- *   B  The frozen response contract: four keys, in the order name, version,
- *      timestamp, status, compact, with the literal status value UP.
- *   C  JSON escaping. The JDK ships no JSON serializer, so User assembles the
- *      document by hand; the escape helper is therefore load-bearing and is
- *      tested directly, including the characters it deliberately leaves alone.
- *   D  Path normalisation, which is the routing decision.
- *   E  Configuration precedence: environment over file over built-in default.
- *      The environment layer is proven in a child JVM whose environment this
- *      harness sets itself, so that layer is covered unconditionally.
- *   F  Live routing over a real socket, including the negative paths.
- *   G  Entry-point dispatch: --serve and --probe driven through the real main
- *      method of a child JVM, which is the only way to prove the dispatcher
- *      rather than the methods it dispatches to.
- *   H  Transport behaviour over a raw socket: the contract asserted byte-for-byte
- *      rather than through a client that reframes it, the connection and body
- *      semantics around it, and the endpoint's answer to hostile request bytes -
- *      none of which a conforming HTTP client can be persuaded to produce.
- *
- * WHY A CHILD JVM, FOR SECTIONS A, E AND G
- * ----------------------------------------
- * Three things can only be observed from outside the process under test, and all
- * three are contractual here.
- *
- * An EXIT STATUS is one. Calling User.main in this JVM and capturing the streams
- * looks equivalent and is not: if the default path ever regressed to call
- * System.exit(0), that call would terminate THIS process from inside the
- * assertion. No summary line would be printed, no check count would be reported,
- * and - because the status would be 0 - the harness would look like it passed.
- * That is the worst failure mode a test can have, and it is invisible from the
- * inside by construction. A child JVM makes the exit status an observation
- * instead of an assumption, and it makes System.exit(0) fail this section rather
- * than silently satisfy it.
- *
- * An ENVIRONMENT is the second. A JVM's environment is fixed at launch and this
- * harness will not use reflection to forge one, so the environment layer of the
- * precedence chain cannot be exercised in process at all. A child can: its
- * environment is an argument. Section E therefore starts a child with a
- * properties file saying one thing and environment variables saying another, and
- * reads the served payload to see which won. The child's environment is built
- * EMPTY and populated explicitly - not even PATH is inherited - so the check
- * neither depends on nor discloses anything about the environment this harness
- * happens to run in, and it can never be skipped for want of a witness variable.
- *
- * A PROCESS LIFECYCLE is the third. "The default mode starts no listener" is a
- * claim about the whole process: a child that bound a socket would not exit, so
- * observing prompt termination proves it more completely than counting threads
- * from the inside ever could.
- *
- * The child is launched with the JDK's multi-file source launcher when User.java
- * can be located, and from compiled classes otherwise, so both documented
- * invocations work. If NEITHER can be located the harness records a counted
- * FAILURE rather than skipping: a check that quietly does not run is the same
- * false green this section exists to eliminate.
+ * WHY A CHILD JVM, FOR SECTIONS A, E AND G. Three properties can only be
+ * observed from outside the process under test. An EXIT STATUS is one: were the
+ * default path ever to call System.exit(0), that call would terminate an
+ * in-process assertion from inside it, printing no summary and reporting status
+ * 0 - the worst failure mode a test can have. An ENVIRONMENT is the second: a
+ * JVM's environment is fixed at launch and this harness will not use reflection
+ * to forge one, so the environment layer of the precedence chain is exercised by
+ * a child, whose environment is an argument. A PROCESS LIFECYCLE is the third:
+ * "the default mode starts no listener" is a claim about a whole process, and a
+ * child that bound a socket would not exit. A child is launched from source when
+ * User.java can be located and from compiled classes otherwise; when NEITHER can
+ * be located the harness records a counted FAILURE rather than skipping.
  *
  * TWO RULES THIS HARNESS IMPOSES ON ITSELF
- * ----------------------------------------
  *   1. The timestamp is asserted by FORMAT and never by VALUE. It is the only
- *      non-deterministic field in the payload, and an assertion on its value
- *      would make this harness fail for a reason unrelated to correctness.
- *   2. Nothing here mutates the environment of THIS process, and no reflection
- *      is used to try. Where an environment override is needed it is passed to a
- *      child process, which is the supported way to set one.
+ *      non-deterministic field in the payload.
+ *   2. Nothing here mutates the environment of THIS process, and no reflection is
+ *      used to try. An override is passed to a child process instead.
  *
- * A NOTE ON ENVIRONMENT VALUES AND DISCLOSURE
- * -------------------------------------------
- * A process environment routinely carries credentials, so the variables this
- * harness reads are named explicitly and never discovered by scanning: a scan
- * ordered by name could just as easily select an API key as a witness. Only two
- * categories are read. The application's own settings - APP_NAME, APP_VERSION,
- * HEALTH_PATH, APP_HOST, PORT and JAVA_PORT - are by definition not secrets,
- * since the first two are published in the health response itself, so those may
- * appear in a diagnostic. PATH is read once, as an opportunistic in-process
- * precedence witness, and compared only through the boolean check form, so a
- * failure reports the name of the check and never the value; the precedence proof
- * does not depend on it, because section E's child JVM supplies its own variables.
- * No environment variable of this process is written, and no reflection is used
- * to try. Every child environment is built EMPTY and populated explicitly, so
- * nothing this harness runs can inherit a credential from its own environment.
+ * ENVIRONMENT VALUES AND DISCLOSURE. A process environment routinely carries
+ * credentials, so the variables read here are named explicitly and never
+ * discovered by scanning: a scan ordered by name could just as easily select an
+ * API key. Only the application's own settings are read - APP_NAME, APP_VERSION,
+ * HEALTH_PATH, APP_HOST, PORT and JAVA_PORT - and the first two are published in
+ * the health response itself, so they may appear in a diagnostic. Every child
+ * environment is built EMPTY and populated explicitly, so not even PATH is
+ * inherited and nothing this harness starts can pick up a credential from it.
  *
- * EXPECTED OUTPUT THAT IS NOT A FAILURE
- * -------------------------------------
- * Four sections deliberately drive User down a fail-closed path, and User reports
- * each on stderr by design:
+ * EXPECTED OUTPUT THAT IS NOT A FAILURE. Several checks deliberately drive User
+ * down a fail-closed path, and User reports each on stderr by design:
  *   [User] probe could not reach http://...            (sections F and G)
  *   [User] probe rejected http://...: status 404       (section G)
  *   [User] refusing to start: invalid port value: ...  (section G)
  *   [User] could not bind ...: java.net.BindException  (section G)
- * The first is announced on stdout immediately before it is provoked so that a
- * reader of a CI log does not mistake an expected diagnostic for a real fault.
- * The remaining three are produced by CHILD processes, whose streams this harness
- * captures rather than passes through, so they never reach the log at all - they
- * are asserted on instead.
- *
- * Section E drives the other fail-closed path - an unusable port value - but that
- * one is refused by an exception rather than reported on a stream, so it produces
- * no stderr line to announce. See checkRejects.
+ * The first is announced on stdout immediately before it is provoked, so a reader
+ * does not mistake an expected diagnostic for a real fault. The other three come
+ * from CHILD processes whose streams this harness captures and asserts on, so
+ * they never reach the log. Section E's unusable-port path is refused by an
+ * exception rather than reported on a stream. See checkRejects.
  */
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
@@ -150,6 +72,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.StringReader;
 import java.io.Writer;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -165,6 +88,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -223,11 +147,13 @@ public class UserTest {
                     UserTest::verifyConfigurationValidation);
             runSection("J probe answer validation and connection reuse",
                     UserTest::verifyProbeValidationAndReuse);
+            runSection("K the shared properties grammar and the failure policy",
+                    UserTest::verifySharedPropertiesGrammar);
         } catch (RuntimeException unexpected) {
             // Defensive: runSection already contains every section, so reaching
             // this point means the harness itself misbehaved. It is still turned
             // into a counted failure rather than a bare stack trace, because an
-            // exit status is the only thing the CI gate can act on.
+            // exit status is the only machine-readable outcome a caller gets.
             checksFailed++;
             System.err.println("FAIL: harness aborted unexpectedly: " + unexpected);
         }
@@ -238,15 +164,10 @@ public class UserTest {
         System.exit(checksFailed == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
     }
 
-    // -------------------------------------------------------------------------
-    // The frozen expectations
-    //
-    // User keeps its configuration keys, environment names and built-in defaults
-    // private, which is correct: they are its implementation detail. This
-    // harness therefore restates them as its own literals. That is deliberate
-    // rather than duplication for its own sake - a test that imported the
-    // constants it is checking would assert only that a value equals itself.
-    // -------------------------------------------------------------------------
+    // The frozen expectations. User keeps its configuration keys, environment
+    // names and built-in defaults private, so this harness restates them as its
+    // own literals: a test that imported the constants it is checking would
+    // assert only that a value equals itself.
 
     /** Standard-output bytes the original program produced, and must still produce. */
     private static final String LEGACY_STDOUT_TEXT = "Test";
@@ -254,18 +175,14 @@ public class UserTest {
     /**
      * Byte length of the preserved default output, {@code Test} plus one newline.
      *
-     * <p>Five is the value the backward-compatibility gate hashes. It assumes a
-     * single-byte line separator, which every target of this project uses: the
-     * CI runner is Linux and all three container images are Linux. A platform
-     * with a two-byte separator would legitimately fail this check, because it
-     * would also break the byte-for-byte output contract the gate enforces.
+     * <p>It assumes a single-byte line separator, which every target of this
+     * project uses. A platform with a two-byte separator would legitimately fail
+     * this check, because it would also break the byte-for-byte output contract.
      */
     private static final int LEGACY_STDOUT_BYTE_LENGTH = 5;
 
-    /** The one and only value the endpoint reports for a passing status. */
     private static final String STATUS_UP = "UP";
 
-    /** The exact fragment a healthy body must contain. */
     private static final String STATUS_UP_FRAGMENT = "\"status\":\"UP\"";
 
     private static final String KEY_APP_NAME = "app.name";
@@ -292,7 +209,6 @@ public class UserTest {
     /** Lowest legal port; 0 additionally means "ask the OS for an ephemeral one". */
     private static final int MIN_PORT = 0;
 
-    /** Highest legal port. */
     private static final int MAX_PORT = 65535;
 
     /**
@@ -311,16 +227,12 @@ public class UserTest {
      */
     private static final int REFERENCE_BODY_BYTE_LENGTH = 108;
 
-    /** The reference document, byte for byte. */
     private static final String REFERENCE_BODY =
             "{\"name\":\"only_parent_parent_repo_10_LOC\",\"version\":\"1.1.0\""
             + ",\"timestamp\":\"2026-07-28T13:47:08Z\",\"status\":\"UP\"}";
 
-    // -------------------------------------------------------------------------
     // Patterns
-    // -------------------------------------------------------------------------
 
-    /** Three-part dotted numeric version. */
     private static final Pattern VERSION_PATTERN = Pattern.compile("^\\d+\\.\\d+\\.\\d+$");
 
     /**
@@ -358,17 +270,12 @@ public class UserTest {
             + "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \\d{4} "
             + "\\d{2}:\\d{2}:\\d{2} GMT$");
 
-    // -------------------------------------------------------------------------
     // Harness mechanics
-    // -------------------------------------------------------------------------
 
-    /** Exit status meaning every check passed. */
     private static final int EXIT_SUCCESS = 0;
 
-    /** Exit status meaning at least one check failed, or the harness aborted. */
     private static final int EXIT_FAILURE = 1;
 
-    /** Visual divider around the summary. */
     private static final String SEPARATOR =
             "------------------------------------------------------------";
 
@@ -382,15 +289,6 @@ public class UserTest {
 
     /** A second guaranteed-absent name, for the universal-port parameter. */
     private static final String ABSENT_ENV_SECONDARY = "USERTEST_ABSENT_ENV_DO_NOT_SET_B";
-
-    /**
-     * The variable read as a precedence witness. PATH is present in every
-     * environment this project runs in - a shell, a CI runner and all three
-     * container images - it is never numeric, and it is not a secret. It is
-     * named explicitly rather than discovered by scanning the environment,
-     * because a scan could just as easily select a credential.
-     */
-    private static final String WITNESS_ENV_NAME = "PATH";
 
     /** Loopback, so nothing this harness binds is reachable off the host. */
     private static final String TEST_HOST = "127.0.0.1";
@@ -423,7 +321,7 @@ public class UserTest {
      */
     private static final String DISPATCHER_THREAD_NAME = "HTTP-Dispatcher";
 
-    /** Total number of checks executed; the CI gate requires this to exceed zero. */
+    /** Total number of checks executed; the summary line reports it. */
     private static int checksExecuted;
 
     /** Number of checks that failed; the process exit status is derived from it. */
@@ -435,15 +333,11 @@ public class UserTest {
     /** The root path, which is what an empty or null request path normalises to. */
     private static final String ROOT_PATH = "/";
 
-    /** Seconds to wait for a stopped server's dispatcher thread to disappear. */
     private static final int DISPATCHER_SHUTDOWN_WAIT_SECONDS = 5;
 
-    /** Poll interval while waiting for that thread, in milliseconds. */
     private static final long DISPATCHER_POLL_MILLIS = 20L;
 
-    // -------------------------------------------------------------------------
     // Child-process expectations - sections A, E and G
-    // -------------------------------------------------------------------------
 
     /**
      * Budget for a child JVM that is expected to finish, in seconds.
@@ -460,7 +354,6 @@ public class UserTest {
     /** Budget for a serving child to announce its port, in seconds. */
     private static final int SERVER_START_TIMEOUT_SECONDS = 90;
 
-    /** Budget for a serving child to exit once it has been asked to, in seconds. */
     private static final int CHILD_STOP_TIMEOUT_SECONDS = 20;
 
     /**
@@ -475,13 +368,10 @@ public class UserTest {
     private static final Pattern BANNER_PATTERN = Pattern.compile(
             "^\\[User\\] health endpoint listening on http://([^\\s:/]+):(\\d+)(\\S*)$");
 
-    /** The application's source file name, for the source-launcher invocation. */
     private static final String APPLICATION_SOURCE_FILE = "User.java";
 
-    /** The application's compiled class file name, for the classpath invocation. */
     private static final String APPLICATION_CLASS_FILE = "User.class";
 
-    /** The application's class name, as passed to the launcher. */
     private static final String APPLICATION_CLASS_NAME = "User";
 
     /**
@@ -503,10 +393,8 @@ public class UserTest {
      */
     private static final String SOURCE_LAUNCHER_PROPERTY = "jdk.launcher.sourcefile";
 
-    /** The flag that selects serve mode. */
     private static final String FLAG_SERVE = "--serve";
 
-    /** The flag that selects probe mode. */
     private static final String FLAG_PROBE = "--probe";
 
     /** An argument the dispatcher must not recognise, so it selects the default. */
@@ -518,23 +406,13 @@ public class UserTest {
     /** A numerically valid but out-of-range port, refused for a different reason. */
     private static final String OUT_OF_RANGE_PORT_VALUE = "70000";
 
-    // -------------------------------------------------------------------------
-    // Transport expectations - section H
-    //
-    // The exact header sets, the runtime's one observable ceiling, and the sizes
-    // used to probe it. These are restated here rather than imported from User for
-    // the same reason every other expectation is: a test that read the constant it
-    // is checking would assert only that a value equals itself.
-    //
-    // What is NOT here is as deliberate as what is. There is no 400, 414, 431 or
-    // 505 expectation, and no fixed body for one, because this endpoint produces no
-    // such response and the frozen contract enumerates none. Section H's own
-    // comment records the reasoning in full.
-    // -------------------------------------------------------------------------
+    // Transport expectations - section H. The exact header sets, the runtime's
+    // one observable ceiling, and the sizes used to probe it. There is no 400,
+    // 414, 431 or 505 expectation because this endpoint produces no such
+    // response; section H records the reasoning in full.
 
     private static final int HTTP_CONTINUE = 100;
 
-    /** The media type every response this endpoint writes declares. */
     private static final String CONTENT_TYPE_JSON = "application/json";
 
     /**
@@ -558,29 +436,52 @@ public class UserTest {
             List.of("no-cache", "no-store", "must-revalidate");
 
     /**
-     * Exactly the field names a 200 or a 404 carries, lower-cased.
+     * The THREE response header names the frozen contract actually specifies, and
+     * the three that app.py and index.js send - exactly these and nothing else.
+     *
+     * <p>This is the set the contract states: a JSON content type, a no-store cache
+     * directive, and a content length. It is defined separately from what this
+     * implementation sends so that the difference between the two is a named,
+     * asserted quantity rather than an assumption folded invisibly into one list.
+     */
+    private static final Set<String> SPECIFIED_HEADER_NAMES =
+            Set.of("content-type", "cache-control", "content-length");
+
+    /**
+     * The header fields this transport adds that the contract does not specify.
+     *
+     * <p>Exactly one: {@code date}. This is a STATED DEVIATION, not a contract
+     * field. The contract says "no server banner and no date header", and this
+     * implementation sends a date header because {@code Headers.set("Date", <now>)}
+     * runs unconditionally inside {@code ExchangeImpl.sendResponseHeaders} before
+     * its first branch and replaces whatever the caller put there. The full record -
+     * the seven application-side techniques measured against a live server on this
+     * JDK, and the four places the specification mandates this transport - is on
+     * {@code User.sendResponse}.
+     *
+     * <p>Naming the deviation in its own constant is what keeps the harness from
+     * quietly ratifying it: {@link #checkDeviationIsBounded} asserts that the sets
+     * below are the specified three plus PRECISELY these, so the divergence is
+     * pinned at one named field. A second unspecified field appearing later - a
+     * {@code Server} banner, a {@code Keep-Alive} advertising the idle timeout -
+     * fails the suite rather than being absorbed into an expectation.
+     */
+    private static final Set<String> DEVIATION_HEADER_NAMES = Set.of("date");
+
+    /**
+     * Exactly the field names a 200 or a 404 carries, lower-cased: the specified
+     * three plus the one stated deviation.
      *
      * <p>Asserted by set EQUALITY rather than by presence, which is what makes it a
      * disclosure check as well as a contract check: it proves in one assertion that
-     * these four are present AND that a {@code Server} banner, a {@code Keep-Alive}
-     * advertising the idle timeout, and anything else are not. Presence checks can
-     * only ever prove the first half, and the half they miss is the half that leaks.
-     *
-     * <p>{@code date} is one of the four because {@code HttpServer} writes it and
-     * application code cannot stop it - setting the field to a sentinel has it
-     * overwritten, and removing it after the header block is sent still sends it.
-     * RFC 9110 section 6.6.1 says an origin server SHOULD send {@code Date}, so the
-     * field is conformant, and its value discloses nothing about the runtime. It is
-     * the one field this implementation carries that app.py and index.js do not, and
-     * {@link #checkFrozenHeaders} asserts its FORMAT rather than its value for the
-     * same reason the payload timestamp is asserted by format: it is a clock
-     * reading, and a check that compared it would fail for the wrong reason.
+     * these are present AND that nothing else is. Presence checks can only ever prove
+     * the first half, and the half they miss is the half that leaks.
      */
     private static final Set<String> CONTRACT_HEADER_NAMES =
-            Set.of("date", "content-type", "cache-control", "content-length");
+            union(SPECIFIED_HEADER_NAMES, DEVIATION_HEADER_NAMES);
 
     /**
-     * Exactly the field names a 405 carries: the contract four plus Allow.
+     * Exactly the field names a 405 carries: the set above plus Allow.
      *
      * <p>Every refused method carries this same set, HEAD included. HEAD's response
      * body is empty, as RFC 9110 requires, but its {@code Content-Length} still
@@ -589,7 +490,20 @@ public class UserTest {
      * letting the server derive it and then drop it.
      */
     private static final Set<String> REFUSAL_HEADER_NAMES =
-            Set.of("date", "content-type", "cache-control", "content-length", "allow");
+            union(CONTRACT_HEADER_NAMES, Set.of("allow"));
+
+    /**
+     * Returns the union of two header-name sets.
+     *
+     * <p>Used so the expectation sets above are BUILT from the specified contract
+     * plus a named deviation, rather than written out as flat literals in which the
+     * two are indistinguishable.
+     */
+    private static Set<String> union(Set<String> first, Set<String> second) {
+        Set<String> combined = new TreeSet<>(first);
+        combined.addAll(second);
+        return Collections.unmodifiableSet(combined);
+    }
 
     /**
      * Exactly the field names an HTTP/1.0 answer carries: the contract four plus
@@ -652,10 +566,8 @@ public class UserTest {
     /** A single header field far larger than any real client sends, and still served. */
     private static final int LARGE_FIELD_BYTES = 16_385;
 
-    /** Field count for the large-but-legal header block control. */
     private static final int LARGE_BLOCK_FIELD_COUNT = 20;
 
-    /** Per-field size for the large-but-legal header block control. */
     private static final int LARGE_BLOCK_FIELD_BYTES = 1_000;
 
     /**
@@ -671,10 +583,8 @@ public class UserTest {
      */
     private static final int LARGE_BODY_BYTES = 1024 * 1024;
 
-    /** Read budget for one raw socket exchange, in milliseconds. */
     private static final int RAW_READ_TIMEOUT_MILLIS = 10_000;
 
-    /** How long to wait for a peer to close before concluding it will not, in ms. */
     private static final int RAW_CLOSE_TIMEOUT_MILLIS = 2_000;
 
     /**
@@ -686,23 +596,16 @@ public class UserTest {
      */
     private static final int RAW_POLL_TIMEOUT_MILLIS = 250;
 
-    /** Read buffer size for one raw socket read. */
     private static final int RAW_BUFFER_BYTES = 8192;
 
     /** The end of a header block, and the separator before any body. */
     private static final String HEAD_TERMINATOR = "\r\n\r\n";
 
-    /** Line terminator for every raw request this harness writes. */
     private static final String CRLF = "\r\n";
 
-    // -------------------------------------------------------------------------
-    // The assertion engine
-    //
-    // Three primitives, one counter pair, and a section runner. Every failure
-    // goes to standard error naming the check that failed, and every failure is
-    // counted, because the counter pair is the only thing the exit status - and
-    // therefore the CI gate - is derived from.
-    // -------------------------------------------------------------------------
+    // The assertion engine. Three primitives, one counter pair and a section
+    // runner. Every failure names the check that failed on standard error and is
+    // counted, because the exit status is derived from the counter pair alone.
 
     /**
      * One group of related checks.
@@ -723,9 +626,6 @@ public class UserTest {
      * of being lost behind the first stack trace. The aborted section is counted
      * as one executed and one failed check so that the summary can never claim a
      * pass for work that did not run.
-     *
-     * @param label   human-readable section name, used in every message
-     * @param section the checks to run
      */
     private static void runSection(String label, Section section) {
         System.out.println(SEPARATOR);
@@ -745,9 +645,6 @@ public class UserTest {
      * <p>This is the form used wherever the compared values must not be printed,
      * which is how the environment-precedence checks avoid echoing an
      * environment value into a log.
-     *
-     * @param name      description of what is being asserted
-     * @param condition the condition that must hold
      */
     private static void check(String name, boolean condition) {
         checksExecuted++;
@@ -763,9 +660,7 @@ public class UserTest {
      * Records the outcome of an equality comparison, reporting both values when
      * they differ so that a failure is diagnosable from the log alone.
      *
-     * @param name     description of what is being asserted
      * @param expected the required value; {@code null} is compared safely
-     * @param actual   the observed value
      */
     private static void checkEquals(String name, Object expected, Object actual) {
         checksExecuted++;
@@ -789,11 +684,7 @@ public class UserTest {
      * <p>A failure prints both arrays as unsigned decimal, because the differences
      * that matter here are invisible when rendered as text: a trailing carriage
      * return, a byte-order mark or a re-encoded character all look correct in a
-     * log and all break the hash the compatibility gate compares.
-     *
-     * @param name     description of what is being asserted
-     * @param expected the required bytes
-     * @param actual   the observed bytes
+     * log and all break the hash the committed baseline records.
      */
     private static void checkBytesEqual(String name, byte[] expected, byte[] actual) {
         checksExecuted++;
@@ -814,10 +705,6 @@ public class UserTest {
      * nothing about what else arrived. A failure names the two differences
      * separately, because "missing" and "unexpected" have different causes and a
      * combined message sends the reader looking in the wrong place.
-     *
-     * @param name     description of what is being asserted
-     * @param expected the exact set required
-     * @param actual   the observed set
      */
     private static void checkSetEquals(String name, Set<String> expected, Set<String> actual) {
         checksExecuted++;
@@ -844,9 +731,6 @@ public class UserTest {
      * written and that it withheld the value it was complaining about.
      *
      * <p>The original stream is restored on every path, including an exception.
-     *
-     * @param work the action to run
-     * @return everything the action wrote to stderr, decoded as UTF-8
      */
     private static String withStderr(Runnable work) {
         java.io.PrintStream original = System.err;
@@ -869,10 +753,6 @@ public class UserTest {
      * The configuration refusals are the opposite case: the message names the KEY
      * and withholds the VALUE, and it must match the other two implementations
      * byte for byte, so it is compared in full rather than searched.
-     *
-     * @param name     description of what is being asserted
-     * @param expected the exact message the refusal must carry
-     * @param call     the action expected to be refused
      */
     private static void checkRefusalMessage(String name, String expected, Runnable call) {
         checksExecuted++;
@@ -901,10 +781,6 @@ public class UserTest {
      * returns something". The rejected value is expected to appear in the
      * exception message, and that is asserted too: a rejection an operator cannot
      * trace back to the setting they mistyped is only half a diagnostic.
-     *
-     * @param name      description of what is being asserted
-     * @param offending the text that must appear in the rejection message
-     * @param call      the call that must reject its input
      */
     private static void checkRejects(String name, String offending, Runnable call) {
         checksExecuted++;
@@ -932,7 +808,6 @@ public class UserTest {
      * through {@link #checkEquals}, which is what keeps the harness immune to the
      * clock: a format is stable, a value is not.
      *
-     * @param name    description of what is being asserted
      * @param pattern the pattern the value must match in full
      * @param actual  the observed value; {@code null} always fails
      */
@@ -947,20 +822,11 @@ public class UserTest {
     }
 
     /**
-     * Prints an uncounted informational line.
-     *
-     * @param message the note to print
-     */
-    private static void note(String message) {
-        System.out.println("NOTE: " + message);
-    }
-
-    /**
      * Announces a diagnostic that the next check will deliberately provoke.
      *
      * <p>Two checks drive User down a fail-closed path on purpose, and User
      * reports those on standard error by design. Announcing them first is what
-     * stops a reader of a CI log from mistaking correct behaviour for a fault.
+     * stops a reader of the log from mistaking correct behaviour for a fault.
      *
      * @param expected the diagnostic that is about to appear on standard error
      */
@@ -968,13 +834,9 @@ public class UserTest {
         System.out.println("NOTE: an expected diagnostic follows on standard error: " + expected);
     }
 
-    // -------------------------------------------------------------------------
-    // Section A - preserved legacy behaviour
-    //
-    // The backward-compatibility requirement outranks the new feature: the
-    // original program printed "Test" and exited 0, and it still must. These
-    // checks are the mechanical form of that promise.
-    // -------------------------------------------------------------------------
+    // Section A - preserved legacy behaviour. The original program printed
+    // "Test" and exited 0, and it still must: the backward-compatibility
+    // requirement outranks the new feature.
 
     /**
      * Asserts that the default invocation is unchanged and side-effect free,
@@ -983,21 +845,17 @@ public class UserTest {
      * <p>The isolation is the point. Capturing streams around an in-process
      * {@code User.main} call reads the same bytes but cannot see the exit status,
      * and the exit status is half the contract: a default path that regressed to
-     * {@code System.exit(0)} would kill this JVM mid-assertion, print no summary,
+     * {@code System.exit(0)} would kill this JVM mid-assertion, print no summary
      * and still hand the shell a zero - a passing result for a run that asserted
-     * nothing. A child cannot do that to us. Its status is data.
+     * nothing.
      *
-     * <p>Both streams are compared as RAW BYTES rather than as decoded strings.
-     * The gate this mirrors hashes bytes, so bytes are what must be asserted: a
-     * text comparison would silently accept a changed encoding or a normalised
-     * line ending, both of which would break the hash while passing the test.
+     * <p>Both streams are compared as RAW BYTES. The committed baseline hashes
+     * bytes, so a text comparison would silently accept a changed encoding or a
+     * normalised line ending, either of which breaks the hash while passing.
      *
-     * <p>Prompt termination carries the listener assertion. A dual-mode program
+     * <p>Prompt termination carries the listener assertion: a dual-mode program
      * that accidentally bound a socket in its default mode would print exactly the
      * right line and then never exit, because the acceptor thread is not a daemon.
-     * Observing the process end is therefore a stronger proof that the default
-     * path is inert than counting threads from the inside could be, and it needs
-     * no knowledge of how the listener is implemented.
      */
     private static void verifyPreservedBehaviour() {
         byte[] expectedStdout = (LEGACY_STDOUT_TEXT + System.lineSeparator())
@@ -1035,40 +893,26 @@ public class UserTest {
         return count;
     }
 
-    // -------------------------------------------------------------------------
-    // Child-process machinery, shared by sections A, E and G
-    //
-    // Small, and deliberately so, but three details in it are load-bearing and
-    // each is there because omitting it produces a harness that hangs or lies:
-    //
-    //   Both output streams are drained on their own threads. A child writing
-    //   more than a pipe buffer to a stream nobody is reading BLOCKS, and a
-    //   server child writes to stderr. Draining only stdout would wedge the very
-    //   process under test, and the failure would look like a timeout in the
-    //   application rather than a defect in the harness.
-    //
-    //   Every wait is bounded and every child is destroyed on every path. An
-    //   orphaned server would hold its port and outlive the run.
-    //
-    //   Every child environment starts EMPTY. Nothing is inherited - not even
-    //   PATH - so a child sees exactly the variables a check names, which is what
-    //   makes the environment layer of the precedence chain provable rather than
-    //   merely probable, and what keeps this harness from leaking its own
-    //   environment into a process it starts.
-    // -------------------------------------------------------------------------
+    // Child-process machinery, shared by sections A, E and G. Three details in
+    // it are load-bearing, each because omitting it produces a harness that
+    // hangs or lies. Both output streams are drained on their own threads: a
+    // child writing more than a pipe buffer to a stream nobody reads BLOCKS, and
+    // a server child writes to stderr, so draining only stdout would wedge the
+    // very process under test. Every wait is bounded and every child is
+    // destroyed on every path, because an orphaned server would hold its port
+    // and outlive the run. Every child environment starts EMPTY - not even PATH
+    // is inherited - so a child sees exactly the variables a check names, which
+    // is what makes the environment layer provable rather than merely probable.
 
     /**
      * What one completed child invocation produced.
      *
      * @param status         exit status, or {@code -1} when the child had to be killed
-     * @param standardOutput every byte the child wrote to standard output
-     * @param standardError  every byte the child wrote to standard error
      * @param exited         whether the child ended on its own inside its budget
      */
     private record ChildOutcome(int status, byte[] standardOutput, byte[] standardError,
             boolean exited) {
 
-        /** @return standard error decoded for a diagnostic message */
         String errorText() {
             return new String(standardError, StandardCharsets.UTF_8);
         }
@@ -1081,8 +925,6 @@ public class UserTest {
      * guarantees the child runs on the same runtime as the parent - so a result
      * can never be explained by two different Java versions - and lets the child
      * environment be built empty, since an empty environment has no PATH to search.
-     *
-     * @return absolute path to the launcher
      */
     private static String javaLauncher() {
         return Path.of(System.getProperty("java.home"), "bin", "java").toString();
@@ -1098,9 +940,6 @@ public class UserTest {
      * as a counted failure. That is deliberate: silently skipping would reproduce
      * exactly the false green that moving these checks into a child JVM exists to
      * eliminate.
-     *
-     * @return launcher and target, ready for arguments to be appended
-     * @throws IllegalStateException if neither the source nor the class can be found
      */
     private static List<String> applicationLaunchPrefix() {
         Path source = locateBeside(APPLICATION_SOURCE_FILE);
@@ -1126,7 +965,6 @@ public class UserTest {
      * documented compiled invocation, and this class's code source covers a
      * compiled run started from somewhere else entirely.
      *
-     * @param fileName the file to find
      * @return the located file, or {@code null} if no candidate holds it
      */
     private static Path locateBeside(String fileName) {
@@ -1180,26 +1018,18 @@ public class UserTest {
      * Copies the application into a directory of its own and returns the command
      * that launches the copy.
      *
-     * <p>This exists for one purpose: to place a properties file BESIDE the code
-     * the child will run. The application resolves its configuration relative to its
-     * own code source first and the working directory second - the same rule app.py
-     * applies to {@code __file__} and index.js to {@code __dirname} - and there is
-     * deliberately no environment variable that names an arbitrary properties file
-     * in any of the three implementations. Copying the artifact is therefore the
-     * only way to give a child a configuration file of the harness's choosing, and
-     * it is a truer test than a variable would have been: it exercises the real
-     * resolution rule rather than an override that bypasses it.
+     * <p>This exists to place a properties file BESIDE the code the child will
+     * run. All three implementations resolve configuration relative to their own
+     * code source first and the working directory second, and none of them
+     * accepts an environment variable naming an arbitrary properties file, so
+     * copying the artifact is the only way to hand a child a configuration of the
+     * harness's choosing - and it exercises the real resolution rule rather than
+     * an override that bypasses it.
      *
-     * <p>The working directory is deliberately NOT changed, so the repository's own
-     * properties file remains the second candidate. That makes the check
-     * discriminating rather than merely arranged: if code-source resolution ever
-     * regressed, the child would serve the repository's values, which differ from
-     * every value written into the temporary file.
-     *
-     * @param directory an existing directory to copy the application into
-     * @return launcher and target for the copy, ready for arguments to be appended
-     * @throws IOException           if the copy cannot be made
-     * @throws IllegalStateException if neither the source nor the class can be found
+     * <p>The working directory is deliberately NOT changed, so the repository's
+     * own properties file remains the second candidate: if code-source resolution
+     * ever regressed, the child would serve the repository's values, which differ
+     * from every value written into the temporary file.
      */
     private static List<String> isolatedLaunchPrefix(Path directory) throws IOException {
         Path source = locateBeside(APPLICATION_SOURCE_FILE);
@@ -1223,9 +1053,7 @@ public class UserTest {
      * Starts a child JVM running the application, with an explicit environment.
      *
      * @param environment the child's COMPLETE environment; nothing is inherited
-     * @param args        arguments to pass after the launch target
      * @return the started process, with its standard input already closed
-     * @throws IOException if the child cannot be started
      */
     private static Process startApplication(Map<String, String> environment, String... args)
             throws IOException {
@@ -1236,19 +1064,37 @@ public class UserTest {
      * Starts a child JVM from an explicit launch command, with an explicit
      * environment.
      *
-     * @param prefix      launcher and target, as built by
-     *                    {@link #applicationLaunchPrefix} or
-     *                    {@link #isolatedLaunchPrefix}
      * @param environment the child's COMPLETE environment; nothing is inherited
-     * @param args        arguments to pass after the launch target
      * @return the started process, with its standard input already closed
-     * @throws IOException if the child cannot be started
      */
     private static Process startApplication(List<String> prefix,
+            Map<String, String> environment, String... args) throws IOException {
+        return startApplication(prefix, null, environment, args);
+    }
+
+    /**
+     * Starts a child JVM from an explicit launch command, environment and
+     * working directory.
+     *
+     * <p>The working directory is a parameter because the application's second
+     * configuration candidate is {@code app.config.properties} in the working
+     * directory. A child left pointing at the repository would find the
+     * repository's own file, so a test about a MISSING configuration file can
+     * only be honest if it can also move the child away from that file.
+     *
+     * @param workingDirectory the child's working directory, or {@code null} to
+     *                         inherit this process's
+     * @param environment      the child's COMPLETE environment; nothing is inherited
+     * @return the started process, with its standard input already closed
+     */
+    private static Process startApplication(List<String> prefix, Path workingDirectory,
             Map<String, String> environment, String... args) throws IOException {
         List<String> command = new ArrayList<>(prefix);
         command.addAll(Arrays.asList(args));
         ProcessBuilder builder = new ProcessBuilder(command);
+        if (workingDirectory != null) {
+            builder.directory(workingDirectory.toFile());
+        }
         builder.environment().clear();
         builder.environment().putAll(environment);
         Process child = builder.start();
@@ -1262,15 +1108,30 @@ public class UserTest {
     /**
      * Runs the application to completion in a child JVM and collects everything.
      *
-     * @param args        arguments to pass after the launch target
      * @param environment the child's COMPLETE environment
-     * @return the exit status, both streams as raw bytes, and whether it exited
      */
     private static ChildOutcome runApplication(List<String> args,
             Map<String, String> environment) {
+        return runApplication(null, null, args, environment);
+    }
+
+    /**
+     * Runs the application to completion in a child JVM, from an explicit launch
+     * command and working directory, and collects everything.
+     *
+     * @param prefix           launcher and target, or {@code null} for the
+     *                         repository's own copy
+     * @param workingDirectory the child's working directory, or {@code null} to
+     *                         inherit this process's
+     * @param environment      the child's COMPLETE environment
+     */
+    private static ChildOutcome runApplication(List<String> prefix, Path workingDirectory,
+            List<String> args, Map<String, String> environment) {
         Process child = null;
         try {
-            child = startApplication(environment, args.toArray(new String[0]));
+            List<String> launch = prefix != null ? prefix : applicationLaunchPrefix();
+            child = startApplication(launch, workingDirectory, environment,
+                    args.toArray(new String[0]));
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             ByteArrayOutputStream err = new ByteArrayOutputStream();
             Thread outPump = drain(child.getInputStream(), out, "child-stdout");
@@ -1303,10 +1164,7 @@ public class UserTest {
      * <p>A daemon thread so that a stream which never reaches end-of-file cannot
      * keep this JVM alive after the summary has been printed.
      *
-     * @param source the child stream to read
-     * @param sink   where to put the bytes
      * @param name   thread name, so a stack dump is readable
-     * @return the started thread
      */
     private static Thread drain(InputStream source, ByteArrayOutputStream sink, String name) {
         Thread pump = new Thread(() -> {
@@ -1373,8 +1231,6 @@ public class UserTest {
 
         /**
          * Waits for the child to announce its port.
-         *
-         * @return {@code true} once a port has been announced
          */
         boolean awaitBanner() {
             long deadline = System.nanoTime()
@@ -1406,7 +1262,6 @@ public class UserTest {
             return standardOutput.toByteArray();
         }
 
-        /** @return every diagnostic line the child has written so far */
         String diagnostics() {
             synchronized (diagnostics) {
                 return diagnostics.toString();
@@ -1449,7 +1304,6 @@ public class UserTest {
      *
      * @param overrides environment variables for the child, added to a bind on
      *                  loopback and an ephemeral port
-     * @return the running child, already listening
      */
     private static ServeChild startServeChild(Map<String, String> overrides) {
         return startServeChild(applicationLaunchPrefix(), overrides);
@@ -1458,11 +1312,8 @@ public class UserTest {
     /**
      * Starts a serving child from an explicit launch command, on an OS-chosen port.
      *
-     * @param prefix    launcher and target, which may point at an isolated copy of
-     *                  the application so that a chosen properties file sits beside it
      * @param overrides environment variables for the child, added to a bind on
      *                  loopback and an ephemeral port
-     * @return the running child, already listening
      */
     private static ServeChild startServeChild(List<String> prefix,
             Map<String, String> overrides) {
@@ -1493,14 +1344,10 @@ public class UserTest {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Section B - the frozen response contract
-    //
-    // Four keys, in the order name, version, timestamp, status, compact, with the
-    // literal status value UP. Monitoring tools, deployment scripts and humans
-    // all come to depend on this shape, so it is pinned here rather than merely
-    // described in a comment somewhere.
-    // -------------------------------------------------------------------------
+    // Section B - the frozen response contract. Four keys, in the order name,
+    // version, timestamp, status, compact, with the literal status value UP.
+    // Monitoring tools, deployment scripts and humans all come to depend on this
+    // shape, so it is pinned here rather than merely described.
 
     /**
      * Asserts the served document's shape, field formats and byte parity.
@@ -1566,10 +1413,6 @@ public class UserTest {
 
     /**
      * Reports whether the four keys appear in the one order the contract allows.
-     *
-     * @param document the rendered document
-     * @return {@code true} when name precedes version precedes timestamp
-     *         precedes status, and all four are present
      */
     private static boolean keyOrderIsFrozen(String document) {
         int nameAt = document.indexOf("\"name\"");
@@ -1591,8 +1434,6 @@ public class UserTest {
      * configuration this project ships; the escaping of a value that does contain
      * a quote is asserted directly against the escape helper instead.
      *
-     * @param document the compact JSON document to read
-     * @param key      the member name to extract
      * @return the raw field value, or {@code null} when the member is absent
      */
     private static String jsonField(String document, String key) {
@@ -1601,16 +1442,12 @@ public class UserTest {
         return matcher.find() ? matcher.group(1) : null;
     }
 
-    // -------------------------------------------------------------------------
-    // Section C - JSON escaping
-    //
-    // The JDK has no JSON serializer, so User assembles the document by hand.
-    // That makes its escape helper load-bearing in a way that its Python and
-    // JavaScript siblings' json.dumps and JSON.stringify calls are not, which is
-    // why it is tested directly - including the two categories of character it
-    // deliberately leaves alone, because over-escaping would break byte parity
-    // with those siblings just as surely as under-escaping would break the JSON.
-    // -------------------------------------------------------------------------
+    // Section C - JSON escaping. The JDK has no JSON serializer, so User assembles
+    // the document by hand, which makes its escape helper load-bearing in a way its
+    // Python and JavaScript siblings' json.dumps and JSON.stringify calls are not.
+    // The two categories of character it deliberately leaves alone are tested too:
+    // over-escaping would break byte parity with those siblings just as surely as
+    // under-escaping would break the JSON.
 
     /** Asserts every escape the contract requires, and every one it forbids. */
     private static void verifyJsonEscaping() {
@@ -1639,15 +1476,10 @@ public class UserTest {
                 User.renderPayload("a\"b", DEFAULT_APP_VERSION, REFERENCE_TIMESTAMP, STATUS_UP));
     }
 
-    // -------------------------------------------------------------------------
-    // Section D - path normalisation
-    //
-    // Normalisation IS the routing decision, so these cases are the route's
-    // specification. They are expressed relative to the effective route rather
-    // than to the literal /health, so that the section keeps testing the real
-    // behaviour when the route is reconfigured instead of quietly testing a path
-    // the server no longer answers.
-    // -------------------------------------------------------------------------
+    // Section D - path normalisation, which IS the routing decision, so these cases
+    // are the route's specification. They are expressed relative to the effective
+    // route rather than to the literal /health, so the section keeps testing real
+    // behaviour when the route is reconfigured.
 
     /** Asserts which request paths reach the endpoint and which do not. */
     private static void verifyPathNormalisation() {
@@ -1670,23 +1502,54 @@ public class UserTest {
                 !route.equals(User.normalisePath(UNKNOWN_PATH)));
         checkEquals("a null path normalises to the root", ROOT_PATH, User.normalisePath(null));
         checkEquals("an empty path normalises to the root", ROOT_PATH, User.normalisePath(""));
+
+        verifyConfiguredRouteReduction();
     }
 
-    // -------------------------------------------------------------------------
-    // Section E - configuration precedence
-    //
-    // Environment variable beats properties file beats built-in default, and for
-    // the listener port the universal PORT variable beats even the
-    // language-specific JAVA_PORT.
+    /**
+     * Asserts the reduction from a CONFIGURED health path to the route served.
+     *
+     * <p>The same eleven-row table appears in {@code test_app.py} and
+     * {@code index.test.js}. It is a cross-language contract rather than three
+     * per-runtime opinions: {@code configRoute} is the one function both
+     * {@link User#loadConfig} and {@link User#validateConfig} go through, so this
+     * table is simultaneously the routing contract and the validation contract and
+     * the two cannot drift apart, because they are the same call.
+     */
+    private static void verifyConfiguredRouteReduction() {
+        Map<String, String> reductions = new LinkedHashMap<>();
+        reductions.put("/health", "/health");
+        reductions.put("health", "/health");
+        reductions.put("healthz", "/healthz");
+        reductions.put("/health/", "/health");
+        reductions.put("/health?probe=1", "/health");
+        reductions.put("/health#part", "/health");
+        // The leading slash is supplied BEFORE normalisation, so a configured value
+        // that looks like an absolute URL is no longer in absolute form by the time
+        // the authority would be stripped. All three implementations apply the two
+        // steps in this order, which is the part that matters: the value is nonsense
+        // either way, and it stays nonsense identically.
+        reductions.put("http://host:8000/health", "/http://host:8000/health");
+        reductions.put("/", "/");
+        reductions.put("//", "/");
+        reductions.put("//health", "//health");
+        reductions.put("/health//", "/health/");
+
+        for (Map.Entry<String, String> reduction : reductions.entrySet()) {
+            checkEquals("a configured path of " + describe(reduction.getKey())
+                            + " reduces to " + describe(reduction.getValue()),
+                    reduction.getValue(), User.configRoute(reduction.getKey()));
+        }
+    }
+
+    // Section E - configuration precedence. Environment variable beats properties
+    // file beats built-in default, and for the listener port the universal PORT
+    // variable beats even the language-specific JAVA_PORT.
     //
     // A JVM's environment is fixed at launch and this harness will not use
-    // reflection to forge one, so the environment layer is exercised the honest
-    // way: User.resolve takes the variable NAME as a parameter, so passing a name
-    // that is genuinely set proves that the environment layer wins, and passing a
-    // name that cannot be set proves that it is absent. The end-to-end behaviour
-    // with real overrides is covered by scripts/verify-health.sh and the CI jobs,
-    // which export real variables before starting a server.
-    // -------------------------------------------------------------------------
+    // reflection to forge one, so both proofs run in child JVMs whose variables the
+    // harness supplies: one end to end through the served payload, one at resolver
+    // level. Neither can be skipped for want of a variable.
 
     /** Properties key used only to hold a deliberately malformed port value. */
     private static final String KEY_MALFORMED_PORT = "malformed.port";
@@ -1696,16 +1559,13 @@ public class UserTest {
 
     /**
      * Asserts the precedence chain, the accessors, and the fail-closed port rules.
-     *
-     * @throws IOException          if the temporary properties file cannot be written
-     * @throws InterruptedException if a child-process request is interrupted
      */
     private static void verifyConfigurationPrecedence()
             throws IOException, InterruptedException {
         Properties empty = new Properties();
         check("the file-backed configuration is never null", User.configProperties() != null);
 
-        // --- The accessors, against an independently derived expectation --------
+        // The accessors, against an independently derived expectation.
         // expectedEffective re-implements the precedence order rather than calling
         // User.resolve, so these are genuine second opinions and not a value being
         // compared with itself.
@@ -1733,7 +1593,7 @@ public class UserTest {
                     expectedPort, User.javaPort());
         }
 
-        // --- Built-in defaults, with both other layers provably absent ----------
+        // Built-in defaults, with both other layers provably absent.
         checkEquals("the built-in default applies with an empty file and no override",
                 DEFAULT_APP_NAME,
                 User.resolve(empty, KEY_APP_NAME, ABSENT_ENV_PRIMARY, DEFAULT_APP_NAME));
@@ -1758,10 +1618,10 @@ public class UserTest {
                 DEFAULT_APP_NAME,
                 User.resolve(blank, KEY_APP_NAME, ABSENT_ENV_PRIMARY, DEFAULT_APP_NAME));
 
-        // --- The shipped file agrees with the built-in defaults ----------------
+        // The shipped file agrees with the built-in defaults.
         verifyShippedConfigurationAgrees();
 
-        // --- File over default, and the port rules, through a real file ---------
+        // File over default, and the port rules, through a real file.
         verifyFileBackedPrecedence();
     }
 
@@ -1769,19 +1629,20 @@ public class UserTest {
      * Asserts that the shipped configuration file and the built-in defaults do
      * not disagree, so that the single source of truth really is single.
      *
-     * <p>The file is resolved relative to the working directory, so a run started
-     * from elsewhere will not find it. That is not a failure: the application is
-     * specified to fall back to its built-in defaults in exactly that case, and
-     * the accessor checks above already prove the fallback. The distinction is
-     * reported as a note so that a reader of the log knows which path was taken.
+     * <p>The file is located with {@link #locateBeside}, which tries the launched
+     * source file's own directory first, so the assertions below run from any
+     * working directory and a run started from elsewhere cannot skip them. A file
+     * that cannot be located at all is a counted failure rather than a note: this
+     * file is the single source of truth the version-agreement gate rests on, so
+     * its absence is a defect in the repository, not a property of the run.
      */
-    private static void verifyShippedConfigurationAgrees() {
-        Properties shipped = User.configProperties();
-        if (shipped.getProperty(KEY_APP_NAME) == null) {
-            note("no configuration file was found from this working directory, so the"
-                    + " built-in defaults are in force; the accessor checks above cover them");
+    private static void verifyShippedConfigurationAgrees() throws IOException {
+        Path location = locateBeside(CONFIG_FILE_NAME);
+        check("the shipped configuration file was located", location != null);
+        if (location == null) {
             return;
         }
+        Properties shipped = loadProperties(location);
         checkEquals("the shipped file agrees with the built-in default name",
                 DEFAULT_APP_NAME, shipped.getProperty(KEY_APP_NAME));
         checkEquals("the shipped file agrees with the built-in default version",
@@ -1802,9 +1663,6 @@ public class UserTest {
      * the repository - and is deleted in a {@code finally} block, because the
      * working tree must be clean including untracked files after a full test
      * cycle. Its removal is itself asserted.
-     *
-     * @throws IOException          if the temporary file cannot be created or written
-     * @throws InterruptedException if a child-process request is interrupted
      */
     private static void verifyFileBackedPrecedence() throws IOException, InterruptedException {
         String fileName = "name-from-temporary-file";
@@ -1851,10 +1709,6 @@ public class UserTest {
 
     /**
      * Loads a properties file as UTF-8, matching how the application reads it.
-     *
-     * @param location the file to read
-     * @return the parsed properties
-     * @throws IOException if the file cannot be read
      */
     private static Properties loadProperties(Path location) throws IOException {
         Properties parsed = new Properties();
@@ -1867,46 +1721,34 @@ public class UserTest {
     /**
      * Proves environment-over-file precedence end to end, in a child JVM.
      *
-     * <p>This is the check that makes the environment layer unconditionally
-     * covered. A properties file is written saying one thing, a child is started
-     * with environment variables saying another, and the SERVED PAYLOAD decides
-     * which won - so the assertion is about the application's real configuration
-     * path, not about a resolver method called in isolation.
-     *
-     * <p>Three separate claims are settled here, and each is arranged so that only
-     * one outcome is possible if precedence is correct.
+     * <p>A properties file is written saying one thing, a child is started with
+     * environment variables saying another, and the SERVED PAYLOAD decides which
+     * won - so the assertion is about the application's real configuration path,
+     * not about a resolver method called in isolation.
      *
      * <ul>
-     *   <li>Name and version come from the environment, not the file, and the
-     *       file's values appear nowhere in the response.</li>
+     *   <li>Name and version come from the environment, and the file's values
+     *       appear nowhere in the response.</li>
      *   <li>The route comes from the environment: the environment's path answers
      *       200 and the FILE's path answers 404. Asserting both directions is what
      *       distinguishes "the environment won" from "both paths happen to work".</li>
-     *   <li>The universal PORT variable outranks the language-specific one. This is
-     *       proven with an UNBINDABLE language port: if {@code JAVA_PORT} were
-     *       consulted first the child would refuse to start, so the fact that it
-     *       binds and announces a port is the proof. No port has to be reserved and
-     *       nothing can race.</li>
+     *   <li>The universal PORT variable outranks the language-specific one, proven
+     *       with an UNBINDABLE {@code JAVA_PORT}: if that were consulted first the
+     *       child would refuse to start, so the fact that it binds is the proof. No
+     *       port has to be reserved and nothing can race.</li>
      * </ul>
      *
      * <p>A second child, given the file but NO overriding variables, closes the
-     * chain from the other end by serving the file's values - which proves the
-     * file layer is genuinely being read, and therefore that the first child's
-     * result is precedence rather than the file simply being ignored.
+     * chain from the other end by serving the file's values - which proves the file
+     * layer is genuinely being read, and therefore that the first child's result is
+     * precedence rather than the file simply being ignored.
      *
-     * <p>The file is delivered by copying the application into a temporary
-     * directory and writing the properties file beside the copy, because that is
-     * how the file layer is actually reached: all three implementations resolve
-     * their configuration relative to their own source file and NONE of them
-     * accepts an environment variable naming an arbitrary properties file. See
-     * {@link #isolatedLaunchPrefix}. The child's working directory is left pointing
-     * at the repository, so the repository's own properties file is still the
-     * second candidate - which means a regression in code-source resolution would
-     * serve the repository's values and fail every assertion below rather than
-     * quietly passing on a different file.
-     *
-     * @throws IOException          if the temporary directory cannot be prepared
-     * @throws InterruptedException if a request is interrupted
+     * <p>The file is delivered by copying the application into a temporary directory
+     * and writing the properties file beside the copy, because that is how the file
+     * layer is actually reached. See {@link #isolatedLaunchPrefix}. The child's
+     * working directory is left pointing at the repository, so a regression in
+     * code-source resolution would serve the repository's values and fail every
+     * assertion below rather than quietly passing on a different file.
      */
     private static void verifyEnvironmentBeatsFileInChild() throws IOException,
             InterruptedException {
@@ -1987,6 +1829,132 @@ public class UserTest {
     }
 
     /**
+     * Source of the throwaway class that exercises {@code User}'s resolvers directly
+     * in a child JVM whose environment this harness supplies.
+     *
+     * <p>It is compiled from source beside a copy of {@code User.java}, so the source
+     * launcher resolves the sibling class with no classpath and no build step - the
+     * same mechanism that lets {@code java UserTest.java} run at all. Its output is
+     * {@code key=value} lines, so the parent asserts values it computed itself rather
+     * than trusting a self-report of success.
+     *
+     * <p>Argument order is fixed and documented at the call site.
+     */
+    private static final String RESOLVER_PROBE_SOURCE = String.join("\n",
+            "import java.util.Properties;",
+            "",
+            "public class ResolverProbe {",
+            "    public static void main(String[] args) {",
+            "        Properties fromFile = new Properties();",
+            "        fromFile.setProperty(args[0], args[1]);",
+            "        fromFile.setProperty(args[2], args[3]);",
+            "        System.out.println(\"resolve.withEnvironment=\"",
+            "                + User.resolve(fromFile, args[0], args[4], \"BUILT-IN\"));",
+            "        System.out.println(\"resolve.withoutEnvironment=\"",
+            "                + User.resolve(fromFile, args[0], \"" + ABSENT_ENV_PRIMARY + "\","
+                    + " \"BUILT-IN\"));",
+            "        System.out.println(\"resolvePort.universalWins=\"",
+            "                + User.resolvePort(fromFile, args[2], \"" + ABSENT_ENV_PRIMARY + "\",",
+            "                        args[5], 1));",
+            "        System.out.println(\"resolvePort.fileWinsAlone=\"",
+            "                + User.resolvePort(fromFile, args[2], \"" + ABSENT_ENV_PRIMARY + "\",",
+            "                        \"" + ABSENT_ENV_SECONDARY + "\", 1));",
+            "        String refused;",
+            "        try {",
+            "            User.resolvePort(fromFile, args[2], \"" + ABSENT_ENV_PRIMARY + "\",",
+            "                    args[6], 1);",
+            "            refused = \"false\";",
+            "        } catch (IllegalArgumentException rejected) {",
+            "            refused = \"true\";",
+            "        }",
+            "        System.out.println(\"resolvePort.refusesUnusableUniversal=\" + refused);",
+            "    }",
+            "}",
+            "");
+
+    /**
+     * Proves, unconditionally, that {@code User}'s resolvers consult the environment
+     * before the file - and that they fall back to the file when it is absent.
+     *
+     * <p>The variables are supplied by this harness to a child, so their presence is
+     * guaranteed by construction and their values are this harness's own invented
+     * strings, which are safe to report in a failure.
+     *
+     * <p>Five properties are asserted from one child: an environment value outranks a
+     * file value; the same call falls back to the file value when the variable is
+     * absent, which is what makes the first result precedence rather than the file
+     * being ignored; a usable universal port outranks the file port; the file port is
+     * used when no universal variable is supplied; and an unusable universal port is
+     * REFUSED rather than silently falling through to the file, which proves the
+     * universal variable was consulted first.
+     *
+     * @param fromFile the file-backed configuration the caller built, used only for its
+     *                 key names so the child asserts the same keys the parent does
+     */
+    private static void verifyResolverPrefersEnvironmentInChild(Properties fromFile, int filePort)
+            throws IOException {
+        String fileName = "name-from-the-file-layer";
+        String environmentName = "name-from-the-environment-layer";
+        int universalPort = 19004;
+        String nameVariable = "USERTEST_PROBE_NAME";
+        String portVariable = "USERTEST_PROBE_PORT";
+        String badPortVariable = "USERTEST_PROBE_BAD_PORT";
+
+        check("the caller's file configuration supplies the keys this child resolves",
+                fromFile.getProperty(KEY_APP_NAME) != null
+                        && fromFile.getProperty(KEY_JAVA_PORT) != null);
+
+        Path enclosure = Files.createTempDirectory("usertest-resolver-");
+        try {
+            Path application = locateBeside(APPLICATION_SOURCE_FILE);
+            if (application == null) {
+                // Fail closed rather than skip: the whole point of this method is that
+                // it cannot be skipped, so an unlocatable source is a counted failure.
+                check("the application source can be located for the resolver child", false);
+                return;
+            }
+            Files.copy(application, enclosure.resolve(APPLICATION_SOURCE_FILE));
+            Path probe = enclosure.resolve("ResolverProbe.java");
+            Files.writeString(probe, RESOLVER_PROBE_SOURCE, StandardCharsets.UTF_8);
+
+            Map<String, String> environment = new LinkedHashMap<>();
+            environment.put(nameVariable, environmentName);
+            environment.put(portVariable, Integer.toString(universalPort));
+            environment.put(badPortVariable, OUT_OF_RANGE_PORT_VALUE);
+
+            ChildOutcome outcome = runApplication(
+                    List.of(javaLauncher(), probe.toString()), enclosure,
+                    List.of(KEY_APP_NAME, fileName, KEY_JAVA_PORT, Integer.toString(filePort),
+                            nameVariable, portVariable, badPortVariable),
+                    environment);
+            checkEquals("the resolver child exited 0", 0, outcome.status());
+
+            Map<String, String> reported = new LinkedHashMap<>();
+            for (String line : new String(outcome.standardOutput(), StandardCharsets.UTF_8)
+                    .split("\n")) {
+                int separator = line.indexOf('=');
+                if (separator > 0) {
+                    reported.put(line.substring(0, separator), line.substring(separator + 1).trim());
+                }
+            }
+
+            checkEquals("an environment value outranks a file value",
+                    environmentName, reported.get("resolve.withEnvironment"));
+            checkEquals("the same call falls back to the file value when the variable is absent",
+                    fileName, reported.get("resolve.withoutEnvironment"));
+            checkEquals("a usable universal port outranks a file port",
+                    Integer.toString(universalPort), reported.get("resolvePort.universalWins"));
+            checkEquals("the file port is used when no universal variable is supplied",
+                    Integer.toString(filePort), reported.get("resolvePort.fileWinsAlone"));
+            checkEquals("an unusable universal port is refused rather than falling through",
+                    "true", reported.get("resolvePort.refusesUnusableUniversal"));
+        } finally {
+            deleteRecursively(enclosure);
+        }
+        check("the resolver enclosure was removed", !Files.exists(enclosure));
+    }
+
+    /**
      * Removes a directory and everything in it, reporting nothing.
      *
      * <p>Used only to clean up a temporary enclosure this harness created itself, so
@@ -1994,9 +1962,6 @@ public class UserTest {
      * directory with a fresh name and the operating system reclaims the rest. The
      * assertion that the enclosure is gone is made by the caller, which is where a
      * genuine leak would matter.
-     *
-     * @param root the directory to remove
-     * @throws IOException if the directory cannot be walked at all
      */
     private static void deleteRecursively(Path root) throws IOException {
         if (!Files.exists(root)) {
@@ -2021,12 +1986,6 @@ public class UserTest {
      * <p>A fresh client per call, closed immediately: a client held open would keep
      * its connection pool - and the child's connection - alive past the point where
      * the child is expected to have gone.
-     *
-     * @param port the port the child announced
-     * @param path the request path
-     * @return the complete response
-     * @throws IOException          if the request fails
-     * @throws InterruptedException if the request is interrupted
      */
     private static HttpResponse<String> fetch(int port, String path) throws IOException,
             InterruptedException {
@@ -2038,103 +1997,38 @@ public class UserTest {
     }
 
     /**
-     * Asserts that the environment layer outranks the file layer, without
-     * mutating the environment of this process and without reflection.
+     * Asserts that the environment layer outranks the file layer, without mutating
+     * the environment of this process and without reflection.
      *
-     * <p>Two independent proofs, and the split is the whole design.
-     *
-     * <p>The FIRST is unconditional and end to end: {@link #verifyEnvironmentBeatsFileInChild}
-     * starts a child JVM with a properties file saying one thing and environment
-     * variables saying another, and reads the served payload to see which won.
-     * Because the harness supplies the child's environment itself, this proof can
-     * never be skipped for want of a variable, and it exercises the real
-     * {@code loadConfig} path rather than a resolver call.
-     *
-     * <p>The SECOND is opportunistic and unit-level. {@code User.resolve} takes the
-     * variable NAME as a parameter, so any name that happens to be set in this
-     * process proves the precedence directly and instantly. PATH is used when it is
-     * available - named explicitly, never discovered by scanning, because a scan
-     * could just as easily select a credential - and compared only through the
-     * boolean check form so a failure reports the name of the check and never a
-     * value. When PATH is absent this proof is simply not available, and that is
-     * now harmless rather than a gap, because the first proof has already covered
-     * the layer. Its absence is recorded as a note and NOT as a skipped check.
-     *
-     * @param fromFile a configuration that supplies both a name and a port, so
-     *                 that the environment layer has something to outrank
-     * @param filePort the port that configuration supplies
-     * @throws IOException          if a temporary file or a child cannot be handled
-     * @throws InterruptedException if a request or a child wait is interrupted
+     * <p>Two independent and unconditional proofs, and the split is the whole design.
+     * {@link #verifyEnvironmentBeatsFileInChild} is end to end: it starts a child JVM
+     * with a properties file saying one thing and environment variables saying
+     * another, and reads the served payload to see which won.
+     * {@link #verifyResolverPrefersEnvironmentInChild} is unit-level: it exercises
+     * {@code User.resolve} and {@code User.resolvePort} directly in a child JVM whose
+     * variables this harness supplies. Because the harness supplies both environments,
+     * neither proof depends on anything the host happens to have exported, neither can
+     * be skipped, and every value involved is safe to report.
      */
     private static void verifyEnvironmentBeatsFile(Properties fromFile, int filePort)
             throws IOException, InterruptedException {
         // Unconditional, and therefore the proof this section relies on.
         verifyEnvironmentBeatsFileInChild();
 
-        String witness = System.getenv(WITNESS_ENV_NAME);
-        if (witness == null || witness.isEmpty()) {
-            note(WITNESS_ENV_NAME + " is not set in this process, so the in-process"
-                    + " resolver proof is unavailable; the environment layer is already"
-                    + " proven end to end by the child-JVM check above, which supplies"
-                    + " its own variables and therefore cannot be skipped");
-            return;
-        }
-        check("an environment value overrides a file value",
-                witness.equals(User.resolve(fromFile, KEY_APP_NAME,
-                        WITNESS_ENV_NAME, DEFAULT_APP_NAME)));
+        // The resolver-level proof, and it is UNCONDITIONAL: the variables are
+        // supplied by this harness to a child JVM, so there is nothing to skip.
+        verifyResolverPrefersEnvironmentInChild(fromFile, filePort);
 
-        // The universal PORT variable outranks the language-specific key AND the
-        // file. Whether the witness parses as a port decides only which correct
-        // outcome to expect, so the check runs either way rather than being
-        // silently skipped: a numeric witness must win with its own value, and a
-        // non-numeric one must be REFUSED, which proves the file value was
-        // outranked just as conclusively.
-        boolean universalOutranksFile;
-        if (isParsablePort(witness)) {
-            universalOutranksFile = Integer.parseInt(witness.trim())
-                    == User.resolvePort(fromFile, KEY_JAVA_PORT, ABSENT_ENV_PRIMARY,
-                            WITNESS_ENV_NAME, DEFAULT_JAVA_PORT);
-        } else {
-            // The same call resolves cleanly to the file port when no universal name
-            // is supplied, so naming the witness is the ONLY difference between the
-            // two calls below - which makes the refusal proof that the universal
-            // variable was consulted first and outranked the file.
-            //
-            // The outcome is reduced to a boolean and deliberately NOT reported
-            // through checkRejects: that form prints the offending value, and here
-            // the offending value is the contents of the witness variable.
-            boolean fileAloneResolves = filePort == User.resolvePort(fromFile, KEY_JAVA_PORT,
-                    ABSENT_ENV_PRIMARY, ABSENT_ENV_SECONDARY, DEFAULT_JAVA_PORT);
-            boolean refusedWithWitness;
-            try {
-                User.resolvePort(fromFile, KEY_JAVA_PORT, ABSENT_ENV_PRIMARY,
-                        WITNESS_ENV_NAME, DEFAULT_JAVA_PORT);
-                refusedWithWitness = false;
-            } catch (IllegalArgumentException rejectedWitnessValue) {
-                refusedWithWitness = true;
-            }
-            universalOutranksFile = fileAloneResolves && refusedWithWitness;
-        }
-        check("the universal port override outranks a file port", universalOutranksFile);
     }
 
-    // -------------------------------------------------------------------------
-    // Expectation helpers
-    //
-    // These re-derive the precedence order independently of User.resolve, which
-    // is the whole point: an expectation computed by calling the method under
-    // test would assert only that a value equals itself.
-    // -------------------------------------------------------------------------
+    // Expectation helpers. These re-derive the precedence order independently of
+    // User.resolve: an expectation computed by calling the method under test would
+    // assert only that a value equals itself.
 
     /**
      * Re-derives one effective value from the documented precedence order.
      *
      * <p>Reads the environment but never writes it.
-     *
-     * @param environmentName the variable that outranks the file
-     * @param propertiesKey   the key read from the file
-     * @param builtInDefault  the value used when neither source supplies one
-     * @return the value the application must report
      */
     private static String expectedEffective(String environmentName, String propertiesKey,
             String builtInDefault) {
@@ -2149,17 +2043,14 @@ public class UserTest {
         return builtInDefault;
     }
 
-    /** @return the application name the payload must report */
     private static String expectedAppName() {
         return expectedEffective(ENV_APP_NAME, KEY_APP_NAME, DEFAULT_APP_NAME);
     }
 
-    /** @return the application version the payload must report */
     private static String expectedAppVersion() {
         return expectedEffective(ENV_APP_VERSION, KEY_APP_VERSION, DEFAULT_APP_VERSION);
     }
 
-    /** @return the bind address the listener must use */
     private static String expectedAppHost() {
         return expectedEffective(ENV_APP_HOST, KEY_APP_HOST, DEFAULT_APP_HOST);
     }
@@ -2171,8 +2062,6 @@ public class UserTest {
      * <p>Deliberately hand-written rather than delegating to
      * {@code User.normalisePath}, so that the route assertion is an independent
      * opinion about both the precedence order and the normalisation.
-     *
-     * @return the route the endpoint must answer
      */
     private static String expectedHealthPath() {
         String configured = expectedEffective(ENV_HEALTH_PATH, KEY_HEALTH_PATH,
@@ -2216,7 +2105,6 @@ public class UserTest {
      * Reports whether a raw value is a usable port number.
      *
      * @param raw the value to test, possibly {@code null}
-     * @return {@code true} when it parses to a number inside the legal port range
      */
     private static boolean isParsablePort(String raw) {
         if (raw == null) {
@@ -2230,16 +2118,12 @@ public class UserTest {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Section F - live routing over a real socket
-    //
-    // Unit checks prove the pieces; only a real request proves the wiring. The
-    // server is bound on loopback with port 0, so the OS chooses a free port: the
-    // documented default 8002 is never bound here, which is what lets this harness
-    // run twice at once, run beside a real server, and run on a busy CI machine
-    // without a bind collision. The chosen port is read back from the server
-    // rather than assumed.
-    // -------------------------------------------------------------------------
+    // Section F - live routing over a real socket. Unit checks prove the pieces;
+    // only a real request proves the wiring. The server is bound on loopback with
+    // port 0, so the OS chooses a free port: the documented default 8002 is never
+    // bound here, which is what lets this harness run twice at once, run beside a
+    // real server, and run on a busy machine without a bind collision. The chosen
+    // port is read back from the server rather than assumed.
 
     /**
      * Asserts the success path, both negative paths and the self-check, live.
@@ -2252,11 +2136,29 @@ public class UserTest {
      * so it is used for every header read below; that keeps this harness asserting
      * the same contract the Python and JavaScript suites assert, and keeps it
      * correct if the header block is ever emitted by a different writer.
-     *
-     * @throws IOException          if the server cannot be bound or a request fails
-     * @throws InterruptedException if a request is interrupted while in flight
      */
     private static void verifyLiveRouting() throws IOException, InterruptedException {
+        // The expectation sets themselves are asserted before any response is read,
+        // so every direct set-equality check further down inherits the guarantee:
+        // the set this implementation is held to is the three the contract specifies
+        // plus exactly one named, documented deviation - never a fourth field that
+        // was quietly appended to an expectation to make a suite go green.
+        checkSetEquals("the specified header set is the three fields the contract names",
+                Set.of("content-type", "cache-control", "content-length"),
+                SPECIFIED_HEADER_NAMES);
+        checkSetEquals("the stated deviation is exactly one field, and it is date",
+                Set.of("date"), DEVIATION_HEADER_NAMES);
+        checkSetEquals("the 200/404 expectation is the specified set plus the deviation",
+                union(SPECIFIED_HEADER_NAMES, DEVIATION_HEADER_NAMES), CONTRACT_HEADER_NAMES);
+        Set<String> unspecified = new TreeSet<>(CONTRACT_HEADER_NAMES);
+        unspecified.removeAll(SPECIFIED_HEADER_NAMES);
+        checkSetEquals("the 200/404 expectation departs from the contract in one place only",
+                DEVIATION_HEADER_NAMES, unspecified);
+        Set<String> refusalExtra = new TreeSet<>(REFUSAL_HEADER_NAMES);
+        refusalExtra.removeAll(CONTRACT_HEADER_NAMES);
+        checkSetEquals("a refusal adds Allow and nothing else",
+                Set.of("allow"), refusalExtra);
+
         String route = User.healthPath();
         User.HealthServer server = User.startServer(TEST_HOST, EPHEMERAL_PORT);
         int port = server.port();
@@ -2310,7 +2212,7 @@ public class UserTest {
                     BODY_METHOD_NOT_ALLOWED.getBytes(StandardCharsets.UTF_8).length, "405");
 
             // Every other method is refused identically, and the refusal carries
-            // the same five fields each time. Sampling one verb would leave the
+            // the same header set each time. Sampling one verb would leave the
             // rest free to answer differently.
             for (String method : new String[] {"PUT", "DELETE", "PATCH", "OPTIONS"}) {
                 HttpResponse<String> refused = send(client, method, port, route);
@@ -2318,7 +2220,7 @@ public class UserTest {
                         HTTP_METHOD_NOT_ALLOWED, refused.statusCode());
                 checkEquals("the 405 answer to " + method + " names GET as allowed",
                         Optional.of("GET"), refused.headers().firstValue("allow"));
-                checkSetEquals("the 405 answer to " + method + " carries exactly five fields",
+                checkSetEquals("the 405 answer to " + method + " carries exactly the refusal set",
                         REFUSAL_HEADER_NAMES, foldedHeaderNames(refused));
             }
 
@@ -2361,13 +2263,6 @@ public class UserTest {
 
     /**
      * Issues a GET request against the test server.
-     *
-     * @param client the client to use
-     * @param port   the ephemeral port the test server chose
-     * @param path   request path, including any query string
-     * @return the complete response with its body as a string
-     * @throws IOException          if the request fails
-     * @throws InterruptedException if the request is interrupted
      */
     private static HttpResponse<String> get(HttpClient client, int port, String path)
             throws IOException, InterruptedException {
@@ -2376,14 +2271,6 @@ public class UserTest {
 
     /**
      * Issues a request with an explicit method and an empty body.
-     *
-     * @param client the client to use
-     * @param method the HTTP method token, which is case-sensitive per RFC 9110
-     * @param port   the ephemeral port the test server chose
-     * @param path   request path, including any query string
-     * @return the complete response with its body as a string
-     * @throws IOException          if the request fails
-     * @throws InterruptedException if the request is interrupted
      */
     private static HttpResponse<String> send(HttpClient client, String method, int port,
             String path) throws IOException, InterruptedException {
@@ -2398,11 +2285,6 @@ public class UserTest {
     /**
      * Reports whether a response header contains a fragment, case-insensitively
      * in the field NAME.
-     *
-     * @param response the response to inspect
-     * @param name     the field name, in any casing
-     * @param fragment the substring the value must contain
-     * @return {@code true} when the header is present and contains the fragment
      */
     private static boolean headerContains(HttpResponse<String> response, String name,
             String fragment) {
@@ -2421,9 +2303,6 @@ public class UserTest {
      * is what lets this harness assert the same contract the Python and JavaScript
      * suites assert, and what keeps the assertion correct if either the server's
      * writer or the client's reporting ever changes casing.
-     *
-     * @param response the response to inspect
-     * @return the field names, lower-cased and sorted
      */
     private static Set<String> foldedHeaderNames(HttpResponse<?> response) {
         Set<String> folded = new TreeSet<>();
@@ -2437,39 +2316,26 @@ public class UserTest {
      * Asserts a response's complete header block: exactly which fields, the media
      * type, every cache directive, an accurate length, and nothing disclosed.
      *
-     * <p>The set equality is the assertion that does the most work. Checking that
-     * required fields are PRESENT can only ever prove half the contract, and the
-     * half it cannot reach is the half that leaks: a {@code Server} banner naming
-     * the runtime and its version, a {@code Keep-Alive} advertising the idle
-     * timeout, a {@code Via} or an {@code X-} field added by something in the
-     * middle. Equality proves the required fields arrived AND that nothing else
-     * did, in one comparison that cannot be satisfied by accident.
+     * <p>The set EQUALITY does the most work, for the reason recorded on
+     * {@link #CONTRACT_HEADER_NAMES}: it proves the required fields arrived AND that
+     * nothing else did, in one comparison that cannot be satisfied by accident.
      *
-     * <p>{@code Server} is then named individually as well. That is redundant
-     * against the set equality and kept deliberately: it is the specific disclosure
+     * <p>{@code Server} is then named individually as well. That is redundant against
+     * the set equality and kept deliberately: it is the specific disclosure
      * requirement, so a reader of the log sees it asserted by name, and if the
      * expected set is ever widened the named check still holds the line.
      *
-     * <p>{@code Date} is asserted by FORMAT rather than by absence. The server
+     * <p>{@code Date} is asserted by FORMAT rather than by absence, because the server
      * writes the field itself and application code cannot suppress it, RFC 9110
      * section 6.6.1 says an origin server SHOULD send it, and its value is a clock
-     * reading - so the only assertion that can be both meaningful and stable is
-     * that the field is present and well formed. Asserting a value would make this
-     * check fail for the wrong reason, exactly as an asserted payload timestamp
-     * would.
+     * reading - so the only assertion that can be both meaningful and stable is that
+     * the field is present and well formed.
      *
      * <p>All three cache directives are required, not just one. They do different
      * jobs - a stale health answer is worse than no answer, and a response merely
      * marked {@code no-cache} may still be written to a shared store - so asserting
      * only the presence of the header, or only one directive, would let a real
      * regression through.
-     *
-     * @param response        the response to inspect
-     * @param expectedNames   exactly the field names the response must carry
-     * @param declaredLength  the byte length {@code Content-Length} must declare,
-     *                        which for a HEAD refusal is the length the body WOULD
-     *                        have had rather than the zero bytes actually sent
-     * @param label           prefix for every message, naming the case under test
      */
     private static void checkFrozenHeaders(HttpResponse<String> response,
             Set<String> expectedNames, int declaredLength, String label) {
@@ -2488,6 +2354,35 @@ public class UserTest {
                 HTTP_DATE_PATTERN, response.headers().firstValue("Date").orElse(""));
         check(label + ": discloses no Server banner",
                 response.headers().firstValue("Server").isEmpty());
+        checkDeviationIsBounded(response, expectedNames, label);
+    }
+
+    /**
+     * Asserts that this implementation's departure from the specified header set is
+     * EXACTLY the one stated deviation, and nothing more.
+     *
+     * <p>The point of this check is to stop the harness from ratifying the
+     * divergence it is documenting. Asserting only that the response carries
+     * {@code CONTRACT_HEADER_NAMES} would silently accept whatever that set happened
+     * to contain; this instead computes, from the response actually received, the
+     * field names that the contract does NOT specify, and requires that set to equal
+     * {@link #DEVIATION_HEADER_NAMES} - one field, named, with its reason recorded.
+     * A second unspecified field appearing later fails here even if someone had
+     * already added it to the expectation set above.
+     */
+    private static void checkDeviationIsBounded(HttpResponse<String> response,
+            Set<String> expectedNames, String label) {
+        Set<String> allowed = new TreeSet<>(SPECIFIED_HEADER_NAMES);
+        if (expectedNames.contains("allow")) {
+            // Allow is specified by the contract for a refusal: 405 must name the
+            // methods it permits, so it is not a deviation on that response class.
+            allowed.add("allow");
+        }
+        Set<String> unspecified = new TreeSet<>(foldedHeaderNames(response));
+        unspecified.removeAll(allowed);
+        checkSetEquals(label
+                + ": departs from the specified header set by exactly the stated deviation",
+                DEVIATION_HEADER_NAMES, unspecified);
     }
 
     /**
@@ -2500,8 +2395,6 @@ public class UserTest {
      * genuinely wrong. That the thread must go is not cosmetic - it is not a
      * daemon thread, so a leaked one would keep this JVM alive after the summary
      * was printed and the harness would appear to hang.
-     *
-     * @return {@code true} once no dispatcher thread remains
      */
     private static boolean awaitNoDispatcherThread() {
         long deadline = System.nanoTime()
@@ -2517,30 +2410,23 @@ public class UserTest {
         return dispatcherThreadCount() == 0;
     }
 
-    // -------------------------------------------------------------------------
-    // Section G - entry-point dispatch
+    // Section G - entry-point dispatch. Every check above this point calls a method
+    // of User directly, which proves the methods and says nothing about the
+    // DISPATCHER that chooses between them. That gap matters more than it sounds:
+    // the flag handling is the newest code in the program, and the entire
+    // backward-compatibility guarantee rests on which branch an empty argument
+    // vector selects. A direct call to startServer cannot tell you that --serve
+    // reaches it, and a direct call to probe cannot tell you that --probe exits with
+    // the value probe returned.
     //
-    // Every check above this point calls a method of User directly, which proves
-    // the methods and says nothing about the DISPATCHER that chooses between
-    // them. That gap matters more than it sounds: the argument vector had never
-    // been read in this program's history before this feature, the flag handling
-    // is new code, and the entire backward-compatibility guarantee rests on which
-    // branch an empty argument vector selects. A direct call to startServer cannot
-    // tell you that --serve reaches it, and a direct call to probe cannot tell you
-    // that --probe exits with the value probe returned.
-    //
-    // So this section drives the real main method of a real process and observes
-    // only what a shell or a container runtime would observe: the exit status, the
-    // two streams, and whether a port is listening.
-    // -------------------------------------------------------------------------
+    // So this section drives the real main method of a real process and observes only
+    // what a shell or a container runtime would observe: the exit status, the two
+    // streams, and whether a port is listening.
 
     /**
      * Asserts that {@code --serve} and {@code --probe} reach their modes, that the
      * default branch survives an unrecognised flag, and that both new modes fail
      * closed.
-     *
-     * @throws IOException          if a child cannot be started or a request fails
-     * @throws InterruptedException if a wait is interrupted
      */
     private static void verifyEntrypointDispatch() throws IOException, InterruptedException {
         verifyUnrecognisedFlagKeepsDefault();
@@ -2580,9 +2466,6 @@ public class UserTest {
      * output stream that the compatibility gate hashes for any tool piping this
      * program. Asserting stdout is EMPTY in serve mode is what protects that
      * separation.
-     *
-     * @throws IOException          if a request fails
-     * @throws InterruptedException if a request is interrupted
      */
     private static void verifyServeMode() throws IOException, InterruptedException {
         String route = "/dispatch-health";
@@ -2665,8 +2548,6 @@ public class UserTest {
      * would follow from quietly substituting the default. The offending value is
      * required to appear in the diagnostic, because a refusal an operator cannot
      * trace back to the setting they mistyped is only half a diagnostic.
-     *
-     * @throws IOException if the port used to provoke a bind conflict cannot be held
      */
     private static void verifyServeFailsClosed() throws IOException {
         ChildOutcome unparseable = runApplication(List.of(FLAG_SERVE),
@@ -2705,14 +2586,11 @@ public class UserTest {
      * Asserts that {@code --probe} grades a live endpoint healthy and everything
      * else unhealthy, and that its verdict becomes the process exit status.
      *
-     * <p>This is the mode a container health check runs, so the exit status IS the
-     * contract - and it has to be observed from outside the process to be observed
-     * at all. Every negative case matters as much as the positive one: a probe that
-     * cannot fail is indistinguishable from no health check, and it would report a
-     * dead application as healthy for as long as the deployment lived.
-     *
-     * @throws IOException          if a child cannot be started
-     * @throws InterruptedException if a wait is interrupted
+     * <p>The exit status IS the contract in this mode, and it has to be observed
+     * from outside the process to be observed at all. Every negative case matters
+     * as much as the positive one: a probe that cannot fail is indistinguishable
+     * from no probe, and it would report a dead application as healthy for as long
+     * as the deployment lived.
      */
     private static void verifyProbeMode() throws IOException, InterruptedException {
         int abandoned;
@@ -2745,7 +2623,8 @@ public class UserTest {
 
         // The wildcard bind is what a container uses, and it is not a routable
         // target, so the probe has to translate it to loopback to reach its own
-        // endpoint. Without this the container health check could never pass.
+        // endpoint. Without that translation a wildcard-bound process could never
+        // grade itself healthy.
         try (ServeChild wildcard = startServeChild(Map.of(ENV_APP_HOST, DEFAULT_APP_HOST))) {
             checkEquals("a wildcard-bound child announces the wildcard address",
                     DEFAULT_APP_HOST, wildcard.host());
@@ -2783,9 +2662,6 @@ public class UserTest {
      * only just reclaimed can refuse one bind and accept the next. Polling makes
      * the check mean "the port was released" instead of "the port was released
      * within one scheduling quantum".
-     *
-     * @param port the port that should now be free
-     * @return {@code true} once the port can be bound
      */
     private static boolean awaitPortFree(int port) {
         long deadline = System.nanoTime()
@@ -2801,75 +2677,44 @@ public class UserTest {
         return false;
     }
 
-    // -------------------------------------------------------------------------
-    // Section H - transport behaviour over a raw socket
+    // Section H - transport behaviour over a raw socket.
     //
     // java.net.http is the right client for the response CONTRACT and the wrong
     // client for the transport. It frames and validates the request itself, so it
     // cannot be persuaded to send a two-token request line, a target of any length
     // the caller chooses, a header block of any size, an unsupported HTTP major, an
     // HTTP/1.1 request with no Host, a stale CRLF before the request line, or a
-    // plain HTTP/1.0 request. It also reframes what comes BACK: a check made
-    // through it is a check on a parsed object, not on the bytes on the wire.
-    //
-    // WHAT THIS SECTION ASSERTS
-    //
-    //  1. The contract, byte-for-byte. Three answers read off a single connection
-    //     prove every Content-Length was accurate, because an inaccurate one leaves
-    //     the next read starting mid-stream and the third answer never frames.
-    //     Nothing above this point can prove that.
-    //  2. The request-body drain, which is code in User and is REQUIRED rather than
-    //     tidy: bytes still queued when the exchange closes make the kernel answer
-    //     with a reset, so a client that POSTed a body would see "connection reset
-    //     by peer" instead of the 405 that was written for it. Reproduced with a
-    //     one-mebibyte body, which is served correctly with the drain in place.
-    //  3. Availability under hostile bytes. Every malformed shape a client can send
-    //     is followed by a well-formed request on a fresh connection, which must
-    //     still be served. That is the property that actually matters for a health
-    //     endpoint: an endpoint a single bad request can silence is worse than no
-    //     endpoint, because the monitoring around it now reports a false outage.
-    //  4. Non-disclosure. No response, from this endpoint OR from the runtime
-    //     underneath it, may reflect any part of the request back, and none may
-    //     carry a Server banner. A rejection that quotes its input is how an error
-    //     path becomes an information leak, and the runtime's own error paths are
-    //     the ones application code never sees.
-    //  5. The one request ceiling the runtime enforces observably, and its
-    //     controls. A ceiling that rejected everything large would pass a limit
-    //     test and break every real client, so the over-limit case is paired with
-    //     large-but-legal requests that must be served.
+    // plain HTTP/1.0 request. It also reframes what comes BACK: a check made through
+    // it is a check on a parsed object, not on the bytes on the wire.
     //
     // WHAT THIS SECTION DELIBERATELY DOES NOT ASSERT
     //
-    // There is no 400, 414, 431 or 505 expectation anywhere below, and no fixed
-    // body for one. This endpoint produces exactly three statuses - 200, 404 and
-    // 405 - and the frozen contract in the specification enumerates exactly those
-    // three. Request parsing belongs to com.sun.net.httpserver, which is the
-    // listener the plan mandates, and it makes its own decisions: it tolerates a
-    // fourth token on the request line, tolerates a lower-case version keyword,
-    // tolerates a version with no minor, requires no Host at HTTP/1.1, imposes no
-    // target or header-size ceiling, and answers the shapes it does refuse with an
-    // HTML document of its own composition. Asserting a JSON 400 here would be
-    // asserting a response no conforming implementation of this contract sends -
-    // it would be testing a bespoke parser that no longer exists, and that this
-    // endpoint is specified not to have. What IS asserted about those shapes is
-    // what the contract genuinely promises: whatever answer comes back reflects
-    // nothing from the request, and the endpoint is still serving afterwards.
+    // There is no 400, 414, 431 or 505 expectation anywhere below, and no fixed body
+    // for one. This endpoint produces exactly three statuses - 200, 404 and 405 - and
+    // the frozen contract in the specification enumerates exactly those three.
+    // Request parsing belongs to com.sun.net.httpserver, which is the listener the
+    // plan mandates, and it makes its own decisions: it tolerates a fourth token on
+    // the request line, tolerates a lower-case version keyword, tolerates a version
+    // with no minor, requires no Host at HTTP/1.1, imposes no target or header-size
+    // ceiling, and answers the shapes it does refuse with an HTML document of its own
+    // composition. Asserting a JSON 400 here would be asserting a response no
+    // conforming implementation of this contract sends, on a bespoke parser this
+    // endpoint is specified not to have. What IS asserted about those shapes is what
+    // the contract genuinely promises: whatever answer comes back reflects nothing
+    // from the request, and the endpoint is still serving afterwards.
     //
-    // The connection assertions are kept in full. A served 1.1 connection is
-    // reused, a client that asks to close is answered and then closed, a lookalike
-    // connection option does not retire a good connection, and HTTP/1.0's inverted
-    // default is honoured both ways. Getting that backwards is not cosmetic: a
-    // health poller that had to reconnect for every poll would pay a handshake it
-    // does not need, and a client that kept writing into a socket the server had
-    // abandoned would see a reset instead of the answer it was given.
-    // -------------------------------------------------------------------------
+    // The connection assertions are kept in full. A served 1.1 connection is reused,
+    // a client that asks to close is answered and then closed, a lookalike connection
+    // option does not retire a good connection, and HTTP/1.0's inverted default is
+    // honoured both ways. Getting that backwards is not cosmetic: a health poller
+    // that had to reconnect for every poll would pay a handshake it does not need,
+    // and a client that kept writing into a socket the server had abandoned would see
+    // a reset instead of the answer it was given.
 
     /**
      * Asserts the contract over raw bytes, the body drain, availability under
      * hostile input and the connection semantics, over a socket this harness writes
      * bytes to directly.
-     *
-     * @throws IOException if the test server cannot be bound
      */
     private static void verifyRawTransport() throws IOException {
         String route = User.healthPath();
@@ -2947,10 +2792,6 @@ public class UserTest {
     /**
      * Asserts the media type, cache directives, length, date format and the absence
      * of a banner, on a response read as raw bytes.
-     *
-     * @param label          names the case in every message
-     * @param response       the parsed raw response
-     * @param declaredLength the byte length {@code Content-Length} must declare
      */
     private static void checkRawContractHeaders(String label, RawResponse response,
             int declaredLength) {
@@ -2968,27 +2809,24 @@ public class UserTest {
     }
 
     /**
-     * Asserts that no shape of hostile request line can silence the endpoint or
-     * make any response reflect its input.
+     * Asserts that no shape of hostile request line can silence the endpoint or make
+     * any response reflect its input.
      *
      * <p>The status a malformed request receives is the RUNTIME's decision, not this
      * endpoint's, and the runtime's decisions vary by shape: a request line with a
      * fourth token is tolerated and routed, one with a space in the target is routed
      * to the truncated target, one with an unparseable target or too few tokens is
-     * refused by the server before any handler runs, and one whose method token
-     * merely looks odd is routed and refused 405 like any other non-GET. All of
-     * those are conformant, none of them is in this endpoint's contract, and so none
-     * of them is asserted as a specific status.
+     * refused before any handler runs, and one whose method token merely looks odd is
+     * routed and refused 405 like any other non-GET. All of those are conformant,
+     * none is in this endpoint's contract, so none is asserted as a specific status.
      *
-     * <p>What IS asserted is what the contract does promise, for every shape without
-     * exception. The answer is a well-formed HTTP/1.1 message. Its status is a
-     * recognised one rather than something invented. Nothing from the request comes
-     * back in the status line, the header block or the body - which is the property
-     * that turns a parser error into an information leak when it fails, and which is
-     * checked with a target chosen to look like internal deployment detail so that a
-     * leak would be unmistakable in the log. And the endpoint is still answering
-     * afterwards, on a fresh connection, which is the availability property a health
-     * endpoint exists to provide.
+     * <p>What IS asserted holds for every shape without exception: the answer is a
+     * well-formed HTTP/1.1 message, its status is a recognised one rather than
+     * something invented, nothing from the request comes back in the status line, the
+     * header block or the body - checked with a target chosen to look like internal
+     * deployment detail so that a leak would be unmistakable in the log - and the
+     * endpoint is still answering afterwards on a fresh connection, which is the
+     * availability property a health endpoint exists to provide.
      */
     private static void verifyHostileRequestLines(int port, String route) {
         String telltale = "/internal-deployment-detail-" + port;
@@ -3028,12 +2866,6 @@ public class UserTest {
      * {@code Cache-Control}. Both are accepted here, and each is held to its own
      * frozen field set, so "the runtime refused it" and "the endpoint answered it"
      * are distinguished rather than blurred.
-     *
-     * @param port     the port the test server bound
-     * @param label    names the case in every message
-     * @param request  the raw bytes to send
-     * @param telltale a distinctive string planted in the request that must not
-     *                 appear anywhere in the response
      */
     private static void checkHostileExchange(int port, String label, String request,
             String telltale) {
@@ -3078,14 +2910,14 @@ public class UserTest {
      * <p>Version negotiation belongs to the listener, and this listener accepts what
      * it is given: an HTTP/2.0, 3.0, 0.9 or 9.9 request line over a 1.1 connection is
      * served, and the answer is a 1.1 message carrying the frozen contract. That is
-     * asserted rather than a 505, because a 505 is not a response this endpoint's
-     * contract defines and the mandated listener does not produce one.
+     * asserted rather than a 505, which is not a response this contract defines and
+     * not one the mandated listener produces.
      *
      * <p>HTTP/1.0 is the case that behaves differently and the case that matters,
-     * because a real 1.0 client exists. Its default disposition is the reverse of
-     * 1.1's, and the server both honours it and says so - which is why the 1.0
-     * answer carries one field more than the contract set, and why that extra field
-     * is named in an expectation of its own rather than tolerated by a loosened one.
+     * because a real 1.0 client exists: its default disposition is the reverse of
+     * 1.1's, and the server both honours it and says so - which is why the 1.0 answer
+     * carries one field more than the contract set, named in an expectation of its own
+     * rather than tolerated by a loosened one.
      */
     private static void verifyProtocolVersions(int port, String route) {
         for (String version : List.of("HTTP/2.0", "HTTP/3.0", "HTTP/0.9", "HTTP/9.9")) {
@@ -3127,19 +2959,17 @@ public class UserTest {
      * Asserts the one request ceiling the runtime enforces observably, with the
      * large-but-legal controls that keep it from being a false positive.
      *
-     * <p>The controls matter as much as the ceiling. A listener that rejected
+     * <p>The controls matter as much as the ceiling: a listener that rejected
      * everything large would pass a limit test and break every real client, so a
      * target of {@value #LARGE_TARGET_BYTES} bytes, a single header field of
      * {@value #LARGE_FIELD_BYTES} bytes and a header block of
      * {@value #LARGE_BLOCK_FIELD_COUNT} fields of {@value #LARGE_BLOCK_FIELD_BYTES}
      * bytes each are all required to be served.
      *
-     * <p>The long target carries the one assertion in this method that is about
-     * correctness rather than capacity: it must be answered 404, never 200. A target
-     * truncated anywhere along its length could normalise to the health route and be
-     * answered healthy on the strength of bytes that were never received, and that
-     * is the single way an unbounded target could produce a wrong ANSWER rather than
-     * merely a large one.
+     * <p>The long target carries the one assertion here that is about correctness
+     * rather than capacity: it must be answered 404, never 200. A target truncated
+     * anywhere along its length could normalise to the health route and be answered
+     * healthy on the strength of bytes that were never received.
      *
      * <p>Past {@value #RUNTIME_HEADER_FIELD_CEILING} fields the runtime closes the
      * connection without writing a byte. That is a denial-of-service control
@@ -3210,10 +3040,6 @@ public class UserTest {
      * takes: a caller that had to remember to subtract the mandatory Host would sit
      * one field off the boundary it meant to probe, and a ceiling probed one field
      * off is a ceiling not probed at all.
-     *
-     * @param route the request target
-     * @param total how many header fields the block must contain in all, at least one
-     * @return request line first, then exactly {@code total} field lines
      */
     private static List<String> headerFieldBlock(String route, int total) {
         List<String> lines = new ArrayList<>();
@@ -3228,22 +3054,20 @@ public class UserTest {
     /**
      * Asserts how the request target and the Host field reach the routing decision.
      *
-     * <p>These are the routing rules asserted at unit level in section D, driven
-     * here through real bytes so that the parser between the wire and
+     * <p>These are the routing rules asserted at unit level in section D, driven here
+     * through real bytes so that the parser between the wire and
      * {@code User.normalisePath} is part of the assertion rather than an assumption.
      * The absolute-form case is the one that would break silently: it is the only
-     * request shape in which the target carries a scheme and an authority, so it is
-     * the only proof that {@code stripAuthority} is still reached now that a server
-     * parses the request line.
+     * request shape whose target carries a scheme and an authority, so it is the only
+     * proof that {@code stripAuthority} is still reached now that a server parses the
+     * request line.
      *
      * <p>The Host field is asserted to be RECOGNISED in any casing and not to be
-     * required at all. That it is not required is a deliberate recording of the
-     * listener's behaviour rather than an endorsement: RFC 9112 section 3.2 requires
-     * a 1.1 client to send one and allows a server to reject a request without one,
-     * and this listener chooses to serve it. That choice is the listener's, the
-     * frozen contract defines no 400, and all three implementations of this endpoint
-     * route on the target alone - so a request missing a Host is answered by the
-     * route it asked for, which is what is asserted here.
+     * required at all. That it is not required records the listener's behaviour rather
+     * than endorsing it: RFC 9112 section 3.2 requires a 1.1 client to send one and
+     * allows a server to reject a request without one, and this listener chooses to
+     * serve it. The frozen contract defines no 400 and all three implementations route
+     * on the target alone, so a hostless request is answered by the route it asked for.
      */
     private static void verifyRequestTargetHandling(int port, String route) {
         checkRawExchange(port, "a request with no Host at all",
@@ -3434,7 +3258,7 @@ public class UserTest {
                     refusal.status());
             checkEquals("the refusal is the fixed document",
                     BODY_METHOD_NOT_ALLOWED, bodyText(refusal));
-            checkSetEquals("the refusal carries exactly five fields",
+            checkSetEquals("the refusal carries exactly the refusal set",
                     REFUSAL_HEADER_NAMES, refusal.names());
             checkEquals("the refusal names GET as allowed", "GET", refusal.headers().get("allow"));
             checkEquals("the connection survived, so the body was drained",
@@ -3444,11 +3268,10 @@ public class UserTest {
         }
 
         // The case that proves the drain is required rather than tidy. A body this
-        // size left unread makes the kernel answer the close with a reset, and the
-        // client then reads "connection reset by peer" instead of the response that
-        // was already written for it - reproduced exactly that way before the drain
-        // was added. One mebibyte is enough to fill the socket buffers and is well
-        // inside the eight-mebibyte cap, so the whole body is consumed.
+        // size left unread makes the kernel answer the close with a reset, so the
+        // client reads "connection reset by peer" instead of the response that was
+        // already written for it. One mebibyte is enough to fill the socket buffers
+        // and is well inside the eight-mebibyte cap, so the whole body is consumed.
         try (RawConnection connection = new RawConnection(port)) {
             String large = "x".repeat(LARGE_BODY_BYTES);
             RawResponse refusal = connection.send(wireRequest(List.of(
@@ -3459,7 +3282,7 @@ public class UserTest {
                     HTTP_METHOD_NOT_ALLOWED, refusal.status());
             checkEquals("the large-body refusal is the fixed document",
                     BODY_METHOD_NOT_ALLOWED, bodyText(refusal));
-            checkSetEquals("the large-body refusal carries exactly five fields",
+            checkSetEquals("the large-body refusal carries exactly the refusal set",
                     REFUSAL_HEADER_NAMES, refusal.names());
         } catch (IOException failure) {
             recordRawFailure("draining a one-mebibyte body", failure);
@@ -3505,7 +3328,7 @@ public class UserTest {
                 "HEAD " + route + " HTTP/1.1", "Host: " + TEST_HOST)), false, response -> {
                     checkEquals("raw HEAD is refused 405", HTTP_METHOD_NOT_ALLOWED,
                             response.status());
-                    checkSetEquals("raw HEAD's refusal carries exactly five fields",
+                    checkSetEquals("raw HEAD's refusal carries exactly the refusal set",
                             REFUSAL_HEADER_NAMES, response.names());
                     checkEquals("raw HEAD advertises the length it would have sent",
                             Integer.toString(BODY_METHOD_NOT_ALLOWED
@@ -3515,16 +3338,13 @@ public class UserTest {
                 });
     }
 
-    // -------------------------------------------------------------------------
     // Raw-socket machinery
-    // -------------------------------------------------------------------------
 
     /** One parsed response, framed out of the byte stream by its Content-Length. */
     private record RawResponse(String statusLine, String version, int status,
             Map<String, String> headers, Set<String> names, byte[] body) {
     }
 
-    /** One assertion block applied to a parsed response. */
     private interface RawAssertions {
         void apply(RawResponse response);
     }
@@ -3553,10 +3373,6 @@ public class UserTest {
 
         /**
          * Writes bytes exactly as given, with no framing of its own.
-         *
-         * @param raw the bytes to send, interpreted as one byte per character
-         * @return this connection, for chaining
-         * @throws IOException if the write fails
          */
         RawConnection send(String raw) throws IOException {
             OutputStream sink = socket.getOutputStream();
@@ -3567,9 +3383,6 @@ public class UserTest {
 
         /**
          * Reads exactly one complete response, leaving any remainder buffered.
-         *
-         * @return the parsed response
-         * @throws IOException if the peer closes or goes quiet before one arrives
          */
         RawResponse readResponse() throws IOException {
             return readResponse(true);
@@ -3584,10 +3397,6 @@ public class UserTest {
          * 9110 requires. A framer that always waited for the declared bytes would
          * block forever on a correct response - so the caller, which is the only
          * party that knows it sent a HEAD, says so.
-         *
-         * @param expectBody whether the declared Content-Length will be delivered
-         * @return the parsed response
-         * @throws IOException if the peer closes or goes quiet before one arrives
          */
         RawResponse readResponse(boolean expectBody) throws IOException {
             long deadline = System.nanoTime()
@@ -3614,9 +3423,6 @@ public class UserTest {
          *
          * <p>Bounded so that a connection the server is deliberately holding open
          * reports {@code false} instead of hanging the harness.
-         *
-         * @return {@code true} once the peer has gone
-         * @throws IOException if reading fails for a reason other than a timeout
          */
         boolean peerHasClosed() throws IOException {
             long deadline = System.nanoTime()
@@ -3643,7 +3449,6 @@ public class UserTest {
             }
         }
 
-        /** @return the buffered bytes as text, for a failure message */
         private String buffered() {
             return new String(pending.toByteArray(), StandardCharsets.ISO_8859_1);
         }
@@ -3651,7 +3456,6 @@ public class UserTest {
         /**
          * Parses and consumes one response if a complete one is buffered.
          *
-         * @param expectBody whether the declared Content-Length will be delivered
          * @return the response, or {@code null} while it is still incomplete
          */
         private RawResponse frame(boolean expectBody) {
@@ -3703,9 +3507,6 @@ public class UserTest {
      * <p>Each line is terminated with CRLF and the block is closed with a blank
      * line, so a check writes exactly the bytes it means - including the malformed
      * ones no HTTP client would agree to send.
-     *
-     * @param lines request line first, then header field lines
-     * @return the complete request, with no body
      */
     private static String wireRequest(List<String> lines) {
         return wireRequest(lines, "");
@@ -3713,10 +3514,6 @@ public class UserTest {
 
     /**
      * Assembles a raw HTTP request with a body appended verbatim.
-     *
-     * @param lines request line first, then header field lines
-     * @param body  raw body bytes, appended with no framing of their own
-     * @return the complete request
      */
     private static String wireRequest(List<String> lines, String body) {
         StringBuilder request = new StringBuilder();
@@ -3726,7 +3523,6 @@ public class UserTest {
         return request.append(CRLF).append(body).toString();
     }
 
-    /** @return a response body decoded as UTF-8 */
     private static String bodyText(RawResponse response) {
         return new String(response.body(), StandardCharsets.UTF_8);
     }
@@ -3738,11 +3534,6 @@ public class UserTest {
      * <p>An I/O failure becomes a COUNTED failure rather than an escaped exception,
      * so one uncooperative case cannot abort the rest of the section and hide
      * findings behind the first stack trace.
-     *
-     * @param port       the port the test server bound
-     * @param label      names the case in every message
-     * @param request    the raw bytes to send
-     * @param assertions what to assert about the response
      */
     private static void checkRawExchange(int port, String label, String request,
             RawAssertions assertions) {
@@ -3751,13 +3542,6 @@ public class UserTest {
 
     /**
      * Sends one raw request and applies assertions, optionally expecting no body.
-     *
-     * @param port       the port the test server bound
-     * @param label      names the case in every message
-     * @param request    the raw bytes to send
-     * @param expectBody whether the declared Content-Length will be delivered,
-     *                   which is false for a HEAD request and true otherwise
-     * @param assertions what to assert about the response
      */
     private static void checkRawExchange(int port, String label, String request,
             boolean expectBody, RawAssertions assertions) {
@@ -3770,9 +3554,6 @@ public class UserTest {
 
     /**
      * Records a raw-socket I/O failure as a counted failure.
-     *
-     * @param label   names the case that failed
-     * @param failure what went wrong
      */
     private static void recordRawFailure(String label, IOException failure) {
         checksExecuted++;
@@ -3780,19 +3561,14 @@ public class UserTest {
         System.err.println("FAIL: " + label + " - the raw exchange failed: " + failure);
     }
 
-    // ===================================================================== //
-    // Section I - configuration validation and the port grammar
+    // Section I - configuration validation and the port grammar. A configuration
+    // that cannot be published truthfully is refused BEFORE a socket is bound, which
+    // is what makes the refusal total: there is no window in which a port is held by
+    // a server that would answer 200 with a payload the contract forbids.
     //
-    // A configuration that cannot be published truthfully is refused BEFORE a
-    // socket is bound, which is what makes the refusal total: there is no window
-    // in which a port is held by a server that would answer 200 with a payload
-    // the contract forbids.
-    //
-    // Every message here names the KEY and withholds the VALUE. That is not
-    // decoration: it is what lets the probe print the message verbatim without
-    // sanitising it a second time, and it is why a configured value carrying CRLF
-    // cannot forge a log line through a refusal.
-    // ===================================================================== //
+    // Every message names the KEY and withholds the VALUE. That is what lets the
+    // probe print the message verbatim without sanitising it a second time, and it is
+    // why a configured value carrying CRLF cannot forge a log line through a refusal.
 
     /** The four refusal messages, worded identically in all three implementations. */
     private static final String NAME_REFUSAL =
@@ -3806,12 +3582,6 @@ public class UserTest {
 
     /**
      * Builds a configuration that is valid in every field, for one field to spoil.
-     *
-     * @param name    application name
-     * @param version application version
-     * @param path    health route
-     * @param host    bind address
-     * @return a configuration bound to an ephemeral port
      */
     private static User.Config configWith(String name, String version, String path, String host) {
         return new User.Config(name, version, path, host, 0);
@@ -3846,6 +3616,31 @@ public class UserTest {
             checkRefusalMessage("a route spelled " + describe(bad) + " is refused",
                     PATH_REFUSAL,
                     () -> User.validateConfig(configWith("n", "1.1.0", bad, "127.0.0.1")));
+        }
+
+        // A network-path reference is refused in all three implementations. Nothing
+        // in THIS runtime would notice it: "//health" survives normalisation
+        // unchanged and HttpServer would serve it. The reason to refuse is that RFC
+        // 3986 reads a leading "//" as the start of an authority, so a client, a
+        // proxy or a sibling implementation may legitimately resolve the same
+        // configured value against a different target - which would let one shared
+        // configuration file describe three different endpoints.
+        for (String bad : List.of("//health", "///health", "//health/", "//host/health")) {
+            checkRefusalMessage("a network-path reference spelled " + describe(bad)
+                            + " is refused", PATH_REFUSAL,
+                    () -> User.validateConfig(configWith("n", "1.1.0", bad, "127.0.0.1")));
+        }
+
+        // The mirror image, and the reason the refusal above cannot be written as a
+        // plain "must start with a slash" rule: the validator grades the route that
+        // will be SERVED, not the configured text, so a value with no leading slash
+        // is accepted and "health" and "/health" are the same configuration. "//"
+        // is accepted because it reduces to "/" - it is a root route, not an
+        // authority.
+        for (String good : List.of("health", "healthz", "/health/", "/health?probe=1", "//")) {
+            checkEquals("a route spelled " + describe(good) + " is accepted", "",
+                    withStderr(() -> User.validateConfig(
+                            configWith("n", "1.1.0", good, "127.0.0.1"))));
         }
 
         for (String bad : List.of("", "127.0.0.1\r\nX", "a\u0000b")) {
@@ -3909,9 +3704,6 @@ public class UserTest {
      *
      * <p>Both environment names are ones no test exports, so the file value is the
      * effective one and the resolution exercises the real code path.
-     *
-     * @param stated the value as it would appear in the properties file
-     * @return the resolved port
      */
     private static int portFrom(String stated) {
         Properties props = new Properties();
@@ -3925,9 +3717,6 @@ public class UserTest {
      *
      * <p>A test name containing a raw carriage return would corrupt the harness's
      * own output, which is the very failure mode these tests exist to prevent.
-     *
-     * @param value the value to describe
-     * @return a single-line, quoted rendering
      */
     private static String describe(String value) {
         StringBuilder rendered = new StringBuilder("\"");
@@ -3949,19 +3738,16 @@ public class UserTest {
         return rendered.append('"').toString();
     }
 
-    // ===================================================================== //
-    // Section J - probe answer validation and connection reuse
+    // Section J - probe answer validation and connection reuse. A health probe's
+    // caller can act only on an exit status, so the probe fails CLOSED: every doubt
+    // resolves to unhealthy. It checks the whole document rather than searching the
+    // body for a hopeful substring, because a substring test accepts a truncated body
+    // that merely quotes the healthy fragment - a probe reporting health it never
+    // established.
     //
-    // The probe is consumed by a container HEALTHCHECK, so it fails CLOSED: every
-    // doubt resolves to unhealthy. It checks the whole document rather than
-    // searching the body for a hopeful substring - the substring test passed for a
-    // truncated body that merely quoted the healthy fragment, which is a probe
-    // reporting health it never established.
-    //
-    // The reuse tests cover a seam none of the three implementations could see
-    // alone: a refused request that arrives WITH a body must not corrupt the next
-    // request on the same connection.
-    // ===================================================================== //
+    // The reuse tests cover a seam none of the three implementations could see alone:
+    // a refused request that arrives WITH a body must not corrupt the next request on
+    // the same connection.
 
     /**
      * The probe's body ceiling, stated independently of the implementation.
@@ -3986,6 +3772,31 @@ public class UserTest {
             "body does not carry exactly the keys [\"name\",\"version\",\"timestamp\",\"status\"]"
             + " in order";
 
+    /**
+     * The reason every body that never becomes a readable document carries.
+     *
+     * <p>Pinned as a literal and asserted by EQUALITY rather than by non-nullness,
+     * because the interesting property is not that these bodies are refused - it is
+     * that all three implementations refuse them at the SAME STEP and word it the
+     * same way. A duplicate member name, for instance, is settled while parsing by
+     * every one of the three: this reader's member map, app.py's
+     * {@code object_pairs_hook} and index.js's member scan all reject it before any
+     * field rule is consulted. A check that only asserted non-nullness would pass
+     * for an implementation that reported "the status field is not the expected
+     * value" instead, and two operators grepping two deployments for one fault would
+     * find two different strings.
+     */
+    private static final String MALFORMED_DOCUMENT_REFUSAL =
+            "body is not the expected JSON document";
+
+    /** The reason a readable document that is not an object carries. */
+    private static final String NOT_AN_OBJECT_REFUSAL =
+            "body is not a JSON object and carries no status field";
+
+    /** The reason a name that is absent, empty or not a string carries. */
+    private static final String NAME_FIELD_REFUSAL =
+            "the name field is not a non-empty string";
+
     private static byte[] utf8(String text) {
         return text.getBytes(StandardCharsets.UTF_8);
     }
@@ -3998,7 +3809,7 @@ public class UserTest {
         checkEquals("a 404 answer is refused by code", "the endpoint answered status 404",
                 User.probeRejection(404, utf8(SOUND_DOCUMENT)));
 
-        // The fail-OPEN case the substring test used to pass: these bytes contain
+        // The fail-OPEN case a substring test accepts: these bytes contain
         // "status":"UP" and are not a JSON document at all.
         checkEquals("a truncated body quoting the healthy fragment is refused",
                 "body is not the expected JSON document",
@@ -4028,19 +3839,84 @@ public class UserTest {
                 User.probeRejection(200, utf8("{}")));
 
         // A repeated member name is refused rather than letting the last one win,
-        // which is what a permissive reader would do.
-        check("a repeated member name is refused",
-                User.probeRejection(200, utf8("{\"name\":\"n\",\"name\":\"other\","
-                        + "\"version\":\"1.1.0\",\"timestamp\":\"2026-07-29T08:00:00Z\","
-                        + "\"status\":\"UP\"}")) != null);
-
-        for (String body : List.of("[]", "\"UP\"", "42", "null", "true")) {
-            check("a body that is JSON but not an object is refused: " + describe(body),
-                    User.probeRejection(200, utf8(body)) != null);
+        // which is what a permissive reader would do. The reason is asserted by
+        // equality, and the same seven rows - same labels, same bytes, same expected
+        // reason - are asserted in test_app.py and index.test.js.
+        String tail = "\"version\":\"1.1.0\",\"timestamp\":\"2026-07-29T08:00:00Z\",\"status\":\"UP\"}";
+        String[][] repeats = {
+            {"a repeated member name whose last value disagrees",
+             "{\"name\":\"n\",\"version\":\"1.1.0\",\"timestamp\":\"2026-07-29T08:00:00Z\","
+                 + "\"status\":\"UP\",\"status\":\"DOWN\"}"},
+            {"a repeated member name whose last value agrees",
+             "{\"name\":\"n\",\"version\":\"1.1.0\",\"timestamp\":\"2026-07-29T08:00:00Z\","
+                 + "\"status\":\"DOWN\",\"status\":\"UP\"}"},
+            {"a repeated first member",
+             "{\"name\":\"n\",\"name\":\"other\"," + tail},
+            {"a repeat spelled with a unicode escape",
+             "{\"name\":\"n\",\"\\u006eame\":\"other\"," + tail},
+            {"a repeat nested inside a member value",
+             "{\"name\":{\"a\":1,\"a\":2}," + tail},
+            {"a repeat inside an array element", "[{\"a\":1,\"a\":2}]"},
+            {"repeated empty-string keys",
+             "{\"\":\"a\",\"\":\"b\",\"name\":\"n\"," + tail},
+        };
+        for (String[] row : repeats) {
+            checkEquals(row[0] + " is refused as a malformed document",
+                    MALFORMED_DOCUMENT_REFUSAL, User.probeRejection(200, utf8(row[1])));
         }
-        check("a non-string field value is refused",
-                User.probeRejection(200, utf8("{\"name\":1,\"version\":\"1.1.0\","
-                        + "\"timestamp\":\"2026-07-29T08:00:00Z\",\"status\":\"UP\"}")) != null);
+
+        // Found at every nesting level, because the member map is consulted on every
+        // object this reader opens - which is what app.py's hook and index.js's scan
+        // also do. A check that only examined the top-level object would agree with
+        // them above and disagree here.
+        for (int depth : new int[] {1, 2, 5, 20}) {
+            String buried = "{\"name\":" + "{\"a\":".repeat(depth) + "{\"b\":1,\"b\":2}"
+                    + "}".repeat(depth) + "," + tail;
+            checkEquals("a repeat " + depth + " level(s) down is still refused",
+                    MALFORMED_DOCUMENT_REFUSAL, User.probeRejection(200, utf8(buried)));
+        }
+
+        for (String body : List.of("[]", "\"UP\"", "42", "null", "true", "false")) {
+            checkEquals("a body that is JSON but not an object is refused: " + describe(body),
+                    NOT_AN_OBJECT_REFUSAL, User.probeRejection(200, utf8(body)));
+        }
+        // An empty body never becomes a document at all, so it is settled one step
+        // earlier and carries the malformed reason instead - as it does in both siblings.
+        checkEquals("an empty body is refused as a malformed document",
+                MALFORMED_DOCUMENT_REFUSAL, User.probeRejection(200, new byte[0]));
+
+        for (String value : List.of("1", "null", "true", "{}", "[\"x\"]")) {
+            checkEquals("a name of " + describe(value) + " is refused",
+                    NAME_FIELD_REFUSAL,
+                    User.probeRejection(200, utf8("{\"name\":" + value + "," + tail)));
+        }
+        // A name of nothing but spaces is ACCEPTED by all three: the rule is
+        // non-empty, not non-blank. Asserted so it cannot be tightened here alone.
+        checkEquals("a name of only spaces is accepted, as in both siblings", null,
+                User.probeRejection(200, utf8("{\"name\":\"   \"," + tail)));
+
+        // Bytes that are not UTF-8 are refused rather than decoded to U+FFFD. This
+        // reader's decoder reports a malformed sequence, app.py's strict decode
+        // raises, and index.js decodes through a fatal TextDecoder, so one bad byte
+        // inside a schema-shaped document is refused by all three at the same step.
+        byte[][] illFormed = {
+            {(byte) 0xC3, (byte) 0x28},
+            {(byte) 0x80},
+            {(byte) 0xE2, (byte) 0x82},
+            {(byte) 0xED, (byte) 0xA0, (byte) 0x80},
+            {(byte) 0xC0, (byte) 0xAF},
+            {(byte) 0xFE},
+        };
+        byte[] opening = utf8("{\"name\":\"");
+        byte[] closing = utf8("\"," + tail);
+        for (byte[] bad : illFormed) {
+            byte[] body = new byte[opening.length + bad.length + closing.length];
+            System.arraycopy(opening, 0, body, 0, opening.length);
+            System.arraycopy(bad, 0, body, opening.length, bad.length);
+            System.arraycopy(closing, 0, body, opening.length + bad.length, closing.length);
+            checkEquals("a body carrying " + bad.length + " ill-formed byte(s) is refused",
+                    MALFORMED_DOCUMENT_REFUSAL, User.probeRejection(200, body));
+        }
 
         // A body that is not valid UTF-8 is refused rather than silently repaired.
         // new String(bytes, UTF_8) substitutes U+FFFD, which would turn a corrupt
@@ -4081,9 +3957,6 @@ public class UserTest {
      * consumed as the start of the next request line, and the legitimate request
      * behind them is never answered. Node dumps an unconsumed request itself and
      * app.py drains explicitly, so all three share this behaviour.
-     *
-     * @param port the port the listener is bound to
-     * @throws Exception if the exchange cannot be performed at all
      */
     private static void verifyConnectionReuse(int port) throws Exception {
         byte[] body = utf8("xyz");
@@ -4112,10 +3985,6 @@ public class UserTest {
 
     /**
      * Counts non-overlapping occurrences of {@code needle} in {@code haystack}.
-     *
-     * @param haystack the text to search
-     * @param needle   the text to count
-     * @return the number of occurrences
      */
     private static int countOccurrences(String haystack, String needle) {
         int found = 0;
@@ -4125,5 +3994,281 @@ public class UserTest {
             at = haystack.indexOf(needle, at + needle.length());
         }
         return found;
+    }
+
+    // Section K - the shared properties grammar and the failure policy. One file,
+    // three parsers. java.util.Properties is the reference by construction - the
+    // format was chosen so that this implementation needs no parser at all - and
+    // app.py and index.js implement its grammar by hand. A fixture table is therefore
+    // the only honest way to state that contract: the same documents and the same
+    // malformed ones appear verbatim in test_app.py, index.test.js and here, with the
+    // same expected results, so a divergence in any one runtime fails a named check
+    // instead of surfacing later as two servers disagreeing about their own name.
+    //
+    // The rest of the section is the FAILURE policy, a contract in its own right:
+    // absence is silent, and an unreadable file and a malformed file each produce
+    // exactly ONE warning and then the built-in defaults. Those outcomes are asserted
+    // from OUTSIDE the process in a child JVM given its own directory, because the
+    // real path - configLocation, loadProperties, the catch order - is private and
+    // takes no file argument, so a child is the only place it can be observed at all
+    // rather than re-implemented and asserted against itself.
+
+    /** One row of the cross-language properties grammar table. */
+    private record GrammarFixture(String label, String text, Map<String, String> expected) {
+    }
+
+    /**
+     * U+FEFF, built from its code point rather than written as an escape.
+     *
+     * <p>A {@code \\u} escape in Java source is processed before the lexer runs, so
+     * writing it inline would put a real byte-order mark in the source file. Naming
+     * it here keeps the fixture readable and the file plain ASCII.
+     */
+    private static final String BYTE_ORDER_MARK = String.valueOf((char) 0xFEFF);
+
+    /**
+     * The grammar, one document per row, with the map it must produce.
+     *
+     * <p>Identical - same labels, same text, same expectations - to
+     * {@code SHARED_PROPERTIES_FIXTURES} in {@code test_app.py} and
+     * {@code index.test.js}. Here the assertion is a round trip against the
+     * reference implementation, which is what makes the same table in the other two
+     * suites a statement about parity rather than about their own opinion.
+     */
+    private static final List<GrammarFixture> SHARED_PROPERTIES_FIXTURES = List.of(
+            new GrammarFixture("a plain key and value", "a=1\n", Map.of("a", "1")),
+            new GrammarFixture("a colon separator", "a:1\n", Map.of("a", "1")),
+            new GrammarFixture("a space separator", "a 1\n", Map.of("a", "1")),
+            new GrammarFixture("a tab separator", "a\t1\n", Map.of("a", "1")),
+            new GrammarFixture("a form-feed separator", "a\f1\n", Map.of("a", "1")),
+            new GrammarFixture("whitespace around the separator", "a = 1\n", Map.of("a", "1")),
+            new GrammarFixture("trailing value whitespace is preserved", "a=1   \n",
+                    Map.of("a", "1   ")),
+            new GrammarFixture("a whitespace-only value is empty", "a=   \n", Map.of("a", "")),
+            new GrammarFixture("a key with no separator has an empty value", "abc\n",
+                    Map.of("abc", "")),
+            new GrammarFixture("an empty key is still a key", "=v\n", Map.of("", "v")),
+            new GrammarFixture("only the first separator separates", "a = b=c \n",
+                    Map.of("a", "b=c ")),
+            new GrammarFixture("an escaped space belongs to the key", "a\\ b=x\n",
+                    Map.of("a b", "x")),
+            new GrammarFixture("an escaped equals belongs to the key", "a\\=b=x\n",
+                    Map.of("a=b", "x")),
+            new GrammarFixture("an escaped colon belongs to the key", "a\\:b=x\n",
+                    Map.of("a:b", "x")),
+            new GrammarFixture("a tab escape in a value", "a=x\\ty\n", Map.of("a", "x\ty")),
+            new GrammarFixture("a newline escape in a value", "a=x\\nz\n", Map.of("a", "x\nz")),
+            new GrammarFixture("a unicode escape in a value", "a=\\u0041\n", Map.of("a", "A")),
+            new GrammarFixture("a capital U is not a unicode escape", "a=\\U0041\n",
+                    Map.of("a", "U0041")),
+            new GrammarFixture("an unknown escape is the character itself", "a=\\z\n",
+                    Map.of("a", "z")),
+            new GrammarFixture("an escaped backslash is one backslash", "a=x\\\\y\n",
+                    Map.of("a", "x\\y")),
+            new GrammarFixture("an odd trailing backslash continues the line",
+                    "a=one\\\n   two\n", Map.of("a", "onetwo")),
+            new GrammarFixture("an even trailing backslash ends the line", "a=v\\\\\nb=2\n",
+                    Map.of("a", "v\\", "b", "2")),
+            new GrammarFixture("a hash comment is skipped", "#c\na=1\n", Map.of("a", "1")),
+            new GrammarFixture("a bang comment is skipped", "!c\na=1\n", Map.of("a", "1")),
+            new GrammarFixture("an indented comment is skipped", "   # c\na=1\n",
+                    Map.of("a", "1")),
+            new GrammarFixture("a continuation line is data, not a comment", "a=x\\\n#y\n",
+                    Map.of("a", "x#y")),
+            new GrammarFixture("CR, LF and CRLF all end a line", "a=1\r\nb=2\rc=3\n",
+                    Map.of("a", "1", "b", "2", "c", "3")),
+            new GrammarFixture("the last of a repeated key wins", "a=1\na=2\n", Map.of("a", "2")),
+            new GrammarFixture("quote characters are literal", "a=\"q\"\n", Map.of("a", "\"q\"")),
+            new GrammarFixture("a trailing backslash at end of input is dropped", "a=v\\",
+                    Map.of("a", "v")),
+            new GrammarFixture("a byte-order mark is not stripped", BYTE_ORDER_MARK + "a=1\n",
+                    Map.of(BYTE_ORDER_MARK + "a", "1")));
+
+    /**
+     * Documents that must be refused outright rather than read literally.
+     *
+     * <p>A short, non-hexadecimal or truncated {@code \\uXXXX} escape makes the
+     * whole document malformed - it is NOT a literal {@code \\u12}. That
+     * distinction is the one place a hand-written parser is most likely to be
+     * lenient, and a lenient parser would publish a name the reference
+     * implementation would refuse.
+     */
+    private static final List<Map.Entry<String, String>> SHARED_MALFORMED_PROPERTIES = List.of(
+            Map.entry("a short unicode escape in a value", "a=\\u12\n"),
+            Map.entry("a non-hexadecimal unicode escape", "a=\\uZZZZ\n"),
+            Map.entry("a malformed unicode escape in a key", "\\u12=v\n"));
+
+    /**
+     * The reference implementation's own wording for a malformed escape.
+     *
+     * <p>Asserted so that the refusal is the documented one and not, say, a
+     * {@code NullPointerException} that happens to abort the parse. app.py raises
+     * {@code PropertiesFormatError} and index.js a {@code RangeError}, each
+     * carrying their own reason text; the internal wording is deliberately NOT
+     * shared, because it never leaves the process. What is shared, and what all
+     * three suites assert, is the OBSERVABLE outcome below: one warning line, then
+     * the built-in defaults.
+     */
+    private static final String MALFORMED_ESCAPE_REASON = "Malformed \\uxxxx encoding.";
+
+    /** The exact warning all three implementations emit for a file they cannot read. */
+    private static final String UNREADABLE_CONFIG_WARNING =
+            "cannot read the configuration file; using defaults";
+
+    /** The exact warning all three implementations emit for a malformed file. */
+    private static final String MALFORMED_CONFIG_WARNING =
+            "the configuration file is malformed; using defaults";
+
+    /** Prefix every diagnostic carries, on standard error and never on standard out. */
+    private static final String DIAGNOSTIC_PREFIX = "[User] ";
+
+    /**
+     * Asserts the shared grammar and then the shared failure policy.
+     */
+    private static void verifySharedPropertiesGrammar() throws IOException {
+        for (GrammarFixture fixture : SHARED_PROPERTIES_FIXTURES) {
+            checkEquals("the shared grammar reads " + fixture.label(),
+                    fixture.expected(), parseSharedProperties(fixture.text()));
+        }
+        for (Map.Entry<String, String> malformed : SHARED_MALFORMED_PROPERTIES) {
+            checkRefusalMessage("the shared grammar refuses " + malformed.getKey(),
+                    MALFORMED_ESCAPE_REASON,
+                    () -> parseSharedProperties(malformed.getValue()));
+        }
+        verifyConfigurationFailurePolicy();
+    }
+
+    /**
+     * Parses properties text the way the application parses its file.
+     *
+     * <p>{@code Properties.load(Reader)} - the character-based overload, not the
+     * byte-based one - because the application reads UTF-8 through a decoding
+     * reader and the two overloads disagree about every non-ASCII byte.
+     */
+    private static Map<String, String> parseSharedProperties(String text) {
+        Properties parsed = new Properties();
+        try (StringReader reader = new StringReader(text)) {
+            parsed.load(reader);
+        } catch (IOException impossible) {
+            throw new IllegalStateException("reading from a string cannot fail", impossible);
+        }
+        Map<String, String> flattened = new LinkedHashMap<>();
+        for (String key : parsed.stringPropertyNames()) {
+            flattened.put(key, parsed.getProperty(key));
+        }
+        return flattened;
+    }
+
+    /**
+     * Asserts the three-outcome failure policy from outside the process.
+     *
+     * <p>Five cases, in an order that makes each one interpretable. The two NEGATIVE
+     * controls come first: an absent file, and a well-formed one delivered exactly the
+     * same way. Without the second, every warning assertion that follows could be
+     * passing because the file was never found at all.
+     *
+     * <p>Every case runs {@code --probe} with an unparseable port value, so the child
+     * refuses before it opens a socket. That makes the run deterministic and
+     * network-free: the exit status is always 1 for the same stated reason, and the
+     * only thing that varies is which configuration warning, if any, precedes it.
+     *
+     * <p>The child's working directory is the enclosure, not the repository. Left
+     * pointing at the repository it would find the repository's own properties file as
+     * its second candidate, and the absent-file case would silently become a
+     * well-formed-file case.
+     */
+    private static void verifyConfigurationFailurePolicy() throws IOException {
+        Path enclosure = Files.createTempDirectory("usertest-config-policy-");
+        try {
+            List<String> prefix = isolatedLaunchPrefix(enclosure);
+            Path config = enclosure.resolve(CONFIG_FILE_NAME);
+
+            // 1. ABSENT - the only silent outcome. Every key has a built-in default,
+            //    and a health endpoint that refused to start for want of an optional
+            //    file would defeat the purpose of having a health endpoint.
+            check("the enclosure genuinely holds no configuration file", !Files.exists(config));
+            checkConfigurationDiagnostics("an absent configuration file",
+                    probeInEnclosure(prefix, enclosure, UNUSABLE_PORT_VALUE), 0, 0);
+
+            // 2. WELL-FORMED, delivered identically - the control that gives the
+            //    three failure cases their meaning. That the file was READ rather
+            //    than merely present is proved by the refusal naming ITS port value:
+            //    no environment variable is set here, so the built-in default would
+            //    have been usable and the child would have gone to the network.
+            Files.writeString(config, KEY_JAVA_PORT + "=" + UNUSABLE_PORT_VALUE + "\n",
+                    StandardCharsets.UTF_8);
+            ChildOutcome wellFormed = probeInEnclosure(prefix, enclosure, null);
+            checkConfigurationDiagnostics("a well-formed configuration file", wellFormed, 0, 0);
+            check("the isolated file was read, not merely present",
+                    wellFormed.errorText().contains(UNUSABLE_PORT_VALUE));
+
+            // 3. MALFORMED - one warning, then the defaults.
+            Files.writeString(config, SHARED_MALFORMED_PROPERTIES.get(0).getValue(),
+                    StandardCharsets.UTF_8);
+            checkConfigurationDiagnostics("a malformed configuration file",
+                    probeInEnclosure(prefix, enclosure, UNUSABLE_PORT_VALUE), 0, 1);
+
+            // 4. NOT UTF-8 - the decoding reader raises MalformedInputException, an
+            //    IOException, so this lands on the unreadable path exactly as it does
+            //    in app.py and index.js. Never U+FFFD: a silently substituted
+            //    replacement character would let this implementation publish a name
+            //    its siblings could not.
+            Files.write(config, new byte[] {'a', '=', 'c', 'a', 'f', (byte) 0xE9, '\n'});
+            checkConfigurationDiagnostics("a configuration file that is not UTF-8",
+                    probeInEnclosure(prefix, enclosure, UNUSABLE_PORT_VALUE), 1, 0);
+
+            // 5. UNREADABLE - one warning, then the defaults. A DIRECTORY standing
+            //    where the file belongs is the portable fixture: a permission bit
+            //    does not stop a process running as root, which is how CI and all
+            //    three container images run, so a chmod-based fixture would pass
+            //    vacuously there.
+            Files.delete(config);
+            Files.createDirectory(config);
+            checkConfigurationDiagnostics("an unreadable configuration file",
+                    probeInEnclosure(prefix, enclosure, UNUSABLE_PORT_VALUE), 1, 0);
+        } finally {
+            deleteRecursively(enclosure);
+        }
+        check("the configuration-policy enclosure was removed", !Files.exists(enclosure));
+    }
+
+    /**
+     * Runs {@code --probe} in an isolated enclosure and collects its diagnostics.
+     *
+     * @param portOverride a {@code JAVA_PORT} value to export, or {@code null} to
+     *                     give the child no environment at all
+     */
+    private static ChildOutcome probeInEnclosure(List<String> prefix, Path enclosure,
+            String portOverride) {
+        Map<String, String> environment = new LinkedHashMap<>();
+        if (portOverride != null) {
+            environment.put(ENV_JAVA_PORT, portOverride);
+        }
+        return runApplication(prefix, enclosure, List.of(FLAG_PROBE), environment);
+    }
+
+    /**
+     * Asserts how many configuration warnings a child emitted, and no more.
+     *
+     * <p>Counting rather than searching is the point: the contract is exactly ONE
+     * warning per failed load. A loader that read the file twice would emit two
+     * identical lines and a substring search would call that correct.
+     */
+    private static void checkConfigurationDiagnostics(String label, ChildOutcome outcome,
+            int expectedUnreadableWarnings, int expectedMalformedWarnings) {
+        String diagnostics = outcome.errorText();
+        checkEquals("--probe fails closed with " + label, EXIT_FAILURE, outcome.status());
+        checkBytesEqual(label + " leaves standard output untouched",
+                new byte[0], outcome.standardOutput());
+        checkEquals(label + " emits " + expectedUnreadableWarnings
+                        + " unreadable-file warning(s)", expectedUnreadableWarnings,
+                countOccurrences(diagnostics, UNREADABLE_CONFIG_WARNING));
+        checkEquals(label + " emits " + expectedMalformedWarnings
+                        + " malformed-file warning(s)", expectedMalformedWarnings,
+                countOccurrences(diagnostics, MALFORMED_CONFIG_WARNING));
+        if (expectedUnreadableWarnings + expectedMalformedWarnings > 0) {
+            check(label + " reports on standard error under the usual prefix",
+                    diagnostics.startsWith(DIAGNOSTIC_PREFIX));
+        }
     }
 }

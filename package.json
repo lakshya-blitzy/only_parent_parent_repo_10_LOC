@@ -10,7 +10,7 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "test": "node --test --test-reporter=tap",
+    "test": "node --test",
     "test:tap": "node --test --test-reporter=tap",
     "start": "node index.js --serve",
     "probe": "node index.js --probe"

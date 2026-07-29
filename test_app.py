@@ -1,56 +1,24 @@
 """Unit tests for app.py - the preserved legacy behaviour and the /health endpoint.
 
-Run them with the standard-library runner, from the repository root:
-
-    python -m unittest test_app.py -v
-    python -m unittest discover -s . -p "test_*.py" -v
-
-This file is a flat sibling of ``app.py`` rather than a member of a ``tests/``
-package, matching the repository's flat layout, and it imports nothing outside
-the Python standard library plus ``app`` itself.  That keeps the zero-dependency
-property of the project intact for its tests as well as for its application
-code: there is no pytest, no coverage tool and no lockfile to install before
-these assertions can run.
-
-What is asserted here, and why each part matters:
-
-Preserved behaviour
-    ``greet`` and the default invocation of ``app.py`` are the program's
-    behaviour as it existed before the health endpoint was added.  Both are
-    pinned byte-exactly, so a future change to either fails here rather than
-    surfacing as a broken downstream consumer.
-
-The frozen response contract
-    Field names, field ORDER, the ``UP`` literal, the compact serialisation and
-    the 108-byte reference body length are asserted as constants written out in
-    full rather than read back from ``app``.  A test that imports the value it
-    is checking cannot detect a change to that value; these tests can.
-
-Configuration precedence
-    Environment variable, then properties file, then built-in default - proven
-    through ``load_config``'s injectable ``env`` and ``path`` parameters.  The
-    real ``os.environ`` is never mutated by these tests, so they neither depend
-    on nor disturb the environment they run in.
-
-Routing and least disclosure
-    A real ``HealthServer`` is bound to an EPHEMERAL loopback port and driven
-    over HTTP.  No port number is hard-coded, so a developer already running
-    ``python app.py --serve`` on port 8000 cannot make this suite fail.  The
-    absence of the ``Server`` and ``Date`` headers is asserted explicitly: the
-    implementation suppresses them deliberately, and that is exactly the kind of
-    property a later refactor towards ``send_response`` would silently undo.
+A flat sibling of ``app.py`` rather than a member of a ``tests/`` package, matching
+the repository's flat layout, and importing nothing outside the Python standard
+library plus ``app`` itself.  That keeps the project's zero-dependency property
+intact for its tests as well as for its application code.
 
 Two rules govern the assertions themselves.
 
 The timestamp is asserted by FORMAT and never by value.  It is the only
 non-deterministic field in the payload, and comparing it to a computed instant
-would make this suite fail for reasons unrelated to correctness.  No assertion
-in this file compares a timestamp, a duration or an elapsed time to anything.
+would make this suite fail for reasons unrelated to correctness.  No assertion in
+this file compares a timestamp to anything.  The two places that do measure
+elapsed time - the drain budget and the pre-parse deadline - assert only that a
+bound was enforced, against a budget the test itself shortened first, and never
+that a duration equalled a value.
 
 Every header assertion is case-insensitive.  RFC 9110 makes field names
-case-insensitive, and the sibling Java implementation normalises their casing,
-so matching case-insensitively is what keeps the three language suites
-asserting the same contract rather than three dialects of it.
+case-insensitive, and the sibling Java implementation normalises their casing, so
+matching case-insensitively is what keeps the three language suites asserting the
+same contract rather than three dialects of it.
 """
 
 import contextlib
@@ -72,14 +40,9 @@ from unittest import mock
 
 import app
 
-# --------------------------------------------------------------------------- #
-# The frozen contract, written out in full.
-#
-# These literals are deliberately NOT imported from app: a test that reads its
-# expectation out of the module under test can never fail when that module
-# changes.  Duplication here is the point - it is what makes these constants a
-# gate rather than a mirror.
-# --------------------------------------------------------------------------- #
+# The frozen contract, written out in full.  These literals are deliberately NOT
+# imported from app: a test that reads its expectation out of the module under test
+# can never fail when that module changes.  Duplication here is the point.
 
 #: Wire order of the health document.  Order is part of the contract, so this is
 #: a list and is compared against ``list(payload.keys())``, not a set.
@@ -121,8 +84,8 @@ VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 #: no business accepting connections from off the host.
 LOOPBACK = "127.0.0.1"
 
-#: Short by design.  A hung request must fail the test quickly instead of
-#: stalling a CI job until the job-level timeout fires.
+#: Short by design.  A hung request must fail the test quickly instead of stalling
+#: the run until an outer timeout fires.
 REQUEST_TIMEOUT_SECONDS = 3.0
 
 #: Ceiling for a subprocess that is expected to exit immediately.
@@ -177,6 +140,41 @@ PIPELINE_GAP_SECONDS = 0.3
 #: every path, so the production budget is never left mutated.
 SHORT_DRAIN_BUDGET_SECONDS = 0.5
 
+#: Pre-parse deadline used by the tests that must watch a silent client be
+#: closed.  Applied to the handler class - which is where the deadline lives, and
+#: where ``setup`` reads it for each accepted connection - for the duration of one
+#: test, and restored on every path.  Waiting out the production deadline would
+#: add ten seconds per case for no additional assurance: what is under test is
+#: that a deadline exists and is enforced, not what number it carries, and the
+#: number itself is asserted separately as a constant.
+SHORT_HEADER_BUDGET_SECONDS = 0.5
+
+#: Ceiling for waiting on something the SERVER must do unprompted - close an idle
+#: connection, release a worker thread.  Generous next to the budget under test so
+#: that a loaded runner cannot fail this suite merely for being slow, and bounded
+#: so that a regression fails the test instead of hanging the run.
+SETTLE_TIMEOUT_SECONDS = 15.0
+
+#: Interval between polls while waiting for the server to settle.
+SETTLE_POLL_SECONDS = 0.05
+
+#: Silent connections opened at once by the thread-accumulation test.  Enough
+#: that an unbounded handler would leave a visible pile of parked threads, few
+#: enough to stay well inside any file-descriptor limit.
+SILENT_CONNECTION_COUNT = 8
+
+#: Request-line and header-block sizes that exceed what the transport will read.
+#: The stdlib reads at most 65537 bytes of a request line and at most 100 header
+#: lines, and refuses beyond either; both ceilings are exceeded generously so the
+#: test does not sit on the boundary of an implementation detail it does not own.
+OVERSIZED_REQUEST_LINE_BYTES = 70000
+EXCESSIVE_HEADER_COUNT = 150
+
+#: Chunk size for writing an oversized request to the socket.  Written in pieces
+#: rather than in one call so that a send interrupted by the server's own close
+#: is reported as a short write instead of stalling the test.
+RAW_SEND_CHUNK_BYTES = 8192
+
 #: A body far larger than any legitimate health document, used to prove the probe
 #: refuses rather than accumulates.  The endpoint's own body is 108 bytes.
 OVERSIZED_BODY_BYTES = 60000
@@ -192,9 +190,7 @@ PROBE_BODY_CEILING = 8192
 FORGED_STATUS_BODY = b'{"name":"x","version":"1.1.0","status":"UP"'
 
 
-# --------------------------------------------------------------------------- #
 # Helpers
-# --------------------------------------------------------------------------- #
 
 
 def write_properties(case, text):
@@ -303,8 +299,6 @@ class HostileEndpoint:
     def __init__(self, head=b"", body=b"", trickle=False, mute=False):
         """Start the listener on an ephemeral loopback port.
 
-        :param head: the response head to send, if any.
-        :param body: the response body to send after the head.
         :param trickle: keep emitting one-byte chunks until stopped.
         :param mute: accept the connection and then say nothing at all.
         """
@@ -415,15 +409,108 @@ def read_one_response(client):
     return head + b"\r\n\r\n" + body
 
 
+def parse_raw_response(received):
+    """Split raw response bytes into ``(status_line, headers, body)``.
+
+    The raw-socket tests cannot go through ``urllib``: several of them send a
+    request line no HTTP client would agree to construct, and one of them asserts
+    that nothing comes back at all.  Parsing is deliberately minimal - split once
+    on the header terminator, then once on the first colon of each field line -
+    because what these tests assert is what the server WROTE, and a forgiving
+    parser would paper over exactly the departures they exist to catch.
+
+    Field names are lower-cased on the way in, so the result can be handed to
+    :func:`header_names` and compared case-insensitively like every other header
+    assertion in this file.
+
+    :returns: the status line without its terminator, a mapping of lower-cased
+        field names to their stripped values, and the body bytes.  A response
+        with no header terminator yields an empty mapping and an empty body
+        rather than raising, so a test can assert on a truncated reply.
+    """
+    head, separator, body = received.partition(b"\r\n\r\n")
+    if not separator:
+        return received, {}, b""
+    lines = head.split(b"\r\n")
+    headers = {}
+    for line in lines[1:]:
+        name, colon, value = line.partition(b":")
+        if colon:
+            headers[name.strip().lower().decode("latin-1")] = (
+                value.strip().decode("latin-1")
+            )
+    return lines[0], headers, body
+
+
+def send_in_chunks(client, payload):
+    """Write ``payload`` to ``client``, tolerating a close by the peer.
+
+    The transport-rejection tests deliberately send more than the server will
+    read: it answers and retires the connection while the rest is still in
+    flight, which surfaces here as a broken pipe.  That is the expected outcome
+    of the case, not a failure of it, so the write stops and the test goes on to
+    read the refusal the server already wrote.
+
+    :returns: True when the whole payload was accepted, False when the peer
+        closed the connection first.
+    """
+    for index in range(0, len(payload), RAW_SEND_CHUNK_BYTES):
+        try:
+            client.sendall(payload[index:index + RAW_SEND_CHUNK_BYTES])
+        except OSError:
+            return False
+    return True
+
+
+def raw_exchange(port, request, timeout=REQUEST_TIMEOUT_SECONDS):
+    """Send ``request`` verbatim on a fresh connection and read the whole reply.
+
+    Bypassing ``urllib`` is the point: these tests send request lines and header
+    blocks that no HTTP client would agree to construct, and they assert on the
+    exact bytes that come back rather than on a parsed object.  The read ends when
+    the server closes the connection, which every refusal path does.
+
+    :param timeout: read ceiling, so a regression fails the test rather than
+        hanging it.
+    :returns: everything the server wrote, which may legitimately be empty.
+    """
+    client = socket.create_connection((LOOPBACK, port), timeout=REQUEST_TIMEOUT_SECONDS)
+    try:
+        send_in_chunks(client, request)
+        client.settimeout(timeout)
+        return read_response(client)
+    finally:
+        client.close()
+
+
+def await_settled(predicate):
+    """Poll ``predicate`` until it is true or :data:`SETTLE_TIMEOUT_SECONDS` passes.
+
+    Used where the assertion is about something the SERVER does on its own
+    schedule - closing an idle connection, releasing a worker thread - which
+    cannot be observed synchronously.  A fixed sleep long enough to be reliable
+    would make the suite slow, and one short enough to be quick would make it
+    flaky; polling with a bounded ceiling is neither.
+
+    :returns: the final value of the predicate, so the caller asserts on it.
+    """
+    deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(SETTLE_POLL_SECONDS)
+    return predicate()
+
+
 def neutralize_health_environment():
     """Remove every health-related variable from ``os.environ``, restorably.
 
-    The request handler resolves its configuration per request, from the real
-    process environment and the committed properties file.  A test that drives a
-    live server therefore cannot hand it an injected mapping the way the loader
-    tests do: the ambient variables have to be taken out of the way instead, or a
-    developer with ``HEALTH_PATH`` exported would see this suite fail against a
-    perfectly correct implementation.
+    A live server resolves its configuration ONCE, when it is constructed, from
+    the real process environment and the committed properties file.  A test that
+    drives one therefore cannot hand it an injected mapping the way the loader
+    tests do: the ambient variables have to be taken out of the way BEFORE the
+    server is built, or a developer with ``HEALTH_PATH`` exported would see this
+    suite fail against a perfectly correct implementation.
 
     ``patch.dict`` snapshots the entire mapping and restores it when stopped, so
     variables this suite never looked at are put back untouched, and so is a
@@ -440,14 +527,8 @@ def neutralize_health_environment():
     return patcher
 
 
-# --------------------------------------------------------------------------- #
-# Preserved legacy behaviour
-#
-# These tests are the backward-compatibility contract.  The health endpoint was
-# added on the explicit condition that nothing already working changed, so the
-# original greeting function and the default invocation of the script are pinned
-# here byte-exactly.
-# --------------------------------------------------------------------------- #
+# Preserved legacy behaviour - the backward-compatibility contract.  The original
+# greeting function and the default invocation of the script are pinned byte-exactly.
 
 
 class TestGreet(unittest.TestCase):
@@ -541,11 +622,13 @@ class TestLegacyInvocation(unittest.TestCase):
         expected = (
             "greet",
             "log_warning",
+            "parse_properties",
             "read_properties",
             "config_value",
             "load_config",
             "normalize_path",
             "strip_authority",
+            "config_route",
             "health_route",
             "health_timestamp",
             "build_payload",
@@ -601,18 +684,238 @@ class TestLegacyInvocation(unittest.TestCase):
         self.assertEqual(completed.stdout, b"Hello Lakshya\n")
 
 
-# --------------------------------------------------------------------------- #
-# Configuration
-#
-# Every test in this section injects its own environment mapping and its own
-# properties path.  os.environ is never written to: these tests must not depend
-# on the environment they run in, and must not leave it altered for the tests
-# that follow.
-# --------------------------------------------------------------------------- #
+class TestModeDispatch(unittest.TestCase):
+    """``--serve`` and ``--probe``, driven through the real entry point.
+
+    What is under test is the WIRING at the foot of ``app.py``: that the flag
+    reaches the listener, that ``--probe`` reaches the self-check and that its
+    verdict becomes the process exit status an orchestrator reads.  None of that
+    can be established by calling :func:`app.serve` or :func:`app.probe` directly -
+    those tests exist elsewhere in this file and would pass even if the dispatcher
+    ignored both flags.  It also cannot be established in-process: the exit status
+    IS the contract, and only a real child has one.
+
+    Every child runs with a controlled environment - the health variables removed,
+    then this test's own values put in - so a developer with ``HEALTH_PATH``
+    exported cannot fail the suite, and on a port the kernel has just confirmed is
+    free, so a server already running on the configured port cannot either.
+
+    Standard output is asserted empty for both modes.  It carries this program's
+    legacy output and is hashed by the backward-compatibility gate, so a mode that
+    printed one line to it would break that gate while looking perfectly healthy.
+    """
+
+    def setUp(self):
+        self._streams = {}
+
+    def _environment(self, **overrides):
+        """Return the ambient environment with health variables replaced."""
+        environment = dict(os.environ)
+        for name in HEALTH_ENV_NAMES:
+            environment.pop(name, None)
+        environment.update(overrides)
+        return environment
+
+    def _spawn(self, *arguments, environment=None):
+        """Start ``python <arguments>`` in app.py's directory, streams captured."""
+        child = subprocess.Popen(
+            [sys.executable, *arguments],
+            cwd=APP_DIRECTORY,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        self.addCleanup(self._stop, child)
+        return child
+
+    def _stop(self, child):
+        """Terminate the child if it is still running; return ``(stdout, stderr)``.
+
+        Idempotent, because it is both called by the test and registered as
+        cleanup: a listener has no natural end, so the test that starts one is also
+        what must end it, on the failure path as well as the passing one.
+        """
+        if child.pid not in self._streams:
+            if child.poll() is None:
+                child.terminate()
+            try:
+                self._streams[child.pid] = child.communicate(
+                    timeout=SUBPROCESS_TIMEOUT_SECONDS
+                )
+            except subprocess.TimeoutExpired:
+                child.kill()
+                self._streams[child.pid] = child.communicate()
+        return self._streams[child.pid]
+
+    def _await_listener(self, child, port):
+        """Wait until ``port`` accepts a connection, or the child has died."""
+
+        def ready():
+            if child.poll() is not None:
+                return True
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(REQUEST_TIMEOUT_SECONDS)
+                return probe.connect_ex((LOOPBACK, port)) == 0
+
+        await_settled(ready)
+        if child.poll() is not None:
+            _, stderr = self._stop(child)
+            self.fail(
+                "the server exited instead of serving: "
+                + stderr.decode("utf-8", "backslashreplace")
+            )
+
+    def _run(self, *arguments, environment=None):
+        """Run a child that is expected to exit on its own, and return it."""
+        return subprocess.run(
+            [sys.executable, *arguments],
+            cwd=APP_DIRECTORY,
+            capture_output=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+            check=False,
+            env=environment,
+        )
+
+    def test_the_serve_flag_serves_the_endpoint_and_leaves_stdout_empty(self):
+        port = unused_port()
+        environment = self._environment(APP_HOST=LOOPBACK, PORT=str(port))
+        child = self._spawn("app.py", "--serve", environment=environment)
+        self._await_listener(child, port)
+        with urllib.request.urlopen(
+            f"http://{LOOPBACK}:{port}/health", timeout=REQUEST_TIMEOUT_SECONDS
+        ) as response:
+            status = response.status
+            document = json.loads(response.read().decode("utf-8"))
+        stdout, stderr = self._stop(child)
+        self.assertEqual(status, 200)
+        self.assertEqual(list(document.keys()), EXPECTED_KEY_ORDER)
+        self.assertEqual(document["status"], EXPECTED_STATUS)
+        self.assertEqual(stdout, b"", msg="--serve must not write to standard output")
+        self.assertNotIn(b"Hello", stdout)
+        self.assertIn(b"Serving", stderr)
+        self.assertIn(str(port).encode("ascii"), stderr)
+
+    def test_the_probe_flag_exits_zero_against_the_running_listener(self):
+        port = unused_port()
+        environment = self._environment(APP_HOST=LOOPBACK, PORT=str(port))
+        child = self._spawn("app.py", "--serve", environment=environment)
+        self._await_listener(child, port)
+        completed = self._run("app.py", "--probe", environment=environment)
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=completed.stderr.decode("utf-8", "backslashreplace"),
+        )
+        self.assertEqual(completed.stdout, b"")
+        self.assertEqual(completed.stderr, b"", msg="a healthy probe is silent")
+
+    def test_the_probe_flag_exits_one_when_nothing_is_listening(self):
+        """Fail closed: a probe's caller acts on this status and only this."""
+        environment = self._environment(APP_HOST=LOOPBACK, PORT=str(unused_port()))
+        completed = self._run("app.py", "--probe", environment=environment)
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, b"")
+        self.assertEqual(completed.stderr.count(b"\n"), 1, msg=repr(completed.stderr))
+
+    def test_the_probe_flag_follows_the_configured_health_path(self):
+        """Both modes read the same configuration, or the probe grades a stranger."""
+        port = unused_port()
+        served = self._environment(
+            APP_HOST=LOOPBACK, PORT=str(port), HEALTH_PATH="/healthz"
+        )
+        child = self._spawn("app.py", "--serve", environment=served)
+        self._await_listener(child, port)
+        agreeing = self._run("app.py", "--probe", environment=served)
+        disagreeing = self._run(
+            "app.py",
+            "--probe",
+            environment=self._environment(
+                APP_HOST=LOOPBACK, PORT=str(port), HEALTH_PATH="/health"
+            ),
+        )
+        self.assertEqual(
+            agreeing.returncode,
+            0,
+            msg=agreeing.stderr.decode("utf-8", "backslashreplace"),
+        )
+        self.assertEqual(disagreeing.returncode, 1)
+
+    def test_the_serve_flag_fails_closed_on_an_unusable_port(self):
+        """An orchestrator must never see a success status from a dead listener."""
+        environment = self._environment(APP_HOST=LOOPBACK, PORT="not-a-port")
+        completed = self._run("app.py", "--serve", environment=environment)
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"cannot start the health server", completed.stderr)
+        self.assertEqual(completed.stderr.count(b"\n"), 1, msg=repr(completed.stderr))
+
+    def test_the_serve_flag_refuses_an_unpublishable_configuration(self):
+        """Validation happens before the bind, so nothing is ever served from it."""
+        environment = self._environment(APP_HOST=LOOPBACK, APP_VERSION="one.two")
+        completed = self._run("app.py", "--serve", environment=environment)
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"app.version", completed.stderr)
+
+
+# Configuration.  Every test here injects its own environment mapping and its own
+# properties path.  os.environ is never written to: these tests must not depend on
+# the environment they run in, nor leave it altered for those that follow.
+
+
+#: The SHARED properties grammar fixtures.  Every entry is ``(label, file text,
+#: expected mapping)``, and the identical table - same labels, same text, same
+#: expectations - appears in ``index.test.js`` and ``UserTest.java``.  Each
+#: expectation was produced by running ``java.util.Properties.load`` on the same
+#: bytes, so this table is a transcription of the reference implementation rather
+#: than a description of this one: a suite that asserted what its own parser
+#: happens to do could not detect the divergence it exists to prevent.
+SHARED_PROPERTIES_FIXTURES = (
+    ("a plain key and value", "a=1\n", {"a": "1"}),
+    ("a colon separator", "a:1\n", {"a": "1"}),
+    ("a space separator", "a 1\n", {"a": "1"}),
+    ("a tab separator", "a\t1\n", {"a": "1"}),
+    ("a form-feed separator", "a\f1\n", {"a": "1"}),
+    ("whitespace around the separator", "a = 1\n", {"a": "1"}),
+    ("trailing value whitespace is preserved", "a=1   \n", {"a": "1   "}),
+    ("a whitespace-only value is empty", "a=   \n", {"a": ""}),
+    ("a key with no separator has an empty value", "abc\n", {"abc": ""}),
+    ("an empty key is still a key", "=v\n", {"": "v"}),
+    ("only the first separator separates", "a = b=c \n", {"a": "b=c "}),
+    ("an escaped space belongs to the key", "a\\ b=x\n", {"a b": "x"}),
+    ("an escaped equals belongs to the key", "a\\=b=x\n", {"a=b": "x"}),
+    ("an escaped colon belongs to the key", "a\\:b=x\n", {"a:b": "x"}),
+    ("a tab escape in a value", "a=x\\ty\n", {"a": "x\ty"}),
+    ("a newline escape in a value", "a=x\\nz\n", {"a": "x\nz"}),
+    ("a unicode escape in a value", "a=\\u0041\n", {"a": "A"}),
+    ("a capital U is not a unicode escape", "a=\\U0041\n", {"a": "U0041"}),
+    ("an unknown escape is the character itself", "a=\\z\n", {"a": "z"}),
+    ("an escaped backslash is one backslash", "a=x\\\\y\n", {"a": "x\\y"}),
+    ("an odd trailing backslash continues the line", "a=one\\\n   two\n", {"a": "onetwo"}),
+    ("an even trailing backslash ends the line", "a=v\\\\\nb=2\n", {"a": "v\\", "b": "2"}),
+    ("a hash comment is skipped", "#c\na=1\n", {"a": "1"}),
+    ("a bang comment is skipped", "!c\na=1\n", {"a": "1"}),
+    ("an indented comment is skipped", "   # c\na=1\n", {"a": "1"}),
+    ("a continuation line is data, not a comment", "a=x\\\n#y\n", {"a": "x#y"}),
+    ("CR, LF and CRLF all end a line", "a=1\r\nb=2\rc=3\n", {"a": "1", "b": "2", "c": "3"}),
+    ("the last of a repeated key wins", "a=1\na=2\n", {"a": "2"}),
+    ("quote characters are literal", 'a="q"\n', {"a": '"q"'}),
+    ("a trailing backslash at end of input is dropped", "a=v\\", {"a": "v"}),
+    ("a byte-order mark is not stripped", "\ufeffa=1\n", {"\ufeffa": "1"}),
+)
+
+#: The shared MALFORMED fixtures: the one condition under which
+#: ``java.util.Properties.load`` refuses a document outright rather than reading
+#: part of it as a literal.
+SHARED_MALFORMED_PROPERTIES = (
+    ("a short unicode escape in a value", "a=\\u12\n"),
+    ("a non-hexadecimal unicode escape", "a=\\uZZZZ\n"),
+    ("a malformed unicode escape in a key", "\\u12=v\n"),
+)
 
 
 class TestReadProperties(unittest.TestCase):
-    """Parsing of the Java-native ``key=value`` configuration file."""
+    """Parsing of the shared ``key=value`` configuration file."""
 
     def test_reads_keys_and_values(self):
         path = write_properties(self, "app.name=configured\napp.version=4.5.6\n")
@@ -621,23 +924,107 @@ class TestReadProperties(unittest.TestCase):
             {"app.name": "configured", "app.version": "4.5.6"},
         )
 
-    def test_ignores_comments_blank_lines_and_lines_without_a_separator(self):
-        """Comment markers are ``#`` and ``!``, matching java.util.Properties."""
+    def test_the_shared_grammar_fixtures_parse_as_java_parses_them(self):
+        """The cross-language contract: one file must mean one thing in three languages.
+
+        Every expectation in :data:`SHARED_PROPERTIES_FIXTURES` came out of
+        ``java.util.Properties.load``, which is how ``User.java`` reads the same
+        file.  The equivalent table in ``index.test.js`` and ``UserTest.java``
+        carries the same labels and the same expectations, so a change that made
+        one parser drift would fail in whichever suite owns it.
+        """
+        for label, text, expected in SHARED_PROPERTIES_FIXTURES:
+            with self.subTest(label=label):
+                self.assertEqual(app.parse_properties(text), expected)
+
+    def test_a_malformed_unicode_escape_makes_the_document_malformed(self):
+        """A bad ``\\uXXXX`` is a refusal, not a literal - as in Java."""
+        for label, text in SHARED_MALFORMED_PROPERTIES:
+            with self.subTest(label=label):
+                with self.assertRaises(app.PropertiesFormatError):
+                    app.parse_properties(text)
+
+    def test_a_malformed_file_warns_once_and_uses_the_defaults(self):
+        """The malformed-file half of the shared failure policy."""
+        path = write_properties(self, "app.name=x\\u12\n")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            properties = app.read_properties(path)
+        self.assertEqual(properties, {})
+        self.assertEqual(
+            stderr.getvalue(),
+            f"[app.py] {app.CONFIG_MALFORMED_WARNING}\n",
+        )
+
+    def test_a_file_that_cannot_be_read_warns_once_and_uses_the_defaults(self):
+        """The unreadable-file half of the shared failure policy.
+
+        A directory standing where the file should be is the portable way to make
+        a read fail: a permission bit does not stop the root user that a container
+        build commonly runs as, so it would make the test pass for the wrong
+        reason on one host and fail on another.
+        """
+        directory = tempfile.mkdtemp(suffix=".properties")
+        self.addCleanup(os.rmdir, directory)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            properties = app.read_properties(directory)
+        self.assertEqual(properties, {})
+        self.assertEqual(
+            stderr.getvalue(),
+            f"[app.py] {app.CONFIG_UNREADABLE_WARNING}\n",
+        )
+
+    def test_bytes_that_are_not_utf8_are_a_read_failure(self):
+        """Strict decoding, matching Java's UTF-8 reader and Node's fatal decoder.
+
+        A replacement character here would put a U+FFFD into the published
+        ``name`` field of exactly one of the three implementations.
+        """
+        handle = tempfile.NamedTemporaryFile(suffix=".properties", delete=False)
+        try:
+            handle.write(b"app.name=caf\xe9\n")
+        finally:
+            handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            properties = app.read_properties(handle.name)
+        self.assertEqual(properties, {})
+        self.assertEqual(
+            stderr.getvalue(),
+            f"[app.py] {app.CONFIG_UNREADABLE_WARNING}\n",
+        )
+
+    def test_ignores_comments_and_blank_lines(self):
+        """Comment markers are ``#`` and ``!``, matching java.util.Properties.
+
+        A line carrying no separator is NOT ignored: ``Properties.load`` reads it
+        as a key with an empty value, so all three implementations do.  Discarding
+        such a line instead would make a typo like a missing ``=`` produce no key
+        here and an empty-valued key in Java.
+        """
         text = (
             "# a hash comment\n"
             "! a bang comment\n"
             "\n"
             "   \n"
-            "a line with no equals sign\n"
             "app.name=kept\n"
         )
         path = write_properties(self, text)
         self.assertEqual(app.read_properties(path), {"app.name": "kept"})
+        with_separatorless_line = write_properties(
+            self, "a line with no equals sign\napp.name=kept\n"
+        )
+        self.assertEqual(
+            app.read_properties(with_separatorless_line),
+            {"a": "line with no equals sign", "app.name": "kept"},
+        )
 
     def test_splits_on_the_first_separator_only(self):
-        """A value may itself contain ``=``; surrounding whitespace is stripped."""
+        """A value may itself contain ``=``; its trailing whitespace is preserved."""
         path = write_properties(self, "app.name = a=b=c \n")
-        self.assertEqual(app.read_properties(path), {"app.name": "a=b=c"})
+        self.assertEqual(app.read_properties(path), {"app.name": "a=b=c "})
 
     def test_keeps_quote_characters_literally(self):
         """Values are never unquoted - java.util.Properties does not either.
@@ -901,14 +1288,40 @@ class TestRouteResolution(unittest.TestCase):
             app.health_route({"health.path": ""}), EXPECTED_DEFAULTS["health.path"]
         )
 
+    def test_config_route_reduces_a_configured_path_the_shared_way(self):
+        """The same table appears in ``index.test.js`` and ``UserTest.java``.
 
-# --------------------------------------------------------------------------- #
-# The health document
-#
-# The payload is built from a defaults-only configuration so that these
-# assertions are identical on a developer's machine, in CI and inside a
-# container, whatever the environment or the properties file happens to hold.
-# --------------------------------------------------------------------------- #
+        ``config_route`` is the single function both the validator and the router
+        go through, so this table is simultaneously the routing contract and the
+        validation contract - they cannot drift apart because they are the same
+        call.
+        """
+        cases = {
+            "/health": "/health",
+            "health": "/health",
+            "healthz": "/healthz",
+            "/health/": "/health",
+            "/health?probe=1": "/health",
+            "/health#part": "/health",
+            # The leading slash is supplied BEFORE normalisation, so a configured
+            # value that looks like an absolute URL is no longer in absolute form
+            # by the time the authority would be stripped.  All three
+            # implementations do this in the same order, which is what matters:
+            # the value is nonsense either way, and it stays nonsense identically.
+            "http://host:8000/health": "/http://host:8000/health",
+            "/": "/",
+            "//": "/",
+            "//health": "//health",
+            "/health//": "/health/",
+        }
+        for configured, expected in cases.items():
+            with self.subTest(configured=configured):
+                self.assertEqual(app.config_route(configured), expected)
+
+
+# The health document.  The payload is built from a defaults-only configuration so
+# that these assertions are identical wherever they run, whatever the environment
+# or the properties file happens to hold.
 
 
 class TestPayloadContract(unittest.TestCase):
@@ -990,7 +1403,7 @@ class TestPayloadContract(unittest.TestCase):
 
         Dropping the explicit compact separators from the renderer produces 115
         bytes for these same four fields, so this single number catches that
-        regression before it can reach the cross-language verification script.
+        divergence at unit level rather than at the cross-language seam.
         """
         self.assertEqual(
             len(self.rendered.encode("utf-8")),
@@ -1030,14 +1443,10 @@ class TestPayloadContract(unittest.TestCase):
         self.assertEqual(rendered, '{"status":"UP","name":"a"}')
 
 
-# --------------------------------------------------------------------------- #
-# The live endpoint
-#
-# These tests drive a real HealthServer over a real socket, which is the only
-# way to assert the parts of the contract that are properties of the response
-# rather than of the payload: the status codes, the header set, and the two
-# headers that must NOT be there.
-# --------------------------------------------------------------------------- #
+# The live endpoint.  These tests drive a real HealthServer over a real socket,
+# which is the only way to assert the parts of the contract that are properties of
+# the response rather than of the payload: the status codes, the header set, and
+# the two headers that must NOT be there.
 
 
 class HealthServerTestCase(unittest.TestCase):
@@ -1047,13 +1456,13 @@ class HealthServerTestCase(unittest.TestCase):
     bound socket.  Nothing here hard-codes 8000, so the suite passes while a
     developer has ``python app.py --serve`` running on the configured port.
 
-    The handler resolves configuration per request from the process environment
-    and the committed properties file, so it cannot be given an injected mapping
-    the way the loader tests do.  The health-related variables are therefore
-    removed from ``os.environ`` for the lifetime of the class - through
-    ``patch.dict``, which snapshots the whole mapping and restores it even if a
-    test fails - leaving the committed file as the effective configuration.  No
-    other variable is touched, and nothing is added.
+    The server resolves its configuration once, in ``setUpClass`` below, from the
+    process environment and the committed properties file, so it cannot be given
+    an injected mapping the way the loader tests do.  The health-related variables
+    are therefore removed from ``os.environ`` before it is built, for the lifetime
+    of the class - through ``patch.dict``, which snapshots the whole mapping and
+    restores it even if a test fails - leaving the committed file as the effective
+    configuration.  No other variable is touched, and nothing is added.
     """
 
     #: Set once the serve_forever loop is running.  shutdown() waits on an event
@@ -1289,6 +1698,42 @@ class TestRouting(HealthServerTestCase):
                 self.assertEqual(status, expected_status)
                 self.assertIn("no-store", headers.get("Cache-Control", ""))
 
+    def test_the_not_found_headers_are_exactly_the_frozen_set(self):
+        """The error paths are held to the same three fields as the success path.
+
+        Asserted by EQUALITY rather than by containment, on every status this
+        endpoint serves: a containment check passes while a refactor quietly adds a
+        fourth field, which is precisely the regression the frozen set exists to
+        prevent.  Every cache directive is checked here too, not just ``no-store``.
+        """
+        status, headers, body = self.request("/nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(
+            header_names(headers),
+            {"content-type", "cache-control", "content-length"},
+        )
+        self.assertEqual(headers.get("Content-Type"), EXPECTED_CONTENT_TYPE)
+        self.assertEqual(int(headers.get("Content-Length")), len(body))
+        for directive in ("no-cache", "no-store", "must-revalidate"):
+            self.assertIn(directive, headers.get("cache-control", ""))
+
+    def test_the_refusal_headers_are_exactly_the_frozen_set_plus_allow(self):
+        """``Allow`` is the ONE field the 405 adds, and it is added on every verb."""
+        for method, data in (("POST", b""), ("PUT", b""), ("DELETE", None),
+                             ("PATCH", b""), ("OPTIONS", None), ("HEAD", None)):
+            with self.subTest(method=method):
+                status, headers, _ = self.request(
+                    self.route, method=method, data=data
+                )
+                self.assertEqual(status, 405)
+                self.assertEqual(
+                    header_names(headers),
+                    {"content-type", "cache-control", "content-length", "allow"},
+                )
+                self.assertEqual(headers.get("Allow"), EXPECTED_ALLOW_HEADER)
+                for directive in ("no-cache", "no-store", "must-revalidate"):
+                    self.assertIn(directive, headers.get("cache-control", ""))
+
     def test_the_content_length_is_accurate_on_every_response(self):
         """An inaccurate length corrupts a persistent HTTP/1.1 connection."""
         cases = (
@@ -1336,7 +1781,7 @@ class TestRouting(HealthServerTestCase):
 
 
 class TestProbe(HealthServerTestCase):
-    """The in-process self-check used as the container HEALTHCHECK."""
+    """The in-process self-check that answers ``--probe``."""
 
     def _config_for(self, host, port):
         """Copy the class configuration, pointing it at ``host`` and ``port``."""
@@ -1352,8 +1797,7 @@ class TestProbe(HealthServerTestCase):
         """``0.0.0.0`` names every interface and is not a routable destination.
 
         The configured host is the wildcard by default, so without this
-        substitution the container health check could never reach its own
-        endpoint.
+        substitution a wildcard-bound process could never reach its own endpoint.
         """
         self.assertEqual(app.probe(self._config_for("0.0.0.0", self.port)), 0)
 
@@ -1388,12 +1832,11 @@ class TestProbe(HealthServerTestCase):
     def test_a_non_loopback_configured_host_is_still_probed_on_loopback(self):
         """The destination is selected, not derived; see TestProbeAuthority.
 
-        ``app.host`` is an input.  If the probe honoured it, a configured value
-        pointing off the machine would turn the container health check into an
-        outbound HTTP client - reporting this application healthy because some
-        other host answered.  The live endpoint here is on loopback and nothing is
-        listening on the named host, so a verdict of healthy is only possible if
-        loopback was dialled.
+        ``app.host`` is an input.  A probe that honoured it would turn a configured
+        value pointing off the machine into an outbound HTTP client - reporting
+        this application healthy because some other host answered.  The live
+        endpoint here is on loopback and nothing is listening on the named host, so
+        a verdict of healthy is only possible if loopback was dialled.
         """
         stderr = io.StringIO()
         config = self._config_for("monitoring.example.com", self.port)
@@ -1405,14 +1848,10 @@ class TestProbe(HealthServerTestCase):
         self.assertNotIn("example.com", written)
 
 
-# --------------------------------------------------------------------------- #
-# Diagnostic safety
-#
-# Everything this module says about itself goes to stderr, and every line of it
-# is a fixed category.  These tests are the gate on that: a configured value or
-# an exception string reaching a log line would both disclose the deployment and
-# - for any value carrying a CR or an LF - let a caller forge log entries.
-# --------------------------------------------------------------------------- #
+# Diagnostic safety.  Everything this module says about itself goes to stderr, and
+# every line of it is a fixed category: a configured value or an exception string
+# reaching a log line would both disclose the deployment and - for any value
+# carrying a CR or an LF - let a caller forge log entries.
 
 
 class TestDiagnosticSafety(unittest.TestCase):
@@ -1478,7 +1917,7 @@ class TestDiagnosticSafety(unittest.TestCase):
         self.assertNotIn("not-a-port", written)
 
     def test_a_health_path_carrying_crlf_cannot_forge_a_probe_log_line(self):
-        """The reproduced log-forgery case, asserted as fixed.
+        """A health path carrying CRLF must not be able to forge a log line.
 
         The path is refused before a request is constructed, and the single line
         the refusal emits carries none of it.
@@ -1499,9 +1938,7 @@ class TestDiagnosticSafety(unittest.TestCase):
         self.assertNotIn("forged entry", written)
 
 
-# --------------------------------------------------------------------------- #
 # Probe destination allowlist
-# --------------------------------------------------------------------------- #
 
 
 class TestProbeAuthority(unittest.TestCase):
@@ -1584,15 +2021,11 @@ class TestProbeAuthority(unittest.TestCase):
                 self.assertNotIn(host, written)
 
 
-# --------------------------------------------------------------------------- #
-# Probe bounds
-#
-# The probe is a client, and a client is only as safe as its behaviour against a
-# peer that does not cooperate.  Each test here points it at a deliberately
-# broken endpoint: one that answers forever, one that never answers, one that
-# answers with far too much, and one that answers with something that merely
-# looks right.  Every one of them must end in a bounded, unhealthy verdict.
-# --------------------------------------------------------------------------- #
+# Probe bounds.  The probe is a client, and a client is only as safe as its
+# behaviour against a peer that does not cooperate.  Each test here points it at a
+# deliberately broken endpoint: one that answers forever, one that never answers,
+# one that answers with far too much, and one that answers with something that
+# merely looks right.  Every one must end in a bounded, unhealthy verdict.
 
 
 class TestProbeBounds(unittest.TestCase):
@@ -1704,9 +2137,6 @@ class TestProbeBounds(unittest.TestCase):
         verdict, written = self._probe(endpoint.port)
         self.assertEqual(verdict, 0, msg=written)
         self.assertEqual(written, "")
-
-
-# --------------------------------------------------------------------------- #
 
 
 class TestRequestBodyDrain(HealthServerTestCase):
@@ -1870,12 +2300,605 @@ class TestRequestBodyDrain(HealthServerTestCase):
         self.assertEqual(sink.getvalue(), "")
 
 
+class TestAmbiguousFraming(HealthServerTestCase):
+    """A request whose body length has no single answer must not be followed by one.
+
+    CWE-444.  ``self.headers`` is a multi-dict, so a lookup that takes the FIRST
+    ``Content-Length`` silently picks one of two contradictory framings: with ``0``
+    and ``5`` present it drains nothing, and the five bytes it left behind are read
+    as the next request line on a connection it kept alive.  A front end resolving
+    the same message to ``5`` would call those bytes a body.  Two participants, two
+    readings, one connection - which is the definition of the hazard.
+
+    Retiring the connection is the whole fix, and it is sufficient rather than
+    merely mitigating: bytes on a connection nobody reads again cannot be
+    reinterpreted.  No new status code is introduced, because the frozen contract
+    defines three responses and this needs none of them changed.
+
+    A control sits alongside: an honest single length must still drain and still keep
+    the connection.  Without it this class would also pass if every POST simply
+    closed, which would be a different defect wearing this fix's clothes.
+    """
+
+    def _pipelined(self, first, second, timeout=REQUEST_TIMEOUT_SECONDS):
+        """Send two requests down ONE connection; return everything received."""
+        client = socket.create_connection(
+            (LOOPBACK, self.port), timeout=REQUEST_TIMEOUT_SECONDS
+        )
+        try:
+            client.sendall(first)
+            time.sleep(PIPELINE_GAP_SECONDS)
+            client.sendall(second)
+            client.settimeout(timeout)
+            return read_response(client)
+        finally:
+            client.close()
+
+    #: Framings with no single reading, each followed by bytes a front end would
+    #: call a body and a desynchronised server would call a request.
+    AMBIGUOUS = {
+        "two disagreeing lengths, low first": (
+            b"POST /health HTTP/1.1\r\nHost: h\r\n"
+            b"Content-Length: 0\r\nContent-Length: 5\r\n\r\n"
+        ),
+        "two disagreeing lengths, high first": (
+            b"POST /health HTTP/1.1\r\nHost: h\r\n"
+            b"Content-Length: 5\r\nContent-Length: 0\r\n\r\n"
+        ),
+        "two AGREEING lengths": (
+            b"POST /health HTTP/1.1\r\nHost: h\r\n"
+            b"Content-Length: 5\r\nContent-Length: 5\r\n\r\n"
+        ),
+        "one line carrying a comma list": (
+            b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: 0, 5\r\n\r\n"
+        ),
+        "a length continued by an obs-fold": (
+            b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n 5\r\n\r\n"
+        ),
+        "chunked and a length together": (
+            b"POST /health HTTP/1.1\r\nHost: h\r\n"
+            b"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+        ),
+    }
+
+    #: The bytes queued behind each ambiguous head: a complete, valid request.
+    SMUGGLED = b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n"
+
+    def test_an_ambiguous_length_is_answered_once_and_never_twice(self):
+        for label, head in self.AMBIGUOUS.items():
+            with self.subTest(framing=label):
+                received = self._pipelined(head, self.SMUGGLED)
+                self.assertEqual(
+                    received.count(b"HTTP/1.1 "), 1,
+                    msg="%s: %r" % (label, received),
+                )
+
+    def test_no_smuggled_request_is_ever_served(self):
+        """The queued GET must not produce a payload behind the refusal."""
+        for label, head in self.AMBIGUOUS.items():
+            with self.subTest(framing=label):
+                received = self._pipelined(head, self.SMUGGLED)
+                self.assertNotIn(b'"status":"UP"', received, msg=label)
+                self.assertNotIn(b"200 OK", received, msg=label)
+
+    def test_the_one_answer_is_still_the_frozen_contract(self):
+        """Retiring the connection changes the framing, never the response."""
+        for label, head in self.AMBIGUOUS.items():
+            with self.subTest(framing=label):
+                received = self._pipelined(head, self.SMUGGLED)
+                self.assertIn(b"405 Method Not Allowed", received, msg=label)
+                self.assertIn(b'{"error":"Method Not Allowed"}', received, msg=label)
+                self.assertIn(b"Allow: GET", received, msg=label)
+                self.assertNotIn(b"Server:", received, msg=label)
+                self.assertNotIn(b"Date:", received, msg=label)
+                self.assertNotIn(b"<html", received.lower(), msg=label)
+
+    def test_an_ambiguous_exchange_writes_no_diagnostic(self):
+        """A hostile framing is not this endpoint's news to report either."""
+        with contextlib.redirect_stderr(io.StringIO()) as sink:
+            self._pipelined(
+                self.AMBIGUOUS["two disagreeing lengths, low first"], self.SMUGGLED
+            )
+        self.assertEqual(sink.getvalue(), "")
+
+    def test_repetition_alone_is_refused_even_when_the_values_agree(self):
+        """RFC 9112 section 6.3 allows folding or refusing; the other two refuse.
+
+        Refusing is therefore what makes the three answers uniform, and uniformity
+        is the property the shared contract is worth having for.
+        """
+        received = self._pipelined(
+            b"POST /health HTTP/1.1\r\nHost: h\r\n"
+            b"Content-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+            self.SMUGGLED,
+        )
+        self.assertEqual(received.count(b"HTTP/1.1 "), 1, msg=repr(received))
+        self.assertNotIn(b'"status":"UP"', received)
+
+    def test_a_single_honest_length_still_keeps_the_connection(self):
+        """The control that fails if the guard ever widens to every POST."""
+        received = self._pipelined(
+            b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello",
+            self.SMUGGLED,
+        )
+        self.assertEqual(received.count(b"HTTP/1.1 "), 2, msg=repr(received))
+        self.assertIn(b'"status":"UP"', received)
+
+
+class TestMethodDispatchSurface(unittest.TestCase):
+    """The handler answers for every ``do_*`` name, and claims nothing else.
+
+    The inherited request loop dispatches on ``hasattr(self, "do_" + command)``,
+    so a method policy written as a list of explicit ``do_*`` methods covers only
+    the verbs someone thought of.  The class therefore resolves the whole ``do_``
+    namespace dynamically.  That is a broad hook, and these checks pin both
+    halves of the deal: every ``do_`` name resolves to the refusal, and no other
+    name is intercepted, so :func:`hasattr` keeps telling the truth about this
+    object and the introspection, copy and pickle protocols keep working.
+
+    An uninitialised instance is enough, and is used deliberately: the attribute
+    contract must hold before any socket exists, and constructing a real handler
+    would require a connection and would run a request.
+    """
+
+    def setUp(self):
+        self.handler = object.__new__(app.HealthRequestHandler)
+
+    def test_an_unimplemented_method_resolves_to_the_refusal(self):
+        for name in ("do_TRACE", "do_CONNECT", "do_FROBNICATE", "do_PROPFIND"):
+            with self.subTest(name=name):
+                resolved = getattr(self.handler, name)
+                self.assertIs(
+                    resolved.__func__, app.HealthRequestHandler._method_not_allowed
+                )
+
+    def test_an_explicit_method_is_not_shadowed_by_the_fallback(self):
+        """GET must still reach the health route, not the refusal."""
+        self.assertIs(
+            self.handler.do_GET.__func__, app.HealthRequestHandler.do_GET
+        )
+
+    def test_the_prefix_alone_is_not_a_method_name(self):
+        with self.assertRaises(AttributeError):
+            getattr(self.handler, "do_")
+
+    def test_no_other_missing_attribute_is_intercepted(self):
+        """A hook that answered for everything would break far more than it fixed."""
+        for name in ("missing", "_private", "DO_GET", "handle_one_request_", "todo_x"):
+            with self.subTest(name=name):
+                with self.assertRaises(AttributeError):
+                    getattr(self.handler, name)
+
+    def test_the_attribute_error_names_the_attribute(self):
+        """The message must stay the one the interpreter would have produced."""
+        with self.assertRaises(AttributeError) as raised:
+            getattr(self.handler, "definitely_absent")
+        self.assertIn("definitely_absent", str(raised.exception))
+
+
+class TestMethodPolicyOverRawSockets(HealthServerTestCase):
+    """Every method token a request line can carry, not just the six with methods.
+
+    ``urllib`` cannot send these: it refuses to construct a CONNECT the way this
+    test needs it, and an invented extension token has no client-side support at
+    all.  Yet these are exactly the requests that escaped the contract before the
+    dispatch was made total - each one reached the inherited 501 path, which
+    answers with a 483-to-488 byte HTML document, a ``Server`` banner naming the
+    interpreter, a ``Date`` header, and the caller's own method token reflected
+    into the status line.  Four departures from the frozen contract, reachable by
+    anyone who could open a socket.
+
+    The sibling Node and Java implementations reject on "not GET" rather than on a
+    list of known verbs, so these assertions are also what keeps the three
+    agreeing about what a non-GET request receives.
+    """
+
+    #: Method tokens with no ``do_*`` method of their own.  The first two are
+    #: registered HTTP methods, the third is a legal extension token, and the
+    #: fourth is a real method from another specification - the kind of request a
+    #: scanner sends first and an ordinary consumer never sends at all.
+    UNIMPLEMENTED_METHODS = (b"TRACE", b"CONNECT", b"FROBNICATE", b"PROPFIND")
+
+    #: Exactly the fields a refusal carries: the frozen three, plus ``Allow``.
+    REFUSAL_HEADER_NAMES = {"content-type", "cache-control", "content-length", "allow"}
+
+    def _refuse(self, method, target=None):
+        """Send one raw request with ``method`` and return the parsed reply."""
+        if target is None:
+            target = self.route.encode("ascii")
+        request = (
+            method
+            + b" "
+            + target
+            + b" HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n"
+        )
+        received = raw_exchange(self.port, request)
+        return received, parse_raw_response(received)
+
+    def test_every_unimplemented_method_receives_the_frozen_refusal(self):
+        for method in self.UNIMPLEMENTED_METHODS:
+            with self.subTest(method=method.decode("ascii")):
+                _, (status_line, headers, body) = self._refuse(method)
+                self.assertEqual(status_line, b"HTTP/1.1 405 Method Not Allowed")
+                self.assertEqual(body, EXPECTED_METHOD_NOT_ALLOWED_BODY)
+                self.assertEqual(
+                    header_names(headers),
+                    self.REFUSAL_HEADER_NAMES,
+                    msg="the refusal header set is frozen at four fields",
+                )
+                self.assertEqual(headers["allow"], EXPECTED_ALLOW_HEADER)
+                self.assertEqual(headers["content-type"], EXPECTED_CONTENT_TYPE)
+                self.assertEqual(int(headers["content-length"]), len(body))
+
+    def test_no_unimplemented_method_reaches_the_not_implemented_page(self):
+        """The 501, the HTML, the banner and the Date header are all absent."""
+        for method in self.UNIMPLEMENTED_METHODS:
+            with self.subTest(method=method.decode("ascii")):
+                received, (_, headers, _) = self._refuse(method)
+                lowered = received.lower()
+                self.assertNotIn(b"501", received)
+                self.assertNotIn(b"not implemented", lowered)
+                self.assertNotIn(b"unsupported method", lowered)
+                self.assertNotIn(b"<html", lowered)
+                self.assertNotIn(b"basehttp", lowered)
+                self.assertNotIn(b"python", lowered)
+                self.assertNotIn("server", header_names(headers))
+                self.assertNotIn("date", header_names(headers))
+
+    def test_a_refusal_never_reflects_the_method_token(self):
+        """The inherited page quotes the verb back; this one discloses nothing."""
+        for method in self.UNIMPLEMENTED_METHODS:
+            with self.subTest(method=method.decode("ascii")):
+                received, _ = self._refuse(method)
+                self.assertNotIn(method, received)
+
+    def test_connect_in_its_authority_form_is_refused_without_echo(self):
+        """CONNECT carries an authority, not a path, and it must not come back."""
+        authority = b"internal-host.example:8443"
+        received, (status_line, headers, body) = self._refuse(b"CONNECT", authority)
+        self.assertEqual(status_line, b"HTTP/1.1 405 Method Not Allowed")
+        self.assertEqual(body, EXPECTED_METHOD_NOT_ALLOWED_BODY)
+        self.assertEqual(headers["allow"], EXPECTED_ALLOW_HEADER)
+        self.assertNotIn(b"internal-host", received)
+
+    def test_a_refusal_also_refuses_caching(self):
+        for method in self.UNIMPLEMENTED_METHODS:
+            with self.subTest(method=method.decode("ascii")):
+                _, (_, headers, _) = self._refuse(method)
+                for directive in ("no-cache", "no-store", "must-revalidate"):
+                    self.assertIn(directive, headers["cache-control"])
+
+    def test_the_health_route_still_answers_after_an_unimplemented_method(self):
+        """The dynamic dispatch must not disturb the request it exists beside."""
+        self._refuse(b"TRACE")
+        status, _, body = self.request(self.route)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body.decode("utf-8"))["status"], EXPECTED_STATUS)
+
+
+class TestTransportRejection(HealthServerTestCase):
+    """A request too malformed to have a method, refused in one status line.
+
+    These requests never reach a ``do_*`` method: the transport rejects them while
+    parsing, which is the one response this handler cannot compose from the frozen
+    contract.  The inherited error path is unusable here - it emits an HTML
+    document, a ``Server`` banner, a ``Date`` header and the offending request line
+    echoed into both the status line and the body, and a request line that fails to
+    parse at all is classified as HTTP/0.9, for which the inherited writer emits no
+    status line and no headers, making the whole reply a bare HTML document that is
+    not a valid HTTP response.
+
+    What must come back instead is a status line, ``Content-Length: 0``,
+    ``Connection: close``, and nothing else: the same shape the JavaScript
+    listener sends for the same requests.
+    """
+
+    #: ``(label, request bytes, expected status line, text that must not appear)``.
+    #: Each case exercises a different branch of the transport's own parser, and
+    #: each names the request-derived text a regression towards the inherited page
+    #: would put back on the wire.
+    REJECTION_CASES = (
+        (
+            "a one-word request line",
+            b"GARBAGE\r\n\r\n",
+            b"HTTP/1.1 400 Bad Request",
+            b"GARBAGE",
+        ),
+        (
+            "a version that does not parse",
+            b"GARBAGE REQUEST line\r\n\r\n",
+            b"HTTP/1.1 400 Bad Request",
+            b"GARBAGE",
+        ),
+        (
+            "an HTTP/0.9 request that is not a GET",
+            b"POST /health\r\n\r\n",
+            b"HTTP/1.1 400 Bad Request",
+            b"POST",
+        ),
+        (
+            "an unsupported major version",
+            b"GET /health HTTP/9.9\r\nHost: h\r\n\r\n",
+            b"HTTP/1.1 505 HTTP Version Not Supported",
+            b"9.9",
+        ),
+        (
+            "a request line past the transport ceiling",
+            b"GET /" + b"a" * OVERSIZED_REQUEST_LINE_BYTES + b" HTTP/1.1\r\n\r\n",
+            b"HTTP/1.1 414 URI Too Long",
+            b"aaaaaaaa",
+        ),
+        (
+            "more header lines than the transport will parse",
+            b"GET /health HTTP/1.1\r\nHost: h\r\n"
+            + b"".join(
+                b"X-Filler-%d: v\r\n" % index for index in range(EXCESSIVE_HEADER_COUNT)
+            )
+            + b"\r\n",
+            b"HTTP/1.1 431 Request Header Fields Too Large",
+            b"X-Filler",
+        ),
+        (
+            "a single header line past the transport ceiling",
+            b"GET /health HTTP/1.1\r\nHost: h\r\nX-Filler: "
+            + b"b" * OVERSIZED_REQUEST_LINE_BYTES
+            + b"\r\n\r\n",
+            b"HTTP/1.1 431 Request Header Fields Too Large",
+            b"bbbbbbbb",
+        ),
+    )
+
+    def _reject(self, request):
+        """Send ``request``, capture the one diagnostic, return the reply bytes.
+
+        Each of these requests produces exactly one operator diagnostic.  Capturing
+        it keeps this suite's own output clean and turns "exactly one line" into an
+        assertion rather than an expectation: the sanitising emitter is what makes
+        that true, and a refactor past it would show up here.  The diagnostic is
+        written before the refusal is, so it has certainly arrived by the time the
+        reply has been read.
+        """
+        with contextlib.redirect_stderr(io.StringIO()) as sink:
+            received = raw_exchange(self.port, request)
+        written = sink.getvalue()
+        self.assertEqual(written.count("\n"), 1, msg=repr(written))
+        return received
+
+    def test_every_malformed_request_is_refused_in_one_status_line(self):
+        for label, request, expected_status, _ in self.REJECTION_CASES:
+            with self.subTest(case=label):
+                received = self._reject(request)
+                status_line, headers, body = parse_raw_response(received)
+                self.assertEqual(status_line, expected_status)
+                self.assertEqual(
+                    header_names(headers),
+                    {"content-length", "connection"},
+                    msg="a transport refusal carries a length and a close, nothing more",
+                )
+                self.assertEqual(headers["content-length"], "0")
+                self.assertEqual(headers["connection"].lower(), "close")
+                self.assertEqual(body, b"")
+
+    def test_no_malformed_request_receives_a_document_of_any_kind(self):
+        for label, request, _, _ in self.REJECTION_CASES:
+            with self.subTest(case=label):
+                lowered = self._reject(request).lower()
+                self.assertNotIn(b"<html", lowered)
+                self.assertNotIn(b"<head", lowered)
+                self.assertNotIn(b"error code", lowered)
+                self.assertNotIn(b"basehttp", lowered)
+                self.assertNotIn(b"python", lowered)
+                self.assertNotIn(b"server:", lowered)
+                self.assertNotIn(b"date:", lowered)
+
+    def test_no_refusal_echoes_the_request_that_caused_it(self):
+        """Every one of these values is reflected by the inherited page."""
+        for label, request, _, forbidden in self.REJECTION_CASES:
+            with self.subTest(case=label):
+                received = self._reject(request)
+                self.assertNotIn(forbidden, received)
+
+    def test_a_reply_that_is_not_a_valid_response_would_be_caught(self):
+        """A reply must always be a valid response: a status line is always written."""
+        received = self._reject(b"GARBAGE\r\n\r\n")
+        self.assertTrue(
+            received.startswith(b"HTTP/1.1 "), msg=repr(received[:120])
+        )
+        self.assertIn(b"\r\n\r\n", received)
+
+    def test_a_malformed_request_retires_the_connection(self):
+        """Nothing after an unparseable request could be trusted to start cleanly."""
+        with contextlib.redirect_stderr(io.StringIO()):
+            client = socket.create_connection(
+                (LOOPBACK, self.port), timeout=REQUEST_TIMEOUT_SECONDS
+            )
+            try:
+                client.sendall(b"GARBAGE\r\n\r\n")
+                first = read_one_response(client)
+                client.settimeout(REQUEST_TIMEOUT_SECONDS)
+                remainder = read_response(client)
+            finally:
+                client.close()
+        self.assertIn(b"400 Bad Request", first)
+        self.assertEqual(remainder, b"", msg="the connection must be closed, not idle")
+
+    def test_a_transport_refusal_is_logged_as_exactly_one_line(self):
+        """The operator keeps the diagnostic; the network gets none of it.
+
+        The request line reaches this log path, so it is the one refusal whose
+        diagnostic carries caller-chosen text.  It goes through the sanitising
+        emitter, so a control character in the request line cannot open a second
+        entry in whatever collects this process's stderr.
+        """
+        with contextlib.redirect_stderr(io.StringIO()) as sink:
+            raw_exchange(self.port, b"GAR\x07BAGE\x1b[31m\r\n\r\n")
+        written = sink.getvalue()
+        self.assertEqual(written.count("\n"), 1, msg=repr(written))
+        self.assertIn("refusing a malformed request with 400", written)
+        self.assertNotIn("\x07", written)
+        self.assertNotIn("\x1b", written)
+
+
+class TestPreParseDeadline(HealthServerTestCase):
+    """A connection that never finishes its request must not hold a thread.
+
+    Every socket read before a request is parsed - the wait for the request line
+    and the wait for each header line - was unbounded, so one connection that
+    opened and said nothing parked a handler thread for the lifetime of the
+    process.  Measured before the deadline existed: a client that sent no bytes at
+    all was still connected after thirty seconds, and so was one that sent half a
+    header block.  Repeat that and the thread pool is the resource that runs out.
+
+    The deadline is a class attribute, applied by ``setup`` to each accepted
+    connection.  These tests shorten it for their own duration rather than waiting
+    out the production budget, and restore it on every path; the production number
+    itself is asserted separately as a constant.
+    """
+
+    #: Prefixes that leave a request incomplete in each of the ways a real
+    #: slowloris client does.  The first sends nothing at all.
+    PARTIAL_REQUESTS = (
+        ("no bytes at all", b""),
+        ("a request line and then silence", b"GET /health HTTP/1.1\r\n"),
+        ("half a header block", b"GET /health HTTP/1.1\r\nHost: h\r\n"),
+        ("a request line without its terminator", b"GET /health HTTP/1.1"),
+    )
+
+    @contextlib.contextmanager
+    def _short_deadline(self):
+        """Shorten the pre-parse deadline for one test, restoring it always."""
+        with mock.patch.object(
+            app.HealthRequestHandler, "timeout", SHORT_HEADER_BUDGET_SECONDS
+        ):
+            yield
+
+    def _hold(self, prefix):
+        """Open a connection, send ``prefix``, and wait for the server to close it.
+
+        :returns: ``(received bytes, elapsed seconds)``.  A correct server returns
+            no bytes: there is no response to a request it never received.
+        """
+        client = socket.create_connection(
+            (LOOPBACK, self.port), timeout=SETTLE_TIMEOUT_SECONDS
+        )
+        try:
+            if prefix:
+                client.sendall(prefix)
+            began = time.monotonic()
+            client.settimeout(SETTLE_TIMEOUT_SECONDS)
+            received = read_response(client)
+            return received, time.monotonic() - began
+        finally:
+            client.close()
+
+    def test_an_unfinished_request_is_closed_by_the_deadline(self):
+        for label, prefix in self.PARTIAL_REQUESTS:
+            with self.subTest(case=label):
+                with self._short_deadline():
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        received, elapsed = self._hold(prefix)
+                self.assertEqual(
+                    received, b"", msg="a request never received has no response"
+                )
+                self.assertGreaterEqual(elapsed, SHORT_HEADER_BUDGET_SECONDS * 0.5)
+                self.assertLess(
+                    elapsed,
+                    SETTLE_TIMEOUT_SECONDS,
+                    msg="the connection was not closed by the deadline",
+                )
+
+    def test_the_deadline_diagnostic_carries_nothing_the_client_sent(self):
+        """One line per abandoned connection, and none of it caller-supplied."""
+        with self._short_deadline():
+            with contextlib.redirect_stderr(io.StringIO()) as sink:
+                self._hold(b"GET /health HTTP/1.1\r\nHost: internal.example\r\n")
+        written = sink.getvalue()
+        self.assertEqual(written.count("\n"), 1, msg=repr(written))
+        self.assertIn("timed out", written)
+        self.assertNotIn("internal.example", written)
+        self.assertNotIn("health", written)
+
+    def test_silent_connections_do_not_accumulate_handler_threads(self):
+        """The resource the deadline actually protects, measured directly."""
+        baseline = threading.active_count()
+        clients = []
+        try:
+            with self._short_deadline():
+                with contextlib.redirect_stderr(io.StringIO()):
+                    for _ in range(SILENT_CONNECTION_COUNT):
+                        clients.append(
+                            socket.create_connection(
+                                (LOOPBACK, self.port), timeout=SETTLE_TIMEOUT_SECONDS
+                            )
+                        )
+                    for client in clients:
+                        client.settimeout(SETTLE_TIMEOUT_SECONDS)
+                        self.assertEqual(
+                            read_response(client),
+                            b"",
+                            msg="every silent connection must be closed by the server",
+                        )
+                    settled = await_settled(
+                        lambda: threading.active_count() <= baseline
+                    )
+        finally:
+            for client in clients:
+                client.close()
+        self.assertTrue(
+            settled,
+            msg=f"threads did not settle: {threading.active_count()} > {baseline}",
+        )
+
+    def test_the_pre_parse_deadline_is_the_javascript_headers_budget(self):
+        """One number, the same behaviour in both implementations.
+
+        Node bounds the same hazard with ``headersTimeout``; Java bounds header
+        and body together with ``sun.net.httpserver.maxReqTime``.  The deadline
+        must also be shorter than the drain budget, because a request that has not
+        arrived is worth less patience than one being delivered slowly.
+        """
+        self.assertEqual(app.REQUEST_HEADER_TIMEOUT_SECONDS, 10.0)
+        self.assertEqual(
+            app.HealthRequestHandler.timeout,
+            app.REQUEST_HEADER_TIMEOUT_SECONDS,
+            msg="the handler must carry the deadline; setup() reads it from here",
+        )
+        self.assertLess(
+            app.REQUEST_HEADER_TIMEOUT_SECONDS, app.REQUEST_DRAIN_TIMEOUT_SECONDS
+        )
+
+    def test_the_deadline_does_not_disturb_a_reused_connection(self):
+        """A legitimate idle gap between two requests must still be served.
+
+        Run against the PRODUCTION deadline on purpose: a bound set so tightly
+        that ordinary connection reuse broke would be a regression dressed as a
+        hardening measure.
+        """
+        client = socket.create_connection(
+            (LOOPBACK, self.port), timeout=REQUEST_TIMEOUT_SECONDS
+        )
+        try:
+            request = (
+                f"GET {self.route} HTTP/1.1\r\nHost: h\r\n\r\n".encode("ascii")
+            )
+            client.sendall(request)
+            first = read_one_response(client)
+            time.sleep(PIPELINE_GAP_SECONDS)
+            client.sendall(request)
+            second = read_one_response(client)
+        finally:
+            client.close()
+        for reply in (first, second):
+            self.assertIn(b"200 OK", reply)
+            self.assertIn(b'"status":"UP"', reply)
+
+
 class TestServerLifecycle(unittest.TestCase):
     """Binding, port validation, and leaving nothing behind on shutdown."""
 
     def setUp(self):
-        # This class drives a live server too, and the handler resolves its route
-        # from the real environment on every request.  Without this the suite
+        # This class drives a live server too, and a server resolves its route from
+        # the real environment when it is constructed.  Without this the suite
         # would fail for anyone who happens to have HEALTH_PATH exported - a
         # failure that says nothing about the implementation.
         environment = neutralize_health_environment()
@@ -1897,10 +2920,20 @@ class TestServerLifecycle(unittest.TestCase):
         that did not bind.
         """
         config = defaults_only_config(self)
-        for value in ("not-a-port", "70000", "-1", ""):
+        # ``expected`` is the text the message must carry.  It differs by branch on
+        # purpose: a value that fails the grammar is quoted as given, while one that
+        # parses but lies outside the range is reported as the number it parsed to.
+        cases = (
+            ("not-a-port", repr("not-a-port")),
+            ("70000", "70000"),
+            ("-1", "-1"),
+            ("", repr("")),
+        )
+        for value, expected in cases:
             with self.subTest(value=value):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ValueError) as raised:
                     app.create_server(host=LOOPBACK, port=value, config=config)
+                self.assertIn(expected, str(raised.exception))
 
     def test_shutdown_releases_the_listening_socket(self):
         """The suite must leave no listener behind for the next test run."""
@@ -1932,23 +2965,19 @@ class TestServerLifecycle(unittest.TestCase):
             )
 
 
-# --------------------------------------------------------------------------- #
-# Security regressions
-#
-# Every test below reproduces something this endpoint once permitted, and each
-# one fails if the defence is removed.  They are named after what an attacker
-# would have achieved rather than after the function under test, so that a future
-# reader can tell at a glance that they are not stylistic assertions.
-# --------------------------------------------------------------------------- #
+# Security regressions.  Each test below names a specific way this endpoint could
+# be subverted and fails if the defence against it is removed.  They are named
+# after what an attacker would achieve rather than after the function under test,
+# so a reader can tell at a glance that they are not stylistic assertions.
 
 
 class TestConfigurationValidation(unittest.TestCase):
     """An unpublishable configuration is refused, not served.
 
-    The proven defect: ``APP_VERSION=not-a-version`` was served verbatim inside a
-    ``200`` response whose ``status`` field read ``UP``, so the endpoint attested
-    to its own health while describing itself in a form no consumer of the frozen
-    contract could parse.
+    Without this, ``APP_VERSION=not-a-version`` would be served verbatim inside a
+    ``200`` response whose ``status`` field read ``UP``, so the endpoint would
+    attest to its own health while describing itself in a form no consumer of the
+    frozen contract could parse.
     """
 
     def config(self, **overrides):
@@ -1987,11 +3016,47 @@ class TestConfigurationValidation(unittest.TestCase):
                 self.assertIn("app.name", str(raised.exception))
 
     def test_a_route_that_is_not_a_visible_ascii_path_is_refused(self):
-        for path in ["health", "", "/heal th", "/health\r\nX-Injected: 1", "/h\u00e9alth"]:
+        for path in ["", "/heal th", "/health\r\nX-Injected: 1", "/h\u00e9alth"]:
             with self.subTest(path=path):
                 with self.assertRaises(ValueError) as raised:
                     app.validate_config(self.config(**{"health.path": path}))
                 self.assertIn("health.path", str(raised.exception))
+
+    def test_a_network_path_reference_is_refused(self):
+        """``//health`` is an authority, not a path - RFC 3986 section 4.2.
+
+        The shared rule, and it exists because the three platform servers do NOT
+        agree about such a target: CPython's request parser folds an inbound
+        ``//health`` down to ``/health`` and the JDK's URI parser resolves it to an
+        empty path.  A value every validator accepted but only the Node runtime
+        could serve would let one implementation report itself up while its
+        siblings answer nothing, so it is refused before a socket is bound.
+        """
+        for path in ["//health", "///health", "//health/", "//host/health"]:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError) as raised:
+                    app.validate_config(self.config(**{"health.path": path}))
+                self.assertIn("health.path", str(raised.exception))
+
+    def test_a_route_without_a_leading_slash_is_accepted_and_normalised(self):
+        """``HEALTH_PATH=healthz`` must behave identically in all three.
+
+        The validator grades the NORMALISED route, not the raw configured value, so
+        validation and routing cannot disagree.  Grading the raw value would refuse
+        a path with no leading slash while this module's own router supplied that
+        slash - refusing to start on a configuration the JavaScript and Java
+        implementations serve, and on the one ``.env.example`` documents.
+        """
+        for configured, expected in [
+            ("healthz", "/healthz"),
+            ("health", "/health"),
+            ("/health/", "/health"),
+            ("/health?probe=1", "/health"),
+        ]:
+            with self.subTest(configured=configured):
+                config = self.config(**{"health.path": configured})
+                app.validate_config(config)
+                self.assertEqual(app.health_route(config), expected)
 
     def test_a_host_carrying_a_control_character_is_refused(self):
         with self.assertRaises(ValueError) as raised:
@@ -2042,17 +3107,34 @@ class TestPortGrammar(unittest.TestCase):
     """
 
     def test_a_non_ascii_decimal_port_is_refused(self):
+        """Refused, AND the message names the offending value and the grammar.
+
+        The exception is what an operator sees when the server refuses to start, so
+        a regression that stopped naming the value would leave them reading "invalid
+        port" with no indication of which value was invalid.  Asserting only that
+        ``ValueError`` was raised cannot detect that.  The value is safe to name
+        here precisely because this text is an exception rather than a log line: the
+        diagnostics that DO reach stderr name the setting and never quote it, and a
+        separate test asserts that.
+        """
         for value in ["8_001", "\u0668\u0660\u0660\u0661", "0x50", "8O01",
                       "8001.0", "eight", "1e3", "", "8 001", "0b11"]:
             with self.subTest(value=value):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ValueError) as raised:
                     app._as_port(value)
+                message = str(raised.exception)
+                self.assertIn(repr(value), message)
+                self.assertIn("ASCII decimal", message)
 
     def test_an_out_of_range_port_is_refused(self):
+        """The range is stated, so the message is actionable without the source."""
         for value in ["-1", "65536", "99999"]:
             with self.subTest(value=value):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ValueError) as raised:
                     app._as_port(value)
+                message = str(raised.exception)
+                self.assertIn(value, message)
+                self.assertIn("0-65535", message)
 
     def test_a_plain_ascii_decimal_port_is_accepted(self):
         self.assertEqual(app._as_port("8001"), 8001)
@@ -2120,11 +3202,11 @@ def http_response(body, status=200, content_type="application/json"):
 class TestProbeHardening(unittest.TestCase):
     """A self-check must PROVE health, not be talked into reporting it.
 
-    Three separate defects converge here.  The verdict was taken from a substring
-    test, so a truncated body reported healthy.  The whole response was buffered
-    with no ceiling.  And the request went through ``urllib``'s default opener,
-    which reads proxy settings out of the environment - so an injected
-    ``HTTP_PROXY`` could answer on behalf of a process that was not running.
+    Three independent ways to talk one into it converge here.  A verdict taken
+    from a substring test grades a truncated body healthy.  A response buffered
+    with no ceiling is unbounded work.  And a request sent through ``urllib``'s
+    default opener reads proxy settings out of the environment, so an injected
+    ``HTTP_PROXY`` can answer on behalf of a process that is not running.
     """
 
     HEALTHY = json.dumps(

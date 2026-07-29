@@ -1,55 +1,27 @@
 /**
  * index.test.js - unit and integration tests for the JavaScript health endpoint.
  *
- * THE FILENAME IS A CORRECTNESS REQUIREMENT, NOT A STYLE CHOICE.
- * Node's built-in runner collects files whose name carries a `.test.js` or
- * `_test.js` suffix. A file named `index.spec.js` is silently ignored - the
- * runner collects zero tests and still exits 0, which is a suite that reports
- * success while executing nothing. That behaviour was reproduced against this
- * repository before this file was written: with no test file present,
- * `node --test --test-reporter=tap` printed "1..0 / # tests 0 / # pass 0" and
- * exited 0. It is the whole reason the CI gate asserts a collected count
- * greater than zero and requests the TAP reporter explicitly (the default
- * reporter prints decorative glyphs rather than a greppable count line).
- * Do not rename this file.
+ * THE FILENAME IS A CORRECTNESS REQUIREMENT, NOT A STYLE CHOICE. Node's built-in
+ * runner collects files whose name carries a `.test.js` or `_test.js` suffix. A
+ * file named `index.spec.js` is silently ignored: the runner collects zero tests
+ * and still exits 0, which is a suite that reports success while executing
+ * nothing. With no collectible test file present, `node --test
+ * --test-reporter=tap` prints "1..0 / # tests 0 / # pass 0" and exits 0. That is
+ * why the collected count must be asserted to exceed zero, and why the TAP
+ * reporter is requested explicitly: the default reporter prints decorative glyphs
+ * rather than a greppable count line. Do not rename this file.
  *
- * WHAT IS COVERED
- *   A. Preserved legacy behaviour - `add`, the public export surface, the
- *      absence of an import-time side effect, and the byte-exact default stdout.
- *   B. The frozen health payload contract - field set, field ORDER, value
- *      formats, and the compact rendering.
- *   C. Path normalisation, asserted directly as a pure function.
- *   D. Routing, status codes and response headers over a live server bound to
- *      an ephemeral port.
- *   E. Configuration precedence: environment > properties file > built-in
- *      default, with `PORT` outranking `NODE_PORT`.
+ * `timestamp` is the only non-deterministic value in the payload and is matched
+ * against a regular expression only, so no assertion here is time-flaky.
  *
- * ENGINEERING STANDARDS THIS FILE IS HELD TO (no user-specified rules exist for
- * this project; these are the enterprise standards the plan declares binding):
- *   S1 Backward compatibility is non-negotiable. The preserved `add` behaviour,
- *      the byte-exact 15-byte default stdout and the absence of an import-time
- *      side effect are all asserted here, so a regression fails a gate rather
- *      than reaching a reviewer.
- *   S2 Repository conventions are preserved: CommonJS `require` (the manifest
- *      declares `"type": "commonjs"`), two-space indentation, semicolons, and a
- *      flat root sibling rather than a `tests/` subdirectory.
- *   S3 Zero-dependency self-containment: every import below is a Node built-in.
- *      No jest, mocha, supertest or chai; no lockfile; no node_modules.
- *   S6 Fail closed, and assert non-deterministic values by FORMAT, never by
- *      value. `timestamp` is the only non-deterministic field in the payload and
- *      is matched against a regular expression only, so no gate is time-flaky.
- *   S8 Least disclosure on a network-reachable surface: the absence of the
- *      `Date` and `Server` headers is asserted, because header suppression is
- *      easily regressed by a well-meaning refactor.
- *
- * PORTABILITY: only long-stable built-ins are used, because the committed Node
- * pin and the locally installed runtime are not the same minor line. Nothing
- * here depends on an API newer than the manifest's `engines.node` floor.
+ * Only long-stable built-ins are used, because the committed Node pin and the
+ * locally installed runtime are not the same minor line; nothing here depends on
+ * an API newer than the manifest's `engines.node` floor.
  */
 
 const { describe, it, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { execFileSync, spawnSync } = require("node:child_process");
+const { execFileSync, spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
 const net = require("node:net");
@@ -60,15 +32,10 @@ const path = require("node:path");
 // proves that in a child process, where a stray write cannot be missed.
 const app = require("./index.js");
 
-/* -------------------------------------------------------------------------- *
- * Frozen contract constants
- *
- * These are duplicated here on purpose rather than imported from the module.
- * A test that imports the value it is asserting proves only self-consistency:
- * if the implementation's status literal changed to "DOWN", an imported
- * constant would change with it and the assertion would still pass. Spelling
- * the expected values out independently is what makes these real assertions.
- * -------------------------------------------------------------------------- */
+// Frozen contract constants, duplicated here on purpose rather than imported from
+// the module: a test that imports the value it is asserting proves only
+// self-consistency - if the implementation's status literal changed to "DOWN", an
+// imported constant would change with it and the assertion would still pass.
 
 /** The complete field set of the health payload, in contract order. */
 const EXPECTED_KEYS = ["name", "version", "timestamp", "status"];
@@ -109,6 +76,20 @@ const EXPECTED_CONTENT_TYPE = "application/json";
 const NO_STORE_DIRECTIVE = "no-store";
 
 /**
+ * The frozen response header-name sets, sorted and lower-cased, asserted by
+ * EQUALITY rather than containment.
+ *
+ * Containment cannot see an ADDED header, and every header this endpoint does
+ * not need is disclosure it should not make (S8). Node would send `Date` and
+ * would advertise its own version if asked; both are suppressed, which is also
+ * what gives Python and Node an identical header-name set. Java's transport
+ * injects `Date` unconditionally and that is recorded as a stated deviation in
+ * User.java rather than asserted away here.
+ */
+const CONTRACT_HEADER_NAMES = Object.freeze(["cache-control", "content-length", "content-type"]);
+const REFUSAL_HEADER_NAMES = Object.freeze(["allow", "cache-control", "content-length", "content-type"]);
+
+/**
  * The port the application binds by default. The suite must never bind it:
  * every server below is started with `listen(0)` so the tests pass while a
  * developer has the real application running.
@@ -140,6 +121,68 @@ const ENV_SNAPSHOT = Object.freeze(
 );
 
 /**
+ * The two configuration diagnostics, worded identically in app.py and User.java.
+ * Asserted verbatim, because a shared failure policy that each implementation
+ * words differently is not a shared policy to whoever greps the logs.
+ */
+const UNREADABLE_CONFIG_WARNING = "cannot read the configuration file; using defaults";
+const MALFORMED_CONFIG_WARNING = "the configuration file is malformed; using defaults";
+
+/**
+ * The SHARED properties grammar fixtures: `[label, file text, expected mapping]`.
+ *
+ * The identical table - same labels, same text, same expectations - appears in
+ * test_app.py and UserTest.java. Every expectation was produced by running
+ * `java.util.Properties.load` on the same bytes, which is how User.java reads the
+ * shared configuration file, so this table is a transcription of the reference
+ * implementation rather than a description of this one.
+ */
+const SHARED_PROPERTIES_FIXTURES = [
+  ["a plain key and value", "a=1\n", { a: "1" }],
+  ["a colon separator", "a:1\n", { a: "1" }],
+  ["a space separator", "a 1\n", { a: "1" }],
+  ["a tab separator", "a\t1\n", { a: "1" }],
+  ["a form-feed separator", "a\f1\n", { a: "1" }],
+  ["whitespace around the separator", "a = 1\n", { a: "1" }],
+  ["trailing value whitespace is preserved", "a=1   \n", { a: "1   " }],
+  ["a whitespace-only value is empty", "a=   \n", { a: "" }],
+  ["a key with no separator has an empty value", "abc\n", { abc: "" }],
+  ["an empty key is still a key", "=v\n", { "": "v" }],
+  ["only the first separator separates", "a = b=c \n", { a: "b=c " }],
+  ["an escaped space belongs to the key", "a\\ b=x\n", { "a b": "x" }],
+  ["an escaped equals belongs to the key", "a\\=b=x\n", { "a=b": "x" }],
+  ["an escaped colon belongs to the key", "a\\:b=x\n", { "a:b": "x" }],
+  ["a tab escape in a value", "a=x\\ty\n", { a: "x\ty" }],
+  ["a newline escape in a value", "a=x\\nz\n", { a: "x\nz" }],
+  ["a unicode escape in a value", "a=\\u0041\n", { a: "A" }],
+  ["a capital U is not a unicode escape", "a=\\U0041\n", { a: "U0041" }],
+  ["an unknown escape is the character itself", "a=\\z\n", { a: "z" }],
+  ["an escaped backslash is one backslash", "a=x\\\\y\n", { a: "x\\y" }],
+  ["an odd trailing backslash continues the line", "a=one\\\n   two\n", { a: "onetwo" }],
+  ["an even trailing backslash ends the line", "a=v\\\\\nb=2\n", { a: "v\\", b: "2" }],
+  ["a hash comment is skipped", "#c\na=1\n", { a: "1" }],
+  ["a bang comment is skipped", "!c\na=1\n", { a: "1" }],
+  ["an indented comment is skipped", "   # c\na=1\n", { a: "1" }],
+  ["a continuation line is data, not a comment", "a=x\\\n#y\n", { a: "x#y" }],
+  ["CR, LF and CRLF all end a line", "a=1\r\nb=2\rc=3\n", { a: "1", b: "2", c: "3" }],
+  ["the last of a repeated key wins", "a=1\na=2\n", { a: "2" }],
+  ["quote characters are literal", 'a="q"\n', { a: '"q"' }],
+  ["a trailing backslash at end of input is dropped", "a=v\\", { a: "v" }],
+  ["a byte-order mark is not stripped", "\ufeffa=1\n", { "\ufeffa": "1" }],
+];
+
+/**
+ * The shared MALFORMED fixtures: the one condition under which
+ * `java.util.Properties.load` refuses a document outright rather than reading
+ * part of it as a literal.
+ */
+const SHARED_MALFORMED_PROPERTIES = [
+  ["a short unicode escape in a value", "a=\\u12\n"],
+  ["a non-hexadecimal unicode escape", "a=\\uZZZZ\n"],
+  ["a malformed unicode escape in a key", "\\u12=v\n"],
+];
+
+/**
  * Configuration used by every test that needs deterministic field values.
  *
  * `env: {}` is passed so an environment variable exported in the shell running
@@ -151,9 +194,7 @@ function fixedConfig() {
   return app.loadConfig({ env: {} });
 }
 
-/* -------------------------------------------------------------------------- *
- * Child-process helpers - used to observe stdout exactly as a shell would
- * -------------------------------------------------------------------------- */
+// Child-process helpers, so stdout is observed exactly as a shell would see it
 
 /**
  * Runs this same Node binary against the given arguments and returns stdout.
@@ -167,9 +208,6 @@ function fixedConfig() {
  *
  * execFileSync throws when the child exits non-zero, so a successful return is
  * itself an assertion that the exit status was 0.
- *
- * @param {string[]} args Arguments passed to the Node binary.
- * @returns {string} The child's stdout, decoded as UTF-8.
  */
 function nodeStdout(args) {
   return execFileSync(process.execPath, args, {
@@ -187,7 +225,6 @@ function nodeStdout(args) {
  * values rather than a thrown exception, which is what lets a test state
  * "exits 0 AND writes nothing to stderr" as an explicit expectation.
  *
- * @param {string[]} args Arguments passed to the Node binary.
  * @returns {{status: number|null, stdout: string, stderr: string}} Child outcome.
  */
 function runNode(args) {
@@ -200,9 +237,7 @@ function runNode(args) {
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
-/* -------------------------------------------------------------------------- *
- * Server and HTTP helpers
- * -------------------------------------------------------------------------- */
+// Server and HTTP helpers
 
 /**
  * Starts a server on an ephemeral port on loopback and resolves the real port.
@@ -211,7 +246,6 @@ function runNode(args) {
  * to run while the application itself is bound to its configured port. The
  * bound port is read back from server.address() rather than assumed.
  *
- * @param {import("node:http").Server} server An unstarted server.
  * @returns {Promise<number>} The port the kernel assigned.
  */
 function listen(server) {
@@ -236,7 +270,6 @@ function listen(server) {
  * first. Closing an already-closed server is tolerated, which keeps cleanup
  * hooks safe to run after a failed test.
  *
- * @param {import("node:http").Server} server The server to close.
  * @returns {Promise<void>} Resolves once the socket is released.
  */
 function closeServer(server) {
@@ -313,8 +346,6 @@ function request(options) {
  * being looked up - but going through it keeps the intent explicit and makes
  * every header assertion in this file uniform.
  *
- * @param {{headers: Record<string, string>}} response A response.
- * @param {string} name Header name in any casing.
  * @returns {string|undefined} The header value, or undefined when absent.
  */
 function headerValue(response, name) {
@@ -324,31 +355,56 @@ function headerValue(response, name) {
 /**
  * Reports whether a header was present on the wire, case-insensitively.
  *
- * @param {{headerNames: string[]}} response A response.
- * @param {string} name Header name in any casing.
  * @returns {boolean} True when the wire carried the header.
  */
 function hasHeader(response, name) {
   return response.headerNames.includes(name.toLowerCase());
 }
 
-/* -------------------------------------------------------------------------- *
- * Temporary properties files - used to exercise configuration precedence
- * -------------------------------------------------------------------------- */
-
-/** Every temporary directory created by the suite, removed by the hook below. */
-const temporaryDirectories = [];
+/**
+ * Returns the wire header names lower-cased and sorted, for an equality assertion.
+ *
+ * Sorted because header order carries no meaning, lower-cased because RFC 9110
+ * makes field names case-insensitive, and taken from the raw wire list rather
+ * than the parsed map so a duplicated header cannot hide inside a single key.
+ *
+ * @returns {string[]} Sorted, lower-cased header names.
+ */
+function sortedHeaderNames(response) {
+  return [...response.headerNames].sort();
+}
 
 /**
- * Writes a throwaway properties file and returns its path.
+ * Asks the kernel for a port, then releases it, and returns the number.
  *
- * The file is created under the system temporary directory, never inside the
- * repository, so no test run can leave an untracked artifact behind and dirty
- * the clean-working-tree gate.
+ * A child process cannot be handed an already-bound listening socket, so a test
+ * that spawns `--serve` has to name a port up front. Binding zero and reading
+ * the assignment back is the closest thing to a guarantee available: the port
+ * was free a moment ago, and nothing else in this suite ever binds a fixed port.
  *
- * @param {string[]} lines Properties-file lines, written verbatim.
- * @returns {string} Absolute path of the file.
+ * @returns {Promise<number>} A port that was free when this resolved.
  */
+function unusedPort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once("error", reject);
+    probe.listen(0, LOOPBACK, () => {
+      const address = probe.address();
+      const port = address && typeof address === "object" ? address.port : 0;
+      probe.close(() => (port > 0 ? resolve(port) : reject(new Error("no port was assigned"))));
+    });
+  });
+}
+
+/**
+ * Sleeps, so a poll loop yields the event loop between attempts.
+ */
+function pause(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+// Diagnostic capture and temporary properties files
+
 /**
  * Runs `work` with stderr captured, returning its result and everything written.
  *
@@ -358,7 +414,6 @@ const temporaryDirectories = [];
  * is usually that exactly one line was written and that it withheld the value.
  * The original writer is restored on every path.
  *
- * @param {Function} work Zero-argument function to run.
  * @returns {{value: *, written: string}} Its return value and the captured text.
  */
 function withStderr(work) {
@@ -375,6 +430,17 @@ function withStderr(work) {
   }
 }
 
+/** Every temporary directory created by the suite, removed by the hook below. */
+const temporaryDirectories = [];
+
+/**
+ * Writes a throwaway properties file and returns its path.
+ *
+ * Created under the system temporary directory, never inside the repository, so no
+ * test run can leave an untracked artifact behind and dirty the clean-tree gate.
+ *
+ * @param {string[]} lines Properties-file lines, written verbatim.
+ */
 function writePropertiesFile(lines) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "health-config-"));
   temporaryDirectories.push(directory);
@@ -384,10 +450,20 @@ function writePropertiesFile(lines) {
 }
 
 /**
+ * Writes RAW BYTES as the properties file, so a fixture can carry a sequence that
+ * is not valid UTF-8 at all - which a string cannot express.
+ */
+function writePropertiesBytes(bytes) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "health-config-raw-"));
+  temporaryDirectories.push(directory);
+  const file = path.join(directory, "app.config.properties");
+  fs.writeFileSync(file, bytes);
+  return file;
+}
+
+/**
  * Returns a path that is guaranteed not to exist, to exercise the
  * missing-file fallback without depending on the absence of a real path.
- *
- * @returns {string} A non-existent absolute path.
  */
 function missingPropertiesPath() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "health-missing-"));
@@ -403,9 +479,7 @@ after(() => {
   }
 });
 
-/* ========================================================================== *
- * A. Preserved legacy behaviour (S1)
- * ========================================================================== */
+// A. Preserved legacy behaviour
 
 describe("A. preserved legacy behaviour", () => {
   it("add(5, 7) returns 12, the value the original program printed", () => {
@@ -421,9 +495,9 @@ describe("A. preserved legacy behaviour", () => {
   });
 
   it("exposes the documented public API, so the module is consumable as a library", () => {
-    // Before this feature the module declared no exports at all and `add` was
-    // not consumable as a library. Every name below is part of the published
-    // surface and is asserted to exist with the expected type.
+    // Every name below is part of the published surface and is asserted to exist
+    // with the expected type, which is what makes the module consumable as a
+    // library rather than only runnable as a program.
     const expectedFunctions = [
       "add",
       "loadConfig",
@@ -433,6 +507,7 @@ describe("A. preserved legacy behaviour", () => {
       "healthPayload",
       "renderPayload",
       "normalizePath",
+      "configRoute",
       "createServer",
       "buildServer",
       "serve",
@@ -465,11 +540,10 @@ describe("A. preserved legacy behaviour", () => {
   });
 
   it("requiring the module writes nothing to stdout", () => {
-    // The headline backward-compatibility assertion. The five writes used to
-    // happen at module scope, so merely importing the file produced output and
-    // made it untestable. They now live behind a main-module guard. A child
-    // process is used because an in-process check cannot distinguish "never
-    // written" from "written before the test started".
+    // The headline backward-compatibility assertion: the five writes live behind a
+    // main-module guard, so importing the file is silent and the function is
+    // consumable as a library. A child process is used because an in-process check
+    // cannot distinguish "never written" from "written before the test started".
     const stdout = nodeStdout(["-e", "require('./index.js');"]);
     assert.equal(stdout, "");
     assert.equal(Buffer.byteLength(stdout), 0);
@@ -509,9 +583,7 @@ describe("A. preserved legacy behaviour", () => {
 });
 
 
-/* ========================================================================== *
- * B. The frozen health payload contract
- * ========================================================================== */
+// B. The frozen health payload contract
 
 describe("B. health payload contract", () => {
   it("carries exactly the four contract fields, in the contract order", () => {
@@ -635,9 +707,7 @@ describe("B. health payload contract", () => {
   });
 });
 
-/* ========================================================================== *
- * C. Path normalisation, asserted as a pure function
- * ========================================================================== */
+// C. Path normalisation, asserted as a pure function
 
 describe("C. path normalisation", () => {
   // The route is matched by comparing the normalised request target with the
@@ -735,9 +805,7 @@ describe("C. path normalisation", () => {
 });
 
 
-/* ========================================================================== *
- * D. Routing, status codes and headers over a live server
- * ========================================================================== */
+// D. Routing, status codes and headers over a live server
 
 describe("D. routing over a live server", () => {
   let server;
@@ -828,6 +896,37 @@ describe("D. routing over a live server", () => {
     // The three contract headers must all be present on the wire.
     for (const name of ["content-type", "cache-control", "content-length"]) {
       assert.equal(hasHeader(response, name), true, `${name} must be sent`);
+    }
+  });
+
+  it("sends EXACTLY the frozen header set on 200, asserted by equality", async () => {
+    // Equality, not containment: a containment check passes when a header is
+    // ADDED, and an added header on this surface is disclosure nobody asked for.
+    // This is the assertion that would catch a future refactor reintroducing
+    // Node's default Date header, or a helper quietly attaching Connection.
+    const response = await request({ port, path: config.healthPath });
+    assert.equal(response.status, 200);
+    assert.deepStrictEqual(sortedHeaderNames(response), [...CONTRACT_HEADER_NAMES]);
+  });
+
+  it("sends EXACTLY the frozen header set on 404, asserted by equality", async () => {
+    const response = await request({ port, path: "/nope" });
+    assert.equal(response.status, 404);
+    assert.deepStrictEqual(sortedHeaderNames(response), [...CONTRACT_HEADER_NAMES]);
+  });
+
+  it("sends EXACTLY the frozen set plus Allow on 405, for every refused method", async () => {
+    // Allow is the ONLY header a refusal adds. Asserted for every method the
+    // suite refuses, because a per-method branch is exactly where a header set
+    // drifts apart without anyone noticing.
+    for (const method of ["POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]) {
+      const response = await request({ port, method, path: config.healthPath });
+      assert.equal(response.status, 405, `${method} should not be allowed`);
+      assert.deepStrictEqual(
+        sortedHeaderNames(response),
+        [...REFUSAL_HEADER_NAMES],
+        `${method} sent: ${response.headerNames.join(", ")}`,
+      );
     }
   });
 
@@ -926,10 +1025,9 @@ describe("D2. a server built from non-default configuration", () => {
   });
 
   it("self-probes to 0 while listening and to 1 once the socket is gone", async () => {
-    // This is the exact code path a container health check runs, which is why it
-    // is worth asserting in process: slim and JRE base images ship neither curl
-    // nor wget, so the application probes itself. probe() resolves a code rather
-    // than calling process.exit, so calling it here cannot kill the runner.
+    // The probe is in process because slim and JRE base images ship neither curl
+    // nor wget, so the application has to check itself. probe() resolves a code
+    // rather than calling process.exit, so calling it here cannot kill the runner.
     const config = fixedConfig();
     const server = app.createServer(config);
     let port;
@@ -949,19 +1047,14 @@ describe("D2. a server built from non-default configuration", () => {
 });
 
 
-/* ========================================================================== *
- * E. Configuration precedence: environment > properties file > default
- * ========================================================================== */
+// E. Configuration precedence: environment > properties file > default
 
-/* -------------------------------------------------------------------------- *
- * F. Configuration validation and the port grammar
- *
- * A configuration that cannot be published truthfully must be refused BEFORE a
- * socket is bound, so there is no window in which a port is held by a server
- * that would answer 200 with a payload the contract forbids. All three
- * implementations raise, and the message wording is byte-identical across them -
- * an operator greps one deployment's logs, not one language's.
- * -------------------------------------------------------------------------- */
+// F. Configuration validation and the port grammar. A configuration that cannot be
+// published truthfully is refused BEFORE a socket is bound, so there is no window
+// in which a port is held by a server that would answer 200 with a payload the
+// contract forbids. All three implementations raise, and the message wording is
+// byte-identical across them - an operator greps one deployment's logs, not one
+// language's.
 
 describe("F. configuration validation", () => {
   const NAME_REASON = "invalid app.name: it must be non-empty text with no control character";
@@ -1006,6 +1099,63 @@ describe("F. configuration validation", () => {
   it("refuses a health path that is not a visible-ASCII request target", () => {
     for (const healthPath of ["", "/heal th", "/health\r\nX", "/health\n", "/hea\u001blth"]) {
       assert.equal(rejectionOf({ healthPath }), PATH_REASON, JSON.stringify(healthPath));
+    }
+  });
+
+  it("refuses a network-path reference, which only this runtime could serve", () => {
+    // RFC 3986 section 4.2 reads "//health" as an authority named "health", not as
+    // a path, and the three platform servers do not agree about it: CPython's
+    // request parser folds an inbound "//health" down to "/health" and the JDK's
+    // URI parser resolves it to an empty path, while this runtime hands it through
+    // unchanged. A value all three validators accept and only one can answer makes
+    // HEALTH_PATH=//health a configuration-dependent outage - Python's and Java's
+    // self-probes exit 1 while this one reports healthy - so the shared rule
+    // refuses it before a socket is bound.
+    for (const healthPath of ["//health", "///health", "//health/", "//host/health"]) {
+      assert.equal(rejectionOf({ healthPath }), PATH_REASON, JSON.stringify(healthPath));
+    }
+  });
+
+  it("accepts a route with no leading slash and grades the route it will serve", () => {
+    // The validator grades the NORMALISED route rather than the raw value, which is
+    // what makes validation and routing the same decision in all three
+    // implementations: a validator grading the raw value would refuse an unrooted
+    // path outright, so HEALTH_PATH=healthz would stop that implementation from
+    // starting while another served /healthz.
+    for (const [configured, expected] of [
+      ["healthz", "/healthz"],
+      ["health", "/health"],
+      ["/health/", "/health"],
+      ["/health?probe=1", "/health"],
+    ]) {
+      assert.equal(rejectionOf({ healthPath: configured }), null, JSON.stringify(configured));
+      assert.equal(app.configRoute(configured), expected, JSON.stringify(configured));
+    }
+  });
+
+  it("reduces a configured path to a route the shared way", () => {
+    // The same table appears in test_app.py and UserTest.java. configRoute is the
+    // single function both the validator and the router go through, so this table
+    // is simultaneously the routing contract and the validation contract.
+    const cases = [
+      ["/health", "/health"],
+      ["health", "/health"],
+      ["healthz", "/healthz"],
+      ["/health/", "/health"],
+      ["/health?probe=1", "/health"],
+      ["/health#part", "/health"],
+      // The leading slash is supplied BEFORE normalisation, so a configured value
+      // that looks like an absolute URL is no longer in absolute form by the time
+      // the authority would be stripped. All three implementations do this in the
+      // same order, which is the property that matters.
+      ["http://host:8000/health", "/http://host:8000/health"],
+      ["/", "/"],
+      ["//", "/"],
+      ["//health", "//health"],
+      ["/health//", "/health/"],
+    ];
+    for (const [configured, expected] of cases) {
+      assert.equal(app.configRoute(configured), expected, JSON.stringify(configured));
     }
   });
 
@@ -1083,14 +1233,11 @@ describe("F. configuration validation", () => {
   });
 });
 
-/* -------------------------------------------------------------------------- *
- * G. Probe target selection and answer validation
- *
- * The probe exists to be consumed by a container HEALTHCHECK, so it must fail
- * CLOSED: every doubt resolves to unhealthy. It dials loopback only, ignores any
- * ambient proxy, bounds what it will read, and checks the whole document rather
- * than searching the body for a hopeful substring.
- * -------------------------------------------------------------------------- */
+// G. Probe target selection and answer validation. A health probe's caller can act
+// only on an exit status, so the probe fails CLOSED: every doubt resolves to
+// unhealthy. It dials loopback only, ignores any ambient proxy, bounds what it will
+// read, and checks the whole document rather than searching the body for a hopeful
+// substring.
 
 describe("G. probe target and answer validation", () => {
   it("honours every loopback spelling exactly and silently", () => {
@@ -1170,8 +1317,8 @@ describe("G. probe target and answer validation", () => {
   });
 
   it("refuses a truncated body that happens to quote the healthy fragment", () => {
-    // This is the fail-OPEN check the substring test used to pass: the bytes
-    // contain `"status":"UP"` but are not a JSON document at all.
+    // The fail-OPEN case a substring test accepts: the bytes contain
+    // `"status":"UP"` but are not a JSON document at all.
     const reason = app.probeRejection(200, Buffer.from('{"status":"UP"'));
     assert.equal(reason, "body is not the expected JSON document");
   });
@@ -1194,9 +1341,136 @@ describe("G. probe target and answer validation", () => {
     );
   });
 
-  it("refuses a repeated member name instead of letting the last one win", () => {
-    const repeated = '{"name":"n","name":"other","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}';
-    assert.notEqual(app.probeRejection(200, Buffer.from(repeated)), null);
+  it("refuses a repeated member name with the shared malformed-document reason", () => {
+    // The reason is pinned as a literal, not merely asserted non-null. A
+    // duplicate member is settled WHILE PARSING by both siblings - Python's
+    // object_pairs_hook and Java's JsonReader member map - so all three word it
+    // "body is not the expected JSON document" and none of them reaches a field
+    // rule. Asserting only non-null would let this implementation answer "the
+    // status field is not the expected value" for the row below and still pass,
+    // and two operators grepping two deployments for the same fault would then
+    // find different text.
+    const malformed = "body is not the expected JSON document";
+    const rows = [
+      [
+        "last value wins and disagrees",
+        '{"name":"n","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP","status":"DOWN"}',
+      ],
+      [
+        "last value wins and agrees",
+        '{"name":"n","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"DOWN","status":"UP"}',
+      ],
+      [
+        "repeated first member",
+        '{"name":"n","name":"other","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}',
+      ],
+      [
+        "repeat spelled with a unicode escape",
+        '{"name":"n","\\u006eame":"other","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}',
+      ],
+      [
+        "repeat nested inside a member value",
+        '{"name":{"a":1,"a":2},"version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}',
+      ],
+      ["repeat inside an array element", '[{"a":1,"a":2}]'],
+      [
+        "repeated empty-string keys",
+        '{"":"a","":"b","name":"n","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}',
+      ],
+    ];
+    for (const [label, text] of rows) {
+      assert.equal(app.probeRejection(200, Buffer.from(text, "utf8")), malformed, label);
+    }
+  });
+
+  it("finds a repeated member at any nesting depth, as object_pairs_hook does", () => {
+    // Python's hook and Java's reader both fire at EVERY level, so a scan that
+    // only examined the top-level object would agree with them on the rows above
+    // and disagree the moment a duplicate was one level down. A JSON.parse
+    // reviver cannot do this either: duplicates are already collapsed before a
+    // reviver ever runs, which is why the check is a separate scan of the text.
+    const rest = '"version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}';
+    for (const depth of [1, 2, 5, 50, 300]) {
+      const buried = `{"name":${'{"a":'.repeat(depth)}{"b":1,"b":2}${"}".repeat(depth)},${rest}`;
+      assert.equal(
+        app.probeRejection(200, Buffer.from(buried, "utf8")),
+        "body is not the expected JSON document",
+        `a duplicate ${depth} level(s) down must still be found`,
+      );
+    }
+  });
+
+  it("does not mistake a comma, a brace or a quote inside a string for structure", () => {
+    // The duplicate scan walks the text itself, so it has to read strings the
+    // way JSON does or it would lose track of which object it is inside. These
+    // are the rows that would break a naive scanner, and each one is HEALTHY.
+    const healthy = (name) =>
+      `{"name":${JSON.stringify(name)},"version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}`;
+    for (const name of ['a,b', "a{b", "a}b", 'a"b', "a:b", "a\\b", "{\"a\":1,\"a\":2}"]) {
+      assert.equal(app.probeRejection(200, Buffer.from(healthy(name), "utf8")), null, name);
+    }
+  });
+
+  it("refuses a body that is not valid UTF-8, rather than substituting U+FFFD", () => {
+    // `buffer.toString("utf8")` is LOSSY: it replaces every ill-formed sequence
+    // with U+FFFD and never reports one. A peer answering with a schema-shaped
+    // document carrying one bad byte inside `name` therefore parses cleanly and
+    // satisfies every field rule, so a lossy reader grades it HEALTHY - while
+    // Python raises UnicodeDecodeError and Java's CodingErrorAction.REPORT throws
+    // on the same bytes. Two implementations refusing and one accepting is not one
+    // contract, which is why the decode here is fatal and this test holds it so.
+    //
+    // The fixtures are raw Buffers because no JavaScript string can express an
+    // ill-formed sequence: a string that has already been decoded has already
+    // lost the evidence.
+    const rest = Buffer.from(
+      '","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}',
+      "utf8",
+    );
+    const open = Buffer.from('{"name":"', "utf8");
+    const rows = [
+      ["a truncated two-byte sequence", Buffer.from([0xc3, 0x28])],
+      ["a lone continuation byte", Buffer.from([0x80])],
+      ["a truncated three-byte sequence", Buffer.from([0xe2, 0x82])],
+      ["a truncated four-byte sequence", Buffer.from([0xf0, 0x9f, 0x92])],
+      ["an unpaired high surrogate encoded directly", Buffer.from([0xed, 0xa0, 0x80])],
+      ["an overlong encoding of U+002F", Buffer.from([0xc0, 0xaf])],
+      ["a byte no UTF-8 sequence may contain", Buffer.from([0xfe])],
+      ["a five-byte sequence UTF-8 no longer permits", Buffer.from([0xf8, 0x88, 0x80, 0x80, 0x80])],
+      ["a value past the last code point", Buffer.from([0xf5, 0x80, 0x80, 0x80])],
+    ];
+
+    for (const [label, bad] of rows) {
+      const body = Buffer.concat([open, bad, rest]);
+      assert.equal(
+        app.probeRejection(200, body),
+        "body is not the expected JSON document",
+        `${label} must be refused, not replacement-decoded`,
+      );
+
+      // Proves the fixture is a genuine guard rather than a body any decoder would
+      // reject: read LOSSILY, these same bytes are a perfectly valid health
+      // document that satisfies every field rule - which is the verdict a lossy
+      // reader returns, and the assertion above is what forbids it.
+      const lossy = JSON.parse(body.toString("utf8"));
+      assert.deepStrictEqual(Object.keys(lossy), EXPECTED_KEYS, label);
+      assert.equal(lossy.status, EXPECTED_STATUS, label);
+      assert.ok(lossy.name.length > 0, label);
+      assert.ok(lossy.name.includes("\uFFFD"), `${label} must decode lossily to U+FFFD`);
+    }
+  });
+
+  it("keeps a byte-order mark, so a body opening with one stays malformed", () => {
+    // The shared decoder is built with `ignoreBOM: true`, which reads backwards:
+    // it KEEPS the mark rather than ignoring it. Both call sites need that -
+    // java.util.Properties.load keeps it, and JSON.parse refuses a leading
+    // U+FEFF in all three runtimes, so keeping it is what holds probe parity.
+    const document = '{"name":"n","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}';
+    const withMark = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(document, "utf8")]);
+    assert.equal(app.probeRejection(200, withMark), "body is not the expected JSON document");
+    // Without the mark the very same document is healthy, which isolates the mark
+    // as the only reason for the refusal.
+    assert.equal(app.probeRejection(200, Buffer.from(document, "utf8")), null);
   });
 
   it("refuses a body over the ceiling before considering anything else", () => {
@@ -1224,23 +1498,68 @@ describe("G. probe target and answer validation", () => {
     assert.equal(app.probeRejection(200, padded), null);
   });
 
-  it("refuses a body that is valid JSON but not an object of strings", () => {
-    for (const body of ["[]", '"UP"', "42", "null", 'true', '{"name":1,"version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}']) {
-      assert.notEqual(app.probeRejection(200, Buffer.from(body)), null, body);
+  it("refuses a body that is valid JSON but not an object, with the shared reason", () => {
+    // Every reason below was produced by running the same bytes through all
+    // three implementations and diffing the output, so this table is a
+    // transcription of a measured three-way agreement rather than a description
+    // of what this one implementation happens to say. Pinned as literals because
+    // an operator greps one deployment's logs, not one language's.
+    const notAnObject = "body is not a JSON object and carries no status field";
+    for (const text of ["[]", '"UP"', "42", "null", "true", "false"]) {
+      assert.equal(app.probeRejection(200, Buffer.from(text, "utf8")), notAnObject, text);
     }
+    // An empty body never becomes a document at all, so it is settled one step
+    // earlier - while parsing - and carries the malformed reason instead.
+    assert.equal(
+      app.probeRejection(200, Buffer.alloc(0)),
+      "body is not the expected JSON document",
+    );
+  });
+
+  it("words every field rejection exactly as the other two implementations word it", () => {
+    const rest = '"version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}';
+    const rows = [
+      ["numeric name", `{"name":1,${rest}`, "the name field is not a non-empty string"],
+      ["null name", `{"name":null,${rest}`, "the name field is not a non-empty string"],
+      ["boolean name", `{"name":true,${rest}`, "the name field is not a non-empty string"],
+      ["object name", `{"name":{},${rest}`, "the name field is not a non-empty string"],
+      [
+        "numeric status",
+        '{"name":"n","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":1}',
+        "the status field is not the expected value",
+      ],
+      [
+        "numeric version",
+        '{"name":"n","version":1,"timestamp":"2026-07-29T08:00:00Z","status":"UP"}',
+        "the version field is not a three-part dotted numeric version",
+      ],
+      [
+        "numeric timestamp",
+        '{"name":"n","version":"1.1.0","timestamp":1,"status":"UP"}',
+        "the timestamp field is not a whole-second UTC instant",
+      ],
+    ];
+    for (const [label, text, expected] of rows) {
+      assert.equal(app.probeRejection(200, Buffer.from(text, "utf8")), expected, label);
+    }
+
+    // A name of nothing but spaces is ACCEPTED by all three: the rule is
+    // non-empty, not non-blank. Asserted so the shared rule cannot be tightened
+    // in one implementation alone, which would make two of them disagree about a
+    // deployment whose configured name is a space.
+    assert.equal(
+      app.probeRejection(200, Buffer.from(`{"name":"   ",${rest}`, "utf8")),
+      null,
+    );
   });
 });
 
-/* -------------------------------------------------------------------------- *
- * H. Listener budgets and connection reuse
- *
- * Node's defaults leave a half-sent request holding a socket for a minute and a
- * complete one for five, which is far longer than a health endpoint ever needs
- * and long enough to be worth a peer's while. The budgets below are set
- * explicitly, and the last group asserts the seam every implementation shares: a
- * refused request that arrives WITH a body must not corrupt the next request on
- * the same connection.
- * -------------------------------------------------------------------------- */
+// H. Listener budgets and connection reuse. Node's defaults leave a half-sent
+// request holding a socket for a minute and a complete one for five, far longer
+// than a health endpoint needs and long enough to be worth a peer's while, so the
+// budgets below are set explicitly. The last group asserts the seam every
+// implementation shares: a refused request that arrives WITH a body must not
+// corrupt the next request on the same connection.
 
 describe("H. listener budgets and connection reuse", () => {
   let server;
@@ -1589,28 +1908,62 @@ describe("E. configuration precedence", () => {
     assert.match(config.version, VERSION_PATTERN);
   });
 
-  it("parses Java-native properties text, including its awkward cases", () => {
-    const parsed = app.parseProperties(
-      [
-        "# comment",
-        "! bang comment",
-        "   ",
-        "app.name=trimmed  ",
-        "  spaced.key  =  spaced value  ",
-        "empty.value=",
-        "weird=a=b=c",
-        "line-with-no-separator",
-        "=value-with-no-key",
-      ].join("\n"),
-    );
-    assert.equal(parsed["app.name"], "trimmed");
-    assert.equal(parsed["spaced.key"], "spaced value");
-    assert.equal(parsed["empty.value"], "");
-    // Only the first "=" separates key from value, so a value may contain "=".
-    assert.equal(parsed.weird, "a=b=c");
-    assert.equal("line-with-no-separator" in parsed, false);
-    assert.equal("" in parsed, false);
-    assert.equal("# comment" in parsed, false);
+  it("parses the shared grammar fixtures exactly as java.util.Properties does", () => {
+    // The cross-language contract: one file must mean one thing in three
+    // languages. Every expectation in SHARED_PROPERTIES_FIXTURES came out of
+    // java.util.Properties.load, which is how User.java reads the same file, and
+    // the identical table - same labels, same text, same expectations - appears
+    // in test_app.py and UserTest.java. A suite that asserted what its own parser
+    // happens to do could not detect the divergence it exists to prevent, which is
+    // why every expectation here is the reference implementation's and not this
+    // one's.
+    for (const [label, text, expected] of SHARED_PROPERTIES_FIXTURES) {
+      const parsed = app.parseProperties(text);
+      assert.deepEqual(
+        Object.keys(parsed).sort(),
+        Object.keys(expected).sort(),
+        `${label}: key set`,
+      );
+      for (const key of Object.keys(expected)) {
+        assert.equal(parsed[key], expected[key], `${label}: value of ${JSON.stringify(key)}`);
+      }
+    }
+  });
+
+  it("refuses a malformed unicode escape rather than reading it literally", () => {
+    // The one condition under which Properties.load rejects a document outright.
+    for (const [label, text] of SHARED_MALFORMED_PROPERTIES) {
+      assert.throws(() => app.parseProperties(text), RangeError, label);
+    }
+  });
+
+  it("warns once and uses the defaults when the file is malformed", () => {
+    const file = writePropertiesFile(["app.name=x\\u12"]);
+    const { value, written } = withStderr(() => app.loadConfig({ file, env: {} }));
+    assert.equal(value.name, app.DEFAULTS["app.name"]);
+    assert.equal(written, `index.js: ${MALFORMED_CONFIG_WARNING}\n`);
+  });
+
+  it("warns once and uses the defaults when the file cannot be read", () => {
+    // A directory standing where the file should be is the portable way to make
+    // a read fail: a permission bit does not stop the root user a container build
+    // commonly runs as, so it would make the test pass for the wrong reason.
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "health-unreadable-"));
+    temporaryDirectories.push(directory);
+    const { value, written } = withStderr(() => app.loadConfig({ file: directory, env: {} }));
+    assert.equal(value.name, app.DEFAULTS["app.name"]);
+    assert.equal(written, `index.js: ${UNREADABLE_CONFIG_WARNING}\n`);
+  });
+
+  it("treats bytes that are not UTF-8 as a read failure, never as U+FFFD", () => {
+    // `fs.readFileSync(file, "utf8")` would substitute U+FFFD and report nothing,
+    // turning a file Java refuses to read at all into a configuration full of
+    // replacement characters - and that configuration reaches the published name
+    // field, so the read here is fatal instead.
+    const file = writePropertiesBytes(Buffer.from([0x61, 0x3d, 0xc3, 0x28, 0x0a]));
+    const { value, written } = withStderr(() => app.loadConfig({ file, env: {} }));
+    assert.equal(value.name, app.DEFAULTS["app.name"]);
+    assert.equal(written, `index.js: ${UNREADABLE_CONFIG_WARNING}\n`);
   });
 
   it("does not mutate the real process environment", () => {
@@ -1620,5 +1973,310 @@ describe("E. configuration precedence", () => {
     for (const key of CONFIG_ENV_KEYS) {
       assert.equal(process.env[key], ENV_SNAPSHOT[key], `${key} must be untouched by the suite`);
     }
+  });
+});
+
+// I. Mode dispatch through the real entry point. What is under test is the WIRING
+// at the foot of index.js: that `--serve` reaches the listener, that `--probe`
+// reaches the self-check, and that the self-check's verdict becomes the process
+// exit status an orchestrator reads. None of that can be established by calling
+// serve() or probe() directly - those tests are above and would pass even if the
+// dispatcher ignored both flags - and none of it in process, because the exit
+// status IS the contract and only a real child has one.
+//
+// Every child runs with the health variables stripped from its environment and this
+// suite's own values put in, so a developer with HEALTH_PATH exported cannot fail
+// the suite; and on a port the kernel has just confirmed free, so the application
+// already running on its configured port cannot fail it either.
+//
+// Standard output is asserted EMPTY for both modes: it carries this program's legacy
+// output and is hashed by a committed baseline, so a mode that wrote one line to it
+// would break that hash while looking perfectly healthy.
+
+describe("I. mode dispatch through the real entry point", () => {
+  /** Every child started here, so the hook below can end one a test left running. */
+  const children = [];
+  /** Every hostile server started here, closed by the same hook. */
+  const servers = [];
+
+  after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill();
+      }
+    }
+    for (const server of servers) {
+      await new Promise((resolve) => (server.listening ? server.close(() => resolve()) : resolve()));
+    }
+  });
+
+  /**
+   * The ambient environment with every health variable removed, then `overrides`.
+   */
+  function childEnv(overrides) {
+    const environment = { ...process.env };
+    for (const key of CONFIG_ENV_KEYS) {
+      delete environment[key];
+    }
+    return { ...environment, ...overrides };
+  }
+
+  /**
+   * Starts a child that is expected to keep running, streams captured in strings.
+   *
+   * @returns {{child: import("node:child_process").ChildProcess,
+   *            output: {stdout: string, stderr: string}}} The child and its streams.
+   */
+  function startChild(args, environment) {
+    const child = spawn(process.execPath, args, { cwd: __dirname, env: environment });
+    children.push(child);
+    const output = { stdout: "", stderr: "" };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => (output.stdout += chunk));
+    child.stderr.on("data", (chunk) => (output.stderr += chunk));
+    return { child, output };
+  }
+
+  /**
+   * Runs a child that ends on its own and resolves its whole outcome.
+   *
+   * Asynchronous on purpose. spawnSync would block this process's event loop,
+   * which would stop an in-process hostile server from ever accepting the
+   * child's connection - measured: every such probe timed out instead of
+   * reaching the answer under test.
+   *
+   * @returns {Promise<{status: number|null, stdout: string, stderr: string}>} Outcome.
+   */
+  function runChild(args, environment) {
+    return new Promise((resolve, reject) => {
+      const { child, output } = startChild(args, environment);
+      child.once("error", reject);
+      child.once("close", (status) => resolve({ status, ...output }));
+    });
+  }
+
+  /**
+   * Waits until `port` accepts a connection, failing with the child's stderr if
+   * the child died instead of serving.
+   *
+   * @returns {Promise<void>} Resolves once the port accepts.
+   */
+  async function awaitListener(child, output, port) {
+    const deadline = Date.now() + CHILD_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (child.exitCode !== null) {
+        assert.fail(`the server exited instead of serving: ${output.stderr}`);
+      }
+      const accepted = await new Promise((resolve) => {
+        const socket = net.connect(port, LOOPBACK);
+        socket.once("connect", () => {
+          socket.destroy();
+          resolve(true);
+        });
+        socket.once("error", () => resolve(false));
+      });
+      if (accepted) {
+        return;
+      }
+      await pause(50);
+    }
+    assert.fail(`nothing accepted on port ${port} within ${CHILD_TIMEOUT_MS} ms`);
+  }
+
+  /**
+   * Ends a server child and resolves once it has gone.
+   */
+  function stopChild(child) {
+    if (child.exitCode !== null) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      child.once("close", () => resolve());
+      child.kill();
+    });
+  }
+
+  /**
+   * Binds a server on loopback that answers every request with `body` verbatim.
+   *
+   * The point is to hand the probe an answer the real implementation would never
+   * produce - bytes that are not UTF-8, or a document naming a member twice -
+   * which is the only way to exercise the probe's refusal path end to end.
+   *
+   * @param {Buffer} body Exact response body.
+   * @returns {Promise<{server: import("node:http").Server, port: number}>} The server.
+   */
+  function serveExactBody(body) {
+    return new Promise((resolve) => {
+      const server = http.createServer((_request, response) => {
+        response.writeHead(200, {
+          "Content-Type": EXPECTED_CONTENT_TYPE,
+          "Content-Length": body.length,
+        });
+        response.end(body);
+      });
+      servers.push(server);
+      server.listen(0, LOOPBACK, () => resolve({ server, port: server.address().port }));
+    });
+  }
+
+  it("the --serve flag serves the endpoint and writes nothing to stdout", async () => {
+    const port = await unusedPort();
+    const environment = childEnv({ APP_HOST: LOOPBACK, PORT: String(port) });
+    const { child, output } = startChild(["index.js", "--serve"], environment);
+    await awaitListener(child, output, port);
+
+    const response = await request({ port, path: "/health" });
+    assert.equal(response.status, 200);
+    const payload = JSON.parse(response.body);
+    assert.deepStrictEqual(Object.keys(payload), EXPECTED_KEYS);
+    assert.equal(payload.status, EXPECTED_STATUS);
+
+    await stopChild(child);
+    assert.equal(output.stdout, "", "--serve must not write to standard output");
+    assert.ok(!output.stdout.includes("12"), "the legacy output must not appear in serve mode");
+    // The startup banner names the port actually bound and the route actually
+    // answered, so it cannot promise an endpoint that does not exist.
+    assert.match(output.stderr, /health endpoint listening on http:\/\/127\.0\.0\.1:\d+\/health\n$/);
+    assert.ok(output.stderr.includes(String(port)));
+  });
+
+  it("the --probe flag exits 0 against the running listener, in silence", async () => {
+    const port = await unusedPort();
+    const environment = childEnv({ APP_HOST: LOOPBACK, PORT: String(port) });
+    const { child, output } = startChild(["index.js", "--serve"], environment);
+    await awaitListener(child, output, port);
+
+    const probed = await runChild(["index.js", "--probe"], environment);
+    await stopChild(child);
+    assert.equal(probed.status, 0, probed.stderr);
+    assert.equal(probed.stdout, "");
+    assert.equal(probed.stderr, "", "a healthy probe is silent");
+  });
+
+  it("the --probe flag exits 1 when nothing is listening", async () => {
+    // Fail closed. A probe's caller acts on this status and only this.
+    const environment = childEnv({ APP_HOST: LOOPBACK, PORT: String(await unusedPort()) });
+    const probed = await runChild(["index.js", "--probe"], environment);
+    assert.equal(probed.status, 1);
+    assert.equal(probed.stdout, "");
+    assert.equal(probed.stderr.split("\n").filter(Boolean).length, 1, probed.stderr);
+    assert.match(probed.stderr, /probe could not reach/);
+  });
+
+  it("the --probe flag follows the configured health path", async () => {
+    // Both modes read the same configuration, or the probe grades a stranger.
+    const port = await unusedPort();
+    const served = childEnv({ APP_HOST: LOOPBACK, PORT: String(port), HEALTH_PATH: "/healthz" });
+    const { child, output } = startChild(["index.js", "--serve"], served);
+    await awaitListener(child, output, port);
+
+    const agreeing = await runChild(["index.js", "--probe"], served);
+    const disagreeing = await runChild(
+      ["index.js", "--probe"],
+      childEnv({ APP_HOST: LOOPBACK, PORT: String(port), HEALTH_PATH: "/health" }),
+    );
+    await stopChild(child);
+    assert.equal(agreeing.status, 0, agreeing.stderr);
+    assert.equal(disagreeing.status, 1);
+    assert.match(disagreeing.stderr, /the endpoint answered status 404/);
+  });
+
+  it("the --probe flag exits 1 when the answer is not valid UTF-8", async () => {
+    // D1, END TO END. The in-process assertions above prove probeRejection refuses
+    // these bytes; this proves the refusal reaches the exit status a health probe's
+    // caller reads. A lossy decode would turn one bad byte into U+FFFD, the document
+    // would then satisfy every field rule, and the child would exit 0.
+    const malformed = Buffer.concat([
+      Buffer.from('{"name":"', "utf8"),
+      Buffer.from([0xc3, 0x28]),
+      Buffer.from('","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}', "utf8"),
+    ]);
+    const { server, port } = await serveExactBody(malformed);
+    const probed = await runChild(
+      ["index.js", "--probe"],
+      childEnv({ APP_HOST: LOOPBACK, PORT: String(port) }),
+    );
+    await new Promise((resolve) => server.close(() => resolve()));
+
+    assert.equal(probed.status, 1, "a body that is not UTF-8 must probe as unhealthy");
+    assert.equal(probed.stdout, "");
+    assert.equal(
+      probed.stderr,
+      "index.js: probe rejected: body is not the expected JSON document\n",
+    );
+  });
+
+  it("the --probe flag exits 1 when the answer names a member twice", async () => {
+    // D8, END TO END, with the reason pinned: a duplicate is settled while parsing,
+    // so the child must report the malformed-document reason and not a field reason.
+    const duplicated = Buffer.from(
+      '{"name":"n","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP","status":"DOWN"}',
+      "utf8",
+    );
+    const { server, port } = await serveExactBody(duplicated);
+    const probed = await runChild(
+      ["index.js", "--probe"],
+      childEnv({ APP_HOST: LOOPBACK, PORT: String(port) }),
+    );
+    await new Promise((resolve) => server.close(() => resolve()));
+
+    assert.equal(probed.status, 1);
+    assert.equal(
+      probed.stderr,
+      "index.js: probe rejected: body is not the expected JSON document\n",
+    );
+  });
+
+  it("the --probe flag exits 0 against a well-formed answer from the same harness", async () => {
+    // The control for the two rows above: the hostile harness itself is not what
+    // makes them fail. Same server, same code path, a well-formed body, exit 0.
+    const wellFormed = Buffer.from(
+      '{"name":"n","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}',
+      "utf8",
+    );
+    const { server, port } = await serveExactBody(wellFormed);
+    const probed = await runChild(
+      ["index.js", "--probe"],
+      childEnv({ APP_HOST: LOOPBACK, PORT: String(port) }),
+    );
+    await new Promise((resolve) => server.close(() => resolve()));
+
+    assert.equal(probed.status, 0, probed.stderr);
+    assert.equal(probed.stderr, "");
+  });
+
+  it("the --serve flag fails closed on an unusable port", async () => {
+    // An orchestrator must never see a success status from a dead listener.
+    const probed = await runChild(
+      ["index.js", "--serve"],
+      childEnv({ APP_HOST: LOOPBACK, PORT: "not-a-port" }),
+    );
+    assert.equal(probed.status, 1);
+    assert.equal(probed.stdout, "");
+    assert.match(probed.stderr, /cannot start the health server/);
+    assert.equal(probed.stderr.split("\n").filter(Boolean).length, 1, probed.stderr);
+  });
+
+  it("the --serve flag refuses an unpublishable configuration before binding", async () => {
+    // Validation happens before the bind, so nothing is ever served from it.
+    const probed = await runChild(
+      ["index.js", "--serve"],
+      childEnv({ APP_HOST: LOOPBACK, APP_VERSION: "one.two" }),
+    );
+    assert.equal(probed.status, 1);
+    assert.equal(probed.stdout, "");
+    assert.match(probed.stderr, /app\.version/);
+  });
+
+  it("an unrecognised flag still produces the legacy output and exits 0", async () => {
+    // The dispatcher's default branch is the original program. A flag it does not
+    // know must fall through to it rather than being treated as a mode.
+    const probed = await runChild(["index.js", "--nonsense"], childEnv({}));
+    assert.equal(probed.status, 0, probed.stderr);
+    assert.equal(probed.stdout, LEGACY_STDOUT);
+    assert.equal(Buffer.byteLength(probed.stdout), LEGACY_BYTE_LENGTH);
+    assert.equal(probed.stderr, "");
   });
 });
