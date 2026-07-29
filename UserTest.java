@@ -2118,6 +2118,38 @@ public class UserTest {
         }
     }
 
+    /**
+     * Re-derives the byte length of the document a LIVE listener in this process
+     * will serve, under the configuration this process actually resolved.
+     *
+     * <p>{@link #REFERENCE_BODY_BYTE_LENGTH} is the cross-language parity constant
+     * and it belongs to the document rendered from the SHIPPED name and version,
+     * which is where section B asserts it from explicit arguments. Using it as the
+     * expectation for a served answer as well silently adds a second claim - that
+     * the effective configuration IS the shipped one - and that claim is false the
+     * moment anything in the environment overrides {@code APP_NAME} or
+     * {@code APP_VERSION} with a value of a different length. A JVM cannot unset
+     * its own environment the way {@code test_app.py} and {@code index.test.js}
+     * can, so the expectation is re-derived here instead: same precedence order,
+     * same renderer, no ambient assumption. A CI runner, a container or a
+     * developer shell that exports either variable then changes the answer and the
+     * expectation together, and the framing assertion keeps testing framing.
+     *
+     * <p>Deterministic despite naming a live payload: {@code timestamp} is the only
+     * non-deterministic field and it is always the same fixed width, so
+     * {@link #REFERENCE_TIMESTAMP} stands in for the clock reading exactly. Length
+     * is still asserted as an absolute number rather than against the body that
+     * came back - a response whose declared length disagreed with the bytes it sent
+     * is precisely what these checks exist to catch.
+     *
+     * @return the exact number of UTF-8 bytes a contract answer must carry here
+     */
+    private static int expectedServedBodyByteLength() {
+        return User.renderPayload(expectedAppName(), expectedAppVersion(),
+                        REFERENCE_TIMESTAMP, STATUS_UP)
+                .getBytes(StandardCharsets.UTF_8).length;
+    }
+
     // Section F - live routing over a real socket. Unit checks prove the pieces;
     // only a real request proves the wiring. The server is bound on loopback with
     // port 0, so the OS chooses a free port: the documented default 8002 is never
@@ -2756,8 +2788,10 @@ public class UserTest {
                             CONTRACT_HEADER_NAMES, response.names());
                     checkMatches("the served document matches the frozen four-key shape",
                             PAYLOAD_SHAPE_PATTERN, bodyText(response));
+                    // The length this process's configuration renders, not the
+                    // parity constant: see expectedServedBodyByteLength.
                     checkRawContractHeaders("the served answer", response,
-                            REFERENCE_BODY_BYTE_LENGTH);
+                            expectedServedBodyByteLength());
                 });
 
         checkRawExchange(port, "the 404 answer, as bytes",
@@ -3146,13 +3180,14 @@ public class UserTest {
         // pay a handshake per poll. Reading three framed answers off one connection
         // also proves every Content-Length was accurate - an inaccurate one would
         // leave the next read starting mid-stream.
+        int framedLength = expectedServedBodyByteLength();
         try (RawConnection connection = new RawConnection(port)) {
             for (int attempt = 1; attempt <= 3; attempt++) {
                 RawResponse response = connection.send(good).readResponse();
                 checkEquals("request " + attempt + " of 3 on one connection is served",
                         HTTP_OK, response.status());
                 checkEquals("request " + attempt + " is framed accurately",
-                        REFERENCE_BODY_BYTE_LENGTH, response.body().length);
+                        framedLength, response.body().length);
             }
             check("a served connection is left open for reuse", !connection.peerHasClosed());
         } catch (IOException failure) {

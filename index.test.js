@@ -430,6 +430,56 @@ function withStderr(work) {
   }
 }
 
+/**
+ * Runs `work` with every health variable removed from process.env, restorably.
+ *
+ * Three documented call shapes resolve the AMBIENT environment because that is
+ * what the running application does: `loadConfig()`, `buildPayload()` and
+ * `renderPayload()`, each with no argument. Those shapes take no injected map,
+ * so an assertion about the bytes they produce is an assertion about the shell
+ * that started the runner as much as about this module: one exported APP_NAME of
+ * a different length, or an APP_VERSION one byte longer, renders a body of a
+ * different size and fails a perfectly correct implementation - and an APP_NAME
+ * carrying a control character or an out-of-range PORT makes the loader refuse
+ * outright, which the same assertion would report as a broken payload. Taking
+ * the six names out of the way first is what makes those shapes resolve the
+ * committed configuration and nothing else.
+ *
+ * This is NOT the global mutation the precedence tests avoid, and precedence is
+ * still never asserted through it. Nothing is added and no value is changed:
+ * only the names the loader consults are removed, only those that were actually
+ * present are put back, they are put back verbatim on every exit path including
+ * a thrown assertion, and `work` is synchronous - node:test runs the tests in a
+ * file one at a time, so no other test can observe the gap. The restoration is
+ * itself asserted twice: by the neutraliser's own test in group E and by "does
+ * not mutate the real process environment", which compares process.env against
+ * the snapshot taken before any test ran. test_app.py neutralises the same six
+ * names for the same reason (neutralize_health_environment), so both suites are
+ * hermetic on the same terms rather than each on its own.
+ *
+ * @template T
+ * @param {() => T} work Invoked once, with the variables removed.
+ * @returns {T} Whatever `work` returned.
+ */
+function withoutConfigEnvironment(work) {
+  // Only the names that are actually set, so a name the caller's environment
+  // never had is not created by the restoration.
+  const removed = new Map();
+  for (const key of CONFIG_ENV_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(process.env, key)) {
+      removed.set(key, process.env[key]);
+      delete process.env[key];
+    }
+  }
+  try {
+    return work();
+  } finally {
+    for (const [key, value] of removed) {
+      process.env[key] = value;
+    }
+  }
+}
+
 /** Every temporary directory created by the suite, removed by the hook below. */
 const temporaryDirectories = [];
 
@@ -640,7 +690,20 @@ describe("B. health payload contract", () => {
 
   it("builds a payload from the ambient configuration when none is supplied", () => {
     // A caller that has no configuration in hand must still get a valid payload.
-    for (const payload of [app.buildPayload(), app.buildPayload(undefined), app.buildPayload(null)]) {
+    //
+    // "Ambient" is pinned to the committed configuration by removing the health
+    // variables first. Otherwise a developer whose shell exports a value the
+    // loader legitimately refuses - an out-of-range PORT, a HEALTH_PATH that is
+    // not a request target - would see this test throw, reporting an
+    // environment problem as a payload defect. That the environment DOES
+    // outrank the file is a separate claim, asserted in group E through
+    // injected maps.
+    const payloads = withoutConfigEnvironment(() => [
+      app.buildPayload(),
+      app.buildPayload(undefined),
+      app.buildPayload(null),
+    ]);
+    for (const payload of payloads) {
       assert.deepStrictEqual(Object.keys(payload), EXPECTED_KEYS);
       assert.equal(payload.status, EXPECTED_STATUS);
     }
@@ -677,7 +740,19 @@ describe("B. health payload contract", () => {
     // satisfies the contract - a caller holding only a config should not have
     // to build a payload first.
     const config = fixedConfig();
-    const bodies = [app.renderPayload(config), app.renderPayload(app.buildPayload(config)), app.renderPayload()];
+    // The third shape is the only one of the three that resolves the ambient
+    // environment, so it is called with the health variables out of the way.
+    // fixedConfig() already excludes them, so all three then resolve one
+    // source - the committed properties file over the built-in defaults - and
+    // the agreement asserted below is a property of the CALL SHAPES. Without
+    // that, an APP_NAME or APP_VERSION exported in the shell running the suite
+    // changes the third body's length alone and fails this test for a reason
+    // that has nothing to do with what it is testing.
+    const bodies = [
+      app.renderPayload(config),
+      app.renderPayload(app.buildPayload(config)),
+      withoutConfigEnvironment(() => app.renderPayload()),
+    ];
     for (const body of bodies) {
       const parsed = JSON.parse(body);
       assert.deepStrictEqual(Object.keys(parsed), EXPECTED_KEYS);
@@ -1966,10 +2041,87 @@ describe("E. configuration precedence", () => {
     assert.equal(written, `index.js: ${UNREADABLE_CONFIG_WARNING}\n`);
   });
 
+  it("neutralises the ambient health variables and restores them exactly", () => {
+    // The harness invariant the two ambient-resolving assertions in group B
+    // rest on, asserted rather than assumed: if the restoration ever stopped
+    // working, every later test in this file - and anything the runner spawns
+    // afterwards - would silently inherit a variable planted here, and the
+    // suite would start reporting the leak as a product defect.
+    //
+    // This is the one test that plants real variables, because the neutraliser
+    // is what it is testing and a removal cannot be observed without something
+    // to remove. Everything it plants is snapshotted first and put back in the
+    // finally below, and the last two assertions prove that the environment
+    // this test was handed is the environment it leaves behind. test_app.py's
+    // neutralizer is self-tested the same way for the same reason.
+    const planted = { APP_NAME: "ambient-name", APP_VERSION: "9.9.9", PORT: "" };
+    const witness = "INDEX_TEST_UNRELATED_WITNESS";
+    const saved = new Map(
+      [...CONFIG_ENV_KEYS, witness].map((key) => [
+        key,
+        Object.prototype.hasOwnProperty.call(process.env, key) ? process.env[key] : undefined,
+      ]),
+    );
+
+    try {
+      Object.assign(process.env, planted);
+      process.env[witness] = "kept";
+
+      const inside = withoutConfigEnvironment(() => {
+        for (const key of CONFIG_ENV_KEYS) {
+          assert.ok(!(key in process.env), `${key} must be absent for the duration`);
+        }
+        // A variable the loader never consults is none of the neutraliser's
+        // business and must survive untouched.
+        assert.equal(process.env[witness], "kept");
+        // The property group B depends on: with the variables out of the way,
+        // the ambient resolution IS the committed file over the defaults.
+        return app.loadConfig();
+      });
+      assert.deepStrictEqual(inside, fixedConfig());
+
+      // Everything planted comes back verbatim - including the empty string,
+      // which a truthiness test would drop and a delete-everything restoration
+      // would turn into an absent variable.
+      assert.equal(process.env.APP_NAME, "ambient-name");
+      assert.equal(process.env.APP_VERSION, "9.9.9");
+      assert.equal(process.env.PORT, "");
+      assert.ok("PORT" in process.env, "an empty value must be restored as present");
+
+      // And it comes back when the body throws, not only when it returns. A
+      // restoration that only ran on the happy path would leak on exactly the
+      // occasion that matters - a failing assertion inside the scope.
+      assert.throws(
+        () =>
+          withoutConfigEnvironment(() => {
+            throw new Error("planted failure");
+          }),
+        /planted failure/,
+      );
+      assert.equal(process.env.APP_NAME, "ambient-name");
+      assert.equal(process.env.PORT, "");
+    } finally {
+      for (const [key, value] of saved) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+
+    for (const key of CONFIG_ENV_KEYS) {
+      assert.equal(process.env[key], ENV_SNAPSHOT[key], `${key} must be restored by this test`);
+    }
+    assert.equal(process.env[witness], saved.get(witness), "the witness must be restored");
+  });
+
   it("does not mutate the real process environment", () => {
-    // Precedence is exercised exclusively through injected maps. A suite that
-    // wrote to process.env would leak state into every later test in the file
-    // and into anything the runner spawns afterwards.
+    // Precedence is exercised exclusively through injected maps, and the one
+    // helper that touches process.env at all puts back exactly what it removed.
+    // A suite that wrote to process.env and left it written would leak state
+    // into every later test in the file and into anything the runner spawns
+    // afterwards.
     for (const key of CONFIG_ENV_KEYS) {
       assert.equal(process.env[key], ENV_SNAPSHOT[key], `${key} must be untouched by the suite`);
     }
