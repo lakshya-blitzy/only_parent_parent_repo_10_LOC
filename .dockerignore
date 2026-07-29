@@ -1,0 +1,58 @@
+# ==============================================================================
+# .dockerignore - build-context hygiene for the container targets.
+# ==============================================================================
+# Excludes version-control metadata and build artifacts from the build context
+# so image builds are reproducible regardless of local working-tree state. A
+# stale __pycache__/ or *.class left behind by a local test run must never be
+# uploaded to the daemon, and must never shadow a freshly copied source.
+#
+# Semantics are NOT .gitignore semantics: each pattern is matched against the
+# BUILD CONTEXT ROOT, so plain names and directory patterns are used - never a
+# leading "/" anchor, and never a "*" / "!" allowlist inversion, which would be
+# needlessly error-prone for a context this small. Excluding a directory also
+# excludes everything beneath it.
+#
+# The pattern set mirrors the generated-artifact set in .gitignore and adds the
+# repository and CI metadata that Git tracks but no image needs. Nothing a
+# Dockerfile COPY instruction names is listed here: app.py, index.js, User.java
+# and app.config.properties all stay in the context. Excluding
+# app.config.properties in particular would leave every container silently
+# falling back to built-in defaults instead of the shared configuration.
+# ==============================================================================
+
+# Version-control and build metadata - describes the repository, not its runtime
+.git
+.gitignore
+.dockerignore
+
+# CI definition - the workflow runs on the runner, never inside an image
+.github
+
+# Python bytecode and test cache - written by `import app`, py_compile, unittest
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Java build output - `javac -d classes` writes classes/, plain `javac` writes
+# *.class beside the source; the java-build stage compiles from source instead
+*.class
+classes/
+
+# Node dependencies - this project is dependency-free, so nothing is installed
+# today; the pattern keeps an installed tree out of the context regardless
+node_modules/
+
+# Local virtual environments - the provisioned interpreter lives outside the
+# repository, so any environment created here is a purely local artifact
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment overrides - exact names, so the committed reference file
+# .env.example stays in the context
+.env
+.env.local
+
+# Platform agent artifacts (screenshots / screen recordings)
+blitzy/

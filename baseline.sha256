@@ -1,0 +1,57 @@
+# baseline.sha256 - backward-compatibility baseline for the legacy default output
+# of index.js. This file is the mechanism behind acceptance gate G6: the legacy
+# standard output of the JavaScript application must hash to the value recorded on
+# the last line of this file. It exists so that a regression in the default
+# invocation fails loudly and mechanically, rather than depending on a reviewer
+# noticing that five lines of "12" turned into four.
+#
+# WHAT IS HASHED
+#   The bytes written to STANDARD OUTPUT by `node index.js` invoked with no
+#   arguments: 15 bytes, "12\n" repeated five times - the result of add(5, 7)
+#   printed by the five original console.log statements - with exit status 0.
+#
+# WHAT IS DELIBERATELY NOT HASHED
+#   - The source text of index.js. The contract is the observable behaviour, not
+#     the implementation, so a legitimate edit to index.js must never move this
+#     value. Hashing the source would break on every edit and would prove nothing
+#     about behaviour.
+#   - Standard error. The --serve and --probe diagnostics are written to stderr
+#     precisely so that they can never pollute the hashed stream, so capture
+#     stdout alone (`2>/dev/null`, or a separate redirect) and never `2>&1`.
+#   - The Python and Java default outputs. Those are asserted directly in the
+#     workflow ("Hello Lakshya" and "Test") and are deliberately not recorded here.
+#
+# PRODUCING RUNTIME: Node.js 24.18.0 (pinned in .nvmrc)
+#   Recording the producing runtime is mandatory provenance: a baseline committed
+#   without its runtime version creates a check that can fail for the wrong
+#   reason. The value is a SHA-256 over a fixed 15-byte sequence, so it is
+#   content-based and therefore runtime-independent - it was re-verified
+#   byte-identical on the runtime installed in this environment, v22.23.1, which
+#   satisfies the engines.node floor of >=22.12.0 declared in package.json.
+#
+# VERIFY (must print the hash recorded on the last line):
+#   node index.js | sha256sum
+#
+# GATE G6 (fails closed - non-zero exit on mismatch, never retried):
+#   expected="$(grep -v '^#' baseline.sha256 | awk 'NF{print $1; exit}')"
+#   actual="$(node index.js | sha256sum | awk '{print $1}')"
+#   test "$expected" = "$actual" && echo "G6 PASS" || { echo "G6 FAIL"; exit 1; }
+#
+# ON MISMATCH
+#   Fix forward in index.js. A mismatch means the default branch of the entry
+#   point no longer produces the bytes it has always produced, which is a
+#   backward-compatibility failure. Never regenerate this hash to make the gate
+#   pass: the recorded value IS the contract, and rewriting it would silently
+#   discard the behaviour the gate exists to protect. In particular, the five
+#   identical writes are the output contract - they are not to be de-duplicated
+#   or collapsed into a loop.
+#
+# FORMAT
+#   One sha256sum-style record: 64 lowercase hexadecimal digits, two spaces, then
+#   a label. The label names a byte stream rather than a file on disk, so
+#   `sha256sum -c baseline.sha256` is not the supported check and is expected to
+#   report a missing file; use the extraction command above instead. Every other
+#   line here is a comment beginning with '#', there are no blank lines, and the
+#   record is always the last line, so any `grep -v '^#'` or `awk '!/^#/'`
+#   extraction yields it.
+56990d15cb2da6455eec9f9d56432fdeb611e39388f4764725129962343e5fc4  legacy-index-js-stdout
