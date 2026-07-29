@@ -1,25 +1,12 @@
-# .dockerignore - build-context filter for the multi-stage Dockerfile at the repository root.
+# Build-context filter for `docker build`: a container build works from source only, so generated
+# output, editor state, and version-control metadata are kept out of the context. This is NOT
+# .gitignore - several paths excluded below are deliberately tracked in Git.
 #
-# Intent (least-privilege, minimal-surface container): the SDK build stage restores, builds,
-# tests, and publishes from SOURCE ONLY. Nothing produced on a developer machine, no editor or
-# IDE state, and no version-control or CI metadata may enter the build context. That keeps the
-# context a few kilobytes, keeps layer caching honest, and - most importantly - stops host build
-# output from being copied in and poisoning the in-container restore, build, and publish.
+# WARNING - never add a pattern that matches a build input: a root build or configuration manifest,
+# the SDK pin, the editor-config file carrying the path-scoped analyzer exemption, or anything
+# under src/ or tests/.
 #
-# This is NOT .gitignore, and neither file substitutes for the other. The Docker-only entries
-# below (.github/, Dockerfile, .dockerignore, README.md, LICENSE) are deliberately TRACKED in
-# Git and must never be added to .gitignore; conversely .gitignore lists generated artifacts
-# whose only overlap with this file is the build-output section.
-#
-# WARNING - never add a pattern that matches anything the Dockerfile copies into the build
-# stage: the SDK pin, either Directory.*.props manifest, the root editor-config file that
-# carries the path-scoped analyzer exemption, the .sln, src/, or tests/. The in-container build
-# runs with code-style enforcement and warnings-as-errors, so silently dropping one of them
-# surfaces as an opaque "file not found" or analyzer failure rather than an obvious mistake.
-#
-# Patterns are matched against the context root. The recursive **/ form is used wherever an
-# artifact can occur at any depth (per-project bin/ and obj/ above all), and the plain form
-# where the path only ever exists at the root.
+# Patterns match against the context root; the recursive **/ form catches an artifact at any depth.
 
 ## Build output - regenerated inside the SDK stage; must never leak in from the host
 **/bin/

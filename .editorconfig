@@ -1,36 +1,31 @@
 # EditorConfig - https://editorconfig.org
-# Conventions for this repository are enforced by tooling rather than by convention alone, and
-# root = true stops the lookup right here, so no .editorconfig living above the repository can
-# leak settings into this build. Rationale for every section is documented inline below.
+# root = true stops the lookup here, so no .editorconfig above this repository leaks settings
+# into the build.
 root = true
 
 # ---------------------------------------------------------------------------------------------
 # How this file is enforced
 # ---------------------------------------------------------------------------------------------
 # Directory.Build.props switches on EnforceCodeStyleInBuild, which promotes the C# style rules
-# below out of the IDE and into the compiler as IDExxxx diagnostics, and it also switches on
-# TreatWarningsAsErrors together with CodeAnalysisTreatWarningsAsErrors, which makes any surviving
-# diagnostic a build failure. Every severity written below is therefore a deliberate decision
-# about what breaks the build - none of it is a cosmetic editor hint.
+# below into the compiler as IDExxxx diagnostics, and TreatWarningsAsErrors together with
+# CodeAnalysisTreatWarningsAsErrors, which makes any surviving diagnostic a build failure. Every
+# severity written below is therefore a decision about what breaks the build.
 #
 # Two policies are declared here and nowhere else:
 #   1. Formatting - character encoding, line endings, and indentation for every file type.
 #   2. C# style  - file-scoped namespaces, using-directive placement, required braces, and
 #                  explicit accessibility modifiers.
 #
-# The single diagnostic suppression in this entire repository also lives here, in the last
-# section, scoped by path to the test tree and explained in place. Suppressions belong in this
-# file - visible, commented, and narrow - never in a project file.
+# The single diagnostic suppression in this repository also lives here, in the last section,
+# scoped by path and explained in place. Suppressions belong in this file - visible, commented,
+# and narrow - never in a project file.
 
 # ---------------------------------------------------------------------------------------------
 # Every file
 # ---------------------------------------------------------------------------------------------
-# UTF-8 with line-feed endings is the repository-wide baseline. Every file that predates the
-# .NET 8 migration measured zero carriage returns, the ported programs are verified byte-for-byte
-# against the output of the originals, and that parity check is only meaningful while the streams
-# and the sources that produce them stay line-feed only - so this is a published guarantee of the
-# migration, not a preference. A final newline plus trimmed trailing whitespace keeps diffs
-# minimal and keeps every tool in the toolchain from reporting phantom last-line changes.
+# UTF-8 with line-feed endings is the repository-wide baseline. A final newline plus trimmed
+# trailing whitespace keeps diffs minimal and stops tools from reporting phantom last-line
+# changes.
 [*]
 charset = utf-8
 end_of_line = lf
@@ -39,110 +34,86 @@ trim_trailing_whitespace = true
 indent_style = space
 
 # ---------------------------------------------------------------------------------------------
-# C# source, MSBuild project files, and the solution - four-space indentation
+# C# source and MSBuild project/solution files - four-space indentation
 # ---------------------------------------------------------------------------------------------
-# Four spaces is the .NET convention and is what every *.cs file in src/ and tests/ uses. The
-# project system files are grouped with them so that the solution, the five project files, and
-# the code they build all read consistently.
+# Four spaces is the .NET convention. The project-system files are grouped with the code they
+# build so that both read consistently.
 [*.{cs,csproj,props,sln}]
 indent_size = 4
 
 # ---------------------------------------------------------------------------------------------
 # Data, workflow, and documentation files - two-space indentation
 # ---------------------------------------------------------------------------------------------
-# Two spaces suits the nesting-heavy formats: global.json, the GitHub Actions workflow, and the
-# README. It also matches what the workflow file must have to stay readable, since YAML encodes
-# structure entirely through indentation.
+# Two spaces suits the nesting-heavy formats, where JSON and YAML in particular carry structure
+# through indentation.
 [*.{json,yml,yaml,md}]
 indent_size = 2
 
 # ---------------------------------------------------------------------------------------------
 # C# style rules
 # ---------------------------------------------------------------------------------------------
-# Severity legend, and why the choice matters in this repository:
-#   warning - fatal, because TreatWarningsAsErrors is on. Reserved for the four conventions this
-#             repository genuinely guarantees across every one of its C# files, each of which was
-#             confirmed to hold before being made fatal.
+# Severity legend:
+#   warning - fatal, because TreatWarningsAsErrors is on. Reserved for the conventions every C#
+#             file in this repository satisfies.
 #   silent  - the preference is available to IDE refactorings but is never reported, and so can
 #             never fail a build.
 #
-# Why each enforced convention is written twice, once per syntax:
-#   * option = value:severity  - sets the preferred style. The value is honoured everywhere, but
-#     on this SDK band the ":severity" suffix is respected only by IDE live analysis; the
-#     command-line compiler ignores it. Every code-style rule is hidden or suggestion by default,
-#     and such analyzers are skipped entirely in a command-line build.
+# Each enforced convention is written twice, once per syntax, because the two forms are honoured
+# by different tools:
+#   * option = value:severity  - sets the preferred style. On this SDK band the ":severity"
+#     suffix is respected only by IDE live analysis; the command-line compiler ignores it.
 #   * dotnet_diagnostic.IDExxxx.severity - the rule-identifier form the compiler does honour, and
-#     therefore the only thing that turns a preference into a build failure.
-# Written with the suffix alone, these rules would silently pass a violating build: verified by
-# introducing a block-scoped namespace, which built clean until the rule-identifier line was
-# added and then failed with error IDE0161. Both forms are kept so that editors and the build
-# agree instead of drifting apart.
-#
-# Nothing below contradicts the shapes the port mandates: file-scoped namespaces in the Core
-# library and the test project, top-level statements in each Program.cs, an expression-bodied
-# Greeter.Greet, and a primary constructor on User. A style rule that the code does not satisfy
-# would be a fabricated build break, so no rule is asserted here speculatively.
+#     therefore the only form that turns a preference into a build failure.
+# Both are kept so that editors and the build agree instead of drifting apart.
 [*.cs]
 
 # Using directives sit above the namespace declaration, System-prefixed namespaces first, in a
-# single unbroken group. This is the shape of every Program.cs (using Blitzy.LegacyPort.Core;)
-# and of every test file.
+# single unbroken group.
 csharp_using_directive_placement = outside_namespace:warning
 dotnet_diagnostic.IDE0065.severity = warning
 dotnet_sort_system_directives_first = true
 dotnet_separate_import_directive_groups = false
 
-# Namespaces are file-scoped - namespace Blitzy.LegacyPort.Core; with no braces and no extra
-# indentation level - as used by Greeter.cs, Calculator.cs, User.cs and the three test files.
-# The three Program.cs entrypoints declare no namespace at all, so this rule never fires against
-# their top-level statements.
+# Namespaces are file-scoped - "namespace Blitzy.LegacyPort.Core;" with no braces and no extra
+# indentation level. A file that declares no namespace at all is unaffected by this rule.
 csharp_style_namespace_declarations = file_scoped:warning
 dotnet_diagnostic.IDE0161.severity = warning
 
 # Accessibility is always explicit on non-interface members, so no type or member ever relies on
-# C#'s default of internal or private. Interface members are exempt because C# only began
-# permitting modifiers on them recently and the default there is unambiguous.
+# C#'s default of internal or private. Interface members are exempt, where the default is
+# unambiguous.
 dotnet_style_require_accessibility_modifiers = for_non_interface_members:warning
 dotnet_diagnostic.IDE0040.severity = warning
 
-# Braces are required even on a single-statement body. The loop that reproduces the legacy
-# five-fold calculator output is braced for exactly this reason: an unbraced body is the classic
-# place where a later edit silently falls outside the loop.
+# Braces are required even on a single-statement body: an unbraced body is the classic place
+# where a later edit silently falls outside the block.
 csharp_prefer_braces = true:warning
 dotnet_diagnostic.IDE0011.severity = warning
 
-# Allman braces - the open brace on its own line - and indented switch sections, matching the
-# formatting of every hand-authored C# file here. These are whitespace preferences, so they are
-# deliberately left at the severity the analyzer set gives them: they guide editors and
-# "dotnet format" without promoting every stray space into a build failure, which is what raising
-# the whole-file formatting rule to a warning would do.
+# Allman braces - the open brace on its own line - and indented switch sections. These are
+# whitespace preferences, left at the severity the analyzer set gives them so that they guide
+# editors and "dotnet format" without promoting a stray space into a build failure.
 csharp_new_line_before_open_brace = all
 csharp_indent_case_contents = true
 
-# Expression-bodied members are permitted, never mandated. Greeter.Greet, Calculator.Add and
-# User.ToString are one-line expressions, while a test method that needs a block keeps one.
-# Recorded at silent so that neither shape is ever reported, and so that the concise form the
-# ported logic uses can never be turned into a build failure.
+# Expression-bodied members are permitted, never mandated. Recorded at silent so that neither the
+# concise nor the block form is ever reported.
 csharp_style_expression_bodied_methods = when_on_single_line:silent
 
 # ---------------------------------------------------------------------------------------------
 # Test tree - the only diagnostic suppression in this repository
 # ---------------------------------------------------------------------------------------------
 # xUnit test methods follow the universal Method_Scenario_Expectation naming convention - for
-# example Greet_WithName_ReturnsExpectedGreeting - which collides head-on with CA1707,
-# "Identifiers should not contain underscores". The first strict build of this solution failed on
-# exactly that collision: one CA1707 error for every underscored test method, and not a single one
-# anywhere in production code. Deleting this section reproduces those errors immediately.
+# example Greet_WithName_ReturnsExpectedGreeting - whose underscores collide with CA1707,
+# "Identifiers should not contain underscores".
 #
 # The exemption is a path-scoped severity override here rather than a suppression property in the
-# test project file, because this way it stays visible in the conventions file, stays commented,
-# and stays confined to the test tree. CA1707 remains fatal for everything under src/, so the
-# zero-warning gate over the four production assemblies is completely untouched. This is also the
-# only rule anywhere in this file that is switched off; every other diagnostic keeps the severity
-# the analyzer set gives it.
+# test project file, so that it stays visible in the conventions file, stays commented, and stays
+# confined to the test tree. CA1707 remains fatal for everything under src/, leaving the
+# zero-warning gate over production code untouched, and this is the only rule in this file that is
+# switched off.
 #
-# This glob is coupled to the tests/ directory name. Renaming that directory silently disables the
-# exemption and brings every one of those CA1707 build errors straight back, so the two must move
-# together.
+# The glob is coupled to the tests/ directory name: renaming that directory disables the exemption
+# and makes every underscored test name a build error again, so the two must move together.
 [tests/**/*.cs]
 dotnet_diagnostic.CA1707.severity = none

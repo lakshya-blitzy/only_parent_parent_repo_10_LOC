@@ -1,46 +1,34 @@
 <Project>
 
-  <!--
-    Directory.Build.props - the single source of truth for target framework, language level, and
-    build-quality policy for EVERY project in this repository.
+    <!--
+        The single source of truth for target framework, language level, and build-quality policy.
+        Every project in this repository inherits these properties; package versions live in
+        Directory.Packages.props and the SDK is pinned in global.json.
+    -->
+    <PropertyGroup>
+        <!-- The ONLY TargetFramework declaration in this repository.
+             Changing .NET versions is a one-line change here. -->
+        <TargetFramework>net8.0</TargetFramework>
+        <LangVersion>12.0</LangVersion>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <InvariantGlobalization>true</InvariantGlobalization>
 
-    MSBuild imports this file automatically into each project, walking up from the project
-    directory to the first Directory.Build.props it finds, and evaluates it before the project
-    body. Every property below is therefore inherited by all five projects - the Core class
-    library, the three console executables, and the test project - without any of them restating
-    it. A project overrides an inherited value simply by redeclaring it, which is exactly how the
-    executables and the test project switch GenerateDocumentationFile off.
+        <!-- Quality gate: any warning is a build failure. -->
+        <AnalysisLevel>latest-Recommended</AnalysisLevel>
+        <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <CodeAnalysisTreatWarningsAsErrors>true</CodeAnalysisTreatWarningsAsErrors>
 
-    Package versions are deliberately absent here: they live in Directory.Packages.props under
-    NuGet Central Package Management. The SDK that interprets this file is pinned in global.json.
-  -->
-  <PropertyGroup>
-    <!-- The ONLY TargetFramework declaration in this repository.
-         Changing .NET versions is a one-line change here. -->
-    <TargetFramework>net8.0</TargetFramework>
-    <LangVersion>12.0</LangVersion>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <InvariantGlobalization>true</InvariantGlobalization>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <Deterministic>true</Deterministic>
+    </PropertyGroup>
 
-    <!-- Quality gate: any warning is a build failure. -->
-    <AnalysisLevel>latest-Recommended</AnalysisLevel>
-    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
-    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <CodeAnalysisTreatWarningsAsErrors>true</CodeAnalysisTreatWarningsAsErrors>
-
-    <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <Deterministic>true</Deterministic>
-  </PropertyGroup>
-
-  <!--
-    ContinuousIntegrationBuild normalizes the source paths embedded in assemblies and PDBs, which
-    is what makes CI output reproducible but would break local debugging. It is therefore scoped
-    to its own conditioned group and enabled only when the CI environment variable is set;
-    .github/workflows/ci.yml sets CI: true at job level, which activates this group.
-  -->
-  <PropertyGroup Condition="'$(CI)' == 'true'">
-    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
-  </PropertyGroup>
+    <!-- ContinuousIntegrationBuild normalizes the source paths embedded in assemblies and PDBs.
+         That makes output reproducible but breaks local debugging, so it is enabled only when the
+         CI environment variable is set to true. -->
+    <PropertyGroup Condition="'$(CI)' == 'true'">
+        <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    </PropertyGroup>
 
 </Project>

@@ -1,13 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <RootNamespace>Blitzy.LegacyPort.UserApp</RootNamespace>
-    <GenerateDocumentationFile>false</GenerateDocumentationFile>
-  </PropertyGroup>
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <RootNamespace>Blitzy.LegacyPort.UserApp</RootNamespace>
+        <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    </PropertyGroup>
 
-  <ItemGroup>
-    <ProjectReference Include="..\Blitzy.LegacyPort.Core\Blitzy.LegacyPort.Core.csproj" />
-  </ItemGroup>
+    <ItemGroup>
+        <ProjectReference Include="..\Blitzy.LegacyPort.Core\Blitzy.LegacyPort.Core.csproj" />
+    </ItemGroup>
 
 </Project>
