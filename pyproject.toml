@@ -1,54 +1,8 @@
-# ==============================================================================
-# pyproject.toml - project metadata and interpreter floor for the Python
-#                  application in this repository (app.py, test_app.py).
-# ==============================================================================
-#
-# WHAT THIS FILE IS - AND IS NOT
-#   It declares the Python project's identity and the minimum interpreter
-#   version its sources require. It is deliberately NOT a packaging manifest:
-#   this repository is a flat set of root-level scripts that is never built
-#   into a wheel or an sdist and never published, so no [build-system] table
-#   is declared and no build backend is implied. Nothing here has to be
-#   installed for the applications or their tests to run.
-#
-# ZERO THIRD-PARTY DEPENDENCIES - BY DESIGN
-#   The `dependencies` array below is present and empty on purpose. Every
-#   capability the Python side uses comes from the CPython standard library:
-#   http.server / socketserver (the /health listener), json (compact payload
-#   rendering), datetime (the UTC timestamp), os and sys (configuration
-#   resolution and argv dispatch), urllib.request / urllib.error (the
-#   in-process --probe client used by the container HEALTHCHECK), threading,
-#   and unittest (the test runner). No package is to be added here, and no
-#   requirements.txt exists or is to be created - it would be empty.
-#
-# INTERPRETER PINNING
-#   `requires-python` states the supported FLOOR only. The exact interpreter
-#   used locally and in CI is pinned in `.python-version` (3.14.6), which
-#   actions/setup-python reads natively, so the interpreter version lives in
-#   exactly one place and local and CI runs cannot diverge silently.
-#
-# VERSION - SINGLE SOURCE OF TRUTH
-#   `version` below must stay in step with `app.version` in
-#   app.config.properties, `version` in package.json, and the version stated
-#   in README.md. The CI version-consistency gate (G10) fails the build when
-#   any of those four disagree: change all four together, or none of them.
-#
-# RUNNING THE PYTHON SIDE
-#   python app.py                 -> legacy default output ("Hello Lakshya")
-#   python app.py --serve         -> serves the /health endpoint
-#   python app.py --probe         -> self-check; exit 0 healthy, 1 unhealthy
-#   python -m unittest discover -s . -p "test_*.py" -v
-#                                 -> runs the flat root-level unit tests
-# ==============================================================================
-
 [project]
 name = "only_parent_parent_repo_10_loc"
 version = "1.1.0"
 description = "Multi-language sample repository exposing a uniform /health endpoint."
 requires-python = ">=3.14"
 
-# Zero runtime dependencies by design - standard library only (see above).
-# Keep this array empty; there are also no optional-dependency extras, no
-# dependency groups, and no [tool.*] sections, because no third-party tool
-# (pytest, black, ruff, mypy, coverage, tox, poetry) is used by this project.
+# Standard library only, by design; requires-python is a floor, the exact pin lives in .python-version.
 dependencies = []

@@ -30,35 +30,52 @@
  *
  * ZERO DEPENDENCIES
  * -----------------
- * JDK only. The listener is a {@code java.net.ServerSocket} from java.base and
- * the self-check uses java.net.http, so no --add-modules flag, no build tool
- * and no third-party library is needed anywhere, for the application or for its
- * tests. The JDK ships no JSON serializer, and that is the one place this
- * implementation differs in mechanism from its Python and JavaScript siblings:
- * the payload is assembled by hand through an explicit escape helper, and the
- * result is byte-identical to theirs for identical configuration.
+ * JDK only. The listener is a {@code com.sun.net.httpserver.HttpServer} from the
+ * jdk.httpserver module and the self-check uses java.net.http, and both modules
+ * belong to the standard module set - jdk.httpserver requires nothing but
+ * java.base and exports com.sun.net.httpserver - so no --add-modules flag, no
+ * classpath addition, no build tool and no third-party library is needed
+ * anywhere, for the application or for its tests. The JDK ships no JSON
+ * serializer, and that is the one place this implementation differs in mechanism
+ * from its Python and JavaScript siblings: the payload is assembled by hand
+ * through an explicit escape helper, and the result is byte-identical to theirs
+ * for identical configuration.
  *
- * WHY THE LISTENER IS A RAW SOCKET AND NOT com.sun.net.httpserver
- * --------------------------------------------------------------
- * The frozen contract fixes the response header set at exactly Content-Type,
- * Cache-Control and Content-Length - plus Allow on a 405 - and fixes every
- * error body as JSON. com.sun.net.httpserver satisfies neither, and its default
- * executor introduces a denial of service; all four failures were reproduced by
- * execution before this listener replaced it:
- *   1. It writes its own Date response header, which an application cannot set,
- *      blank or remove.
- *   2. It normalises response header names, emitting "Content-type" where the
- *      other two implementations emit "Content-Type".
- *   3. It answers a request that its own URI or request-line parser rejects
- *      with its own HTML page - carrying no cache directives, and in one case
- *      naming the exception it caught - before any handler is reached.
- *   4. Its default executor runs every exchange on the single dispatcher
- *      thread, so one client that connects and then stalls mid-request blocks
- *      every other client for as long as it holds the socket.
- * Owning the socket removes all four at once: this class writes every response
- * byte itself and answers each connection on its own virtual thread. It also
- * needs nothing beyond java.base, so the container's JRE stage requires no
- * module that a JRE might omit.
+ * THE LISTENER, AND THE THREE DETAILS THE JDK SERVER DECIDES FOR ITSELF
+ * --------------------------------------------------------------------
+ * The listener is com.sun.net.httpserver.HttpServer, registered with a single
+ * root context so that every request reaches this class's own handler and is
+ * routed by the shared normalisation rules below rather than by the server's
+ * longest-prefix context matching. Its default executor would run every exchange
+ * on the single dispatcher thread, letting one stalled client block every other,
+ * so it is replaced with a virtual-thread-per-task executor.
+ *
+ * Three response details are written by the server and cannot be reached from
+ * application code. Each was established by execution rather than by reading,
+ * and each is recorded here because these are the only points where this
+ * implementation's bytes differ from app.py's and index.js's:
+ *   1. A Date response header is always present. Setting the field to a sentinel
+ *      value has it overwritten with the real date, and removing it after
+ *      sendResponseHeaders still sends it, because the server writes the field
+ *      itself immediately before the header block reaches the wire. RFC 9110
+ *      section 6.6.1 says an origin server SHOULD send Date, so the extra field
+ *      is conformant, and it discloses nothing about the runtime, so the least
+ *      disclosure property below is unaffected.
+ *   2. Response field names are normalised, so this server emits "Content-type"
+ *      where the other two emit "Content-Type". RFC 9110 makes field names
+ *      case-insensitive, so this is a difference in bytes and not in meaning,
+ *      which is why every assertion against these responses folds case.
+ *   3. A target of //health is answered 404 by the server itself, with an HTML
+ *      body, before this handler is reached: it parses //health as a network-path
+ *      reference whose authority is "health" and whose path is empty, so no
+ *      context matches. The status is the 404 the contract requires and the body
+ *      is a fixed string that echoes nothing from the request; only the media
+ *      type of that one error body differs from the other two implementations.
+ * The same server also answers a request line it cannot parse, and a request
+ * carrying more header fields than it accepts, without reaching this handler.
+ * Those answers are equally fixed strings that reflect no part of the request, so
+ * they disclose nothing; they are outside the contract because the contract
+ * enumerates three statuses and none of them is a transport rejection.
  *
  * DEFAULT UNNAMED PACKAGE
  * -----------------------
@@ -77,29 +94,28 @@
  *                         "UP"}
  *   GET any other path    404 and {"error":"Not Found"}
  *   Any other method      405, {"error":"Method Not Allowed"} and Allow: GET
- *   Malformed request     400 and {"error":"Bad Request"}
- *   Request line too long 414 and {"error":"URI Too Long"}
- *   Header block too big  431 and {"error":"Request Header Fields Too Large"}
- *   HTTP major not 1      505 and {"error":"HTTP Version Not Supported"}
  *   Headers set here      Content-Type: application/json
  *                         Cache-Control: no-cache, no-store, must-revalidate
  *                         Content-Length, from the encoded byte length
  *                         Allow: GET, on the 405 response only
- *                         Connection: close, on the four error statuses only,
- *                         which are the only responses after which this server
- *                         stops reading from the connection
  *
- * A 200, a 404 and a 405 therefore carry exactly three headers - no Date, no
- * Server, no Connection, no Keep-Alive - which is byte for byte the header set
- * app.py and index.js emit, so one case-insensitive assertion set covers all
- * three implementations.
+ * Those three statuses are the only ones this endpoint produces. Every response
+ * additionally carries the Date field described above, and an HTTP/1.0 request
+ * additionally receives the Connection: close the server adds because it will not
+ * hold such a connection open; neither field is set here and neither can be
+ * suppressed. No Server banner is emitted at all, by this class or by the server.
+ * A response to HEAD carries the same four fields as the equivalent response to
+ * any other refused method - Content-Length included, which is why that field is
+ * set explicitly below rather than left to the server - and no body.
  *
  * The query string is stripped before matching and one optional trailing slash
  * is accepted, so /health, /health/ and /health?x=1 all reach the endpoint.
  * Nothing else is forgiven: the request target is matched verbatim, with no
  * percent-decoding, no dot-segment resolution and no collapsing of repeated
  * leading slashes, so //health, /health%2f and /health/../health are all 404
- * exactly as they are in the other two implementations.
+ * exactly as they are in the other two implementations - with the single caveat
+ * that //health receives the server's own 404 rather than this endpoint's, as
+ * detail 3 above records.
  * A health response is never cacheable: a cached health answer is worse than
  * no health answer at all.
  *
@@ -118,34 +134,30 @@
  *
  * REQUEST CLASSIFICATION ORDER (identical in app.py, index.js and User.java)
  * -------------------------------------------------------------------------
- * Every request is graded in exactly this order, and the first rule that fires
- * decides the response. The order is what makes the three implementations agree
- * on requests that break more than one rule at once.
- *   1. A request line longer than {@value #MAX_REQUEST_LINE_BYTES} bytes -> 414.
- *   2. A request line that is not METHOD SP target SP HTTP-version, a method
- *      that is not an RFC 9110 token, or a target carrying a space, a control
- *      character or a byte outside visible US-ASCII -> 400.
- *   3. An HTTP major version other than 1 -> 505.
- *   4. A header block over {@value #MAX_HEADER_BLOCK_BYTES} bytes or over
- *      {@value #MAX_HEADER_FIELDS} fields -> 431.
- *   5. An HTTP/1.1 request with no Host header -> 400.
- *   6. Any method other than the exact token GET -> 405 with Allow: GET. This
- *      is total: HEAD, OPTIONS, CONNECT, TRACE, PROPFIND and any unknown token
- *      all reach it, and none of them is ever echoed back to the caller.
- *   7. Otherwise the normalised target either equals the configured route -> 200
+ * Every request that reaches this class's handler is graded in exactly this
+ * order, and the first rule that fires decides the response. The order is what
+ * makes the three implementations agree on requests that break more than one rule
+ * at once.
+ *   1. Any method other than the exact token GET -> 405 with Allow: GET. This is
+ *      total: HEAD, OPTIONS, CONNECT, TRACE, PROPFIND and any unknown token all
+ *      reach it, and none of them is ever echoed back to the caller.
+ *   2. Otherwise the normalised target either equals the configured route -> 200
  *      with the health document, or it does not -> 404.
+ * Method comparison is case-sensitive, as RFC 9110 requires: "get" is not GET and
+ * is answered 405 like any other unknown token.
  *
  * CONCURRENCY AND CONNECTION LIFETIME
  * -----------------------------------
- * One virtual thread per accepted connection, dispatched by a single non-daemon
- * acceptor thread that is also what keeps the process alive in --serve mode. A
- * stalled or half-open connection therefore costs one parked virtual thread and
- * nothing else; it cannot delay any other client. Every socket carries a
- * {@value #IDLE_TIMEOUT_MILLIS} ms idle timeout so a connection that goes quiet
- * mid-request is reclaimed rather than held forever, persistent connections are
- * reused for as many requests as the client sends, and a request body is drained
- * before the response so that an unwanted body cannot desynchronise the stream
- * or provoke a connection reset instead of a reply.
+ * One named virtual thread per exchange, handed out by the executor installed on
+ * the server, dispatched by the server's own non-daemon HTTP-Dispatcher thread.
+ * That thread is also what keeps the process alive in --serve mode: main returns
+ * as soon as the listener is up, and the JVM stays running until the dispatcher
+ * stops. A stalled or half-open connection therefore costs one parked virtual
+ * thread and nothing else; it cannot delay any other client. Every request body
+ * is drained, bounded at {@value #MAX_REQUEST_DRAIN_BYTES} bytes, before the
+ * response is written: bytes left unread make the kernel answer the close with a
+ * reset instead of letting the client read the reply, which was reproduced with a
+ * one-mebibyte POST and disappears once the body is drained.
  *
  * LEAST DISCLOSURE
  * ----------------
@@ -154,22 +166,23 @@
  * exception detail are never echoed to a caller, only to stderr. No
  * interpreter, framework or server banner is exposed.
  */
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
+import com.sun.net.httpserver.Headers;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
@@ -179,13 +192,21 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 public class User {
     /**
@@ -259,9 +280,6 @@ public class User {
      */
     private static final String CONFIG_FILE = "app.config.properties";
 
-    /** Optional absolute or relative override for the properties file path. */
-    private static final String CONFIG_FILE_ENV = "APP_CONFIG_FILE";
-
     private static final String KEY_APP_NAME = "app.name";
     private static final String ENV_APP_NAME = "APP_NAME";
     private static final String DEFAULT_APP_NAME = "only_parent_parent_repo_10_LOC";
@@ -306,67 +324,88 @@ public class User {
     /** The one and only value this endpoint reports for a passing status. */
     private static final String STATUS_UP = "UP";
 
-    /** What a healthy body must contain; used by the self-check. */
-    private static final String STATUS_UP_FRAGMENT = "\"status\":\"UP\"";
+    /** The payload's first key, and the first key the self-check requires. */
+    private static final String PAYLOAD_KEY_NAME = "name";
+
+    /** The payload's second key. */
+    private static final String PAYLOAD_KEY_VERSION = "version";
+
+    /** The payload's third key, the only non-deterministic one. */
+    private static final String PAYLOAD_KEY_TIMESTAMP = "timestamp";
+
+    /** The payload's fourth key, whose value must be {@value #STATUS_UP}. */
+    private static final String PAYLOAD_KEY_STATUS = "status";
 
     /**
-     * HTTP method tokens are case-sensitive per RFC 9110, so these comparisons
-     * are deliberately case-sensitive: "get" is not GET and is answered 405.
+     * The four payload keys, in the one order the contract freezes them in.
+     *
+     * <p>Order is part of the contract, not an artifact of how the document is
+     * built: the self-check compares a parsed document's key sequence against this
+     * list, so a body carrying the right four keys in the wrong order is refused.
+     * app.py holds the same tuple and index.js the same array.
+     */
+    private static final List<String> PAYLOAD_KEYS = List.of(
+            PAYLOAD_KEY_NAME, PAYLOAD_KEY_VERSION, PAYLOAD_KEY_TIMESTAMP, PAYLOAD_KEY_STATUS);
+
+    /**
+     * The rejection emitted when a probed body does not carry exactly
+     * {@link #PAYLOAD_KEYS} in order.
+     *
+     * <p>Written out as a literal rather than rendered from the list. An operator
+     * greps one deployment's logs, not one language's, so these bytes are identical
+     * in app.py, index.js and here - and {@code List.toString()} would print
+     * {@code [name, version, timestamp, status]}, unquoted and space-padded, which
+     * would make the same rejection read three different ways.
+     */
+    private static final String PROBE_KEY_SET_REASON =
+            "body does not carry exactly the keys "
+            + "[\"name\",\"version\",\"timestamp\",\"status\"] in order";
+
+    /**
+     * HTTP method tokens are case-sensitive per RFC 9110, so this comparison is
+     * deliberately case-sensitive: "get" is not GET and is answered 405. It is
+     * also the value of the {@code Allow} field on that 405.
      */
     private static final String METHOD_GET = "GET";
 
-    /** A HEAD response must carry no body, which is handled explicitly. */
+    /**
+     * The method whose response carries a header block but no body.
+     *
+     * <p>Named because {@link #sendResponse} has to recognise it: the server needs
+     * to be told that no body follows, and telling it that is also what suppresses
+     * the warning it logs when a body length is declared for a HEAD request.
+     */
     private static final String METHOD_HEAD = "HEAD";
 
     /**
-     * The complete response head, written verbatim on every contract response.
+     * The four response fields this class sets, and their values.
      *
-     * <p>Composed here rather than through a header map so that the field names,
-     * their casing and their order are literally the bytes that reach the wire:
-     * a 200, a 404 and a 405 carry these three fields and nothing else, matching
-     * app.py and index.js field for field.
+     * <p>They are set through the exchange's header map rather than written as
+     * bytes, so the server chooses their casing and their order on the wire; RFC
+     * 9110 makes field names case-insensitive, so that choice changes no meaning.
+     *
+     * <p>{@code Content-Length} is set explicitly even though the server derives
+     * the same value from the byte count handed to {@code sendResponseHeaders}. It
+     * has to be, for one response: on a HEAD request the server omits the field
+     * entirely unless it is already in the map, and RFC 9110 section 9.3.2 asks a
+     * HEAD response to carry the same fields a GET response would. Setting it here
+     * is what keeps this implementation's HEAD header set equal to app.py's and
+     * index.js's instead of one field short.
      */
-    private static final String HEADER_CONTENT_TYPE = "Content-Type: application/json";
-    private static final String HEADER_CACHE_CONTROL =
-            "Cache-Control: no-cache, no-store, must-revalidate";
-    private static final String HEADER_CONTENT_LENGTH_PREFIX = "Content-Length: ";
-    private static final String HEADER_ALLOW_GET = "Allow: " + METHOD_GET;
-    private static final String HEADER_CONNECTION_CLOSE = "Connection: close";
-
-    /** Line terminator required between HTTP header fields. */
-    private static final String CRLF = "\r\n";
-
-    /** Version this server speaks, and the only major version it accepts. */
-    private static final String HTTP_VERSION = "HTTP/1.1";
+    private static final String HEADER_CONTENT_TYPE = "Content-Type";
+    private static final String CONTENT_TYPE_JSON = "application/json";
+    private static final String HEADER_CACHE_CONTROL = "Cache-Control";
+    private static final String CACHE_CONTROL_NO_STORE = "no-cache, no-store, must-revalidate";
+    private static final String HEADER_CONTENT_LENGTH = "Content-Length";
+    private static final String HEADER_ALLOW = "Allow";
 
     private static final int HTTP_OK = 200;
-    private static final int HTTP_BAD_REQUEST = 400;
     private static final int HTTP_NOT_FOUND = 404;
     private static final int HTTP_METHOD_NOT_ALLOWED = 405;
-    private static final int HTTP_URI_TOO_LONG = 414;
-    private static final int HTTP_HEADERS_TOO_LARGE = 431;
-    private static final int HTTP_INTERNAL_ERROR = 500;
-    private static final int HTTP_VERSION_NOT_SUPPORTED = 505;
-
-    private static final String REASON_OK = "OK";
-    private static final String REASON_BAD_REQUEST = "Bad Request";
-    private static final String REASON_NOT_FOUND = "Not Found";
-    private static final String REASON_METHOD_NOT_ALLOWED = "Method Not Allowed";
-    private static final String REASON_URI_TOO_LONG = "URI Too Long";
-    private static final String REASON_HEADERS_TOO_LARGE = "Request Header Fields Too Large";
-    private static final String REASON_INTERNAL_ERROR = "Internal Server Error";
-    private static final String REASON_VERSION_NOT_SUPPORTED = "HTTP Version Not Supported";
 
     /** Fixed error bodies: nothing about the request is ever reflected back. */
-    private static final String BODY_BAD_REQUEST = "{\"error\":\"Bad Request\"}";
     private static final String BODY_NOT_FOUND = "{\"error\":\"Not Found\"}";
     private static final String BODY_METHOD_NOT_ALLOWED = "{\"error\":\"Method Not Allowed\"}";
-    private static final String BODY_URI_TOO_LONG = "{\"error\":\"URI Too Long\"}";
-    private static final String BODY_HEADERS_TOO_LARGE =
-            "{\"error\":\"Request Header Fields Too Large\"}";
-    private static final String BODY_INTERNAL_ERROR = "{\"error\":\"Internal Server Error\"}";
-    private static final String BODY_VERSION_NOT_SUPPORTED =
-            "{\"error\":\"HTTP Version Not Supported\"}";
 
     // -------------------------------------------------------------------------
     // Server, probe and formatting limits
@@ -375,58 +414,59 @@ public class User {
     /** The path every normalisation falls back to, and the route prefix. */
     private static final String ROOT_PATH = "/";
 
+    /**
+     * Context path registered on the server.
+     *
+     * <p>Deliberately the root path: the server matches contexts by longest
+     * prefix, so registering the configured health path directly would let the
+     * server decide what a near-miss target means, and a near-miss would then be
+     * answered by its HTML 404 rather than by this endpoint's JSON one. Taking
+     * every target and routing it here keeps the routing rules - and therefore the
+     * 404 body - identical to app.py's and index.js's.
+     */
+    private static final String CONTEXT_PATH = ROOT_PATH;
+
     /** Listen backlog; generous enough that a burst of clients is queued, not refused. */
     private static final int SERVER_BACKLOG = 128;
 
-    /** Name of the acceptor thread, which is what keeps --serve mode alive. */
-    private static final String ACCEPTOR_THREAD_NAME = "health-acceptor";
+    /**
+     * Name prefix for the virtual threads that run exchanges.
+     *
+     * <p>Named rather than anonymous so that a thread dump taken from a running
+     * container tells an operator which threads belong to this endpoint. The
+     * server's own dispatcher thread is named by the JDK, not here, and it is the
+     * non-daemon thread that keeps --serve mode alive.
+     */
+    private static final String WORKER_THREAD_PREFIX = "health-worker-";
+
+    /** First index handed to the worker thread factory. */
+    private static final long WORKER_THREAD_START = 0L;
 
     /** Name of the shutdown hook thread that closes the listening socket. */
     private static final String SHUTDOWN_THREAD_NAME = "health-shutdown";
 
     /**
-     * Idle budget for one connection, in milliseconds.
+     * Seconds the server may spend waiting for exchanges in flight when stopping.
      *
-     * <p>Applied to the socket, so it bounds both the wait for a request line on
-     * a reused connection and the wait for the rest of a request that arrived in
-     * pieces. A client that connects and then says nothing is dropped after this
-     * long instead of parking a thread forever; it can never delay another
-     * client, because it holds nothing but its own virtual thread. The value
-     * matches app.py's connection timeout so all three implementations reclaim an
-     * abandoned connection on the same schedule.
+     * <p>Zero, deliberately: the endpoint's own responses are written in
+     * microseconds, so there is nothing worth waiting for, and a container stop
+     * should release the port immediately rather than hold it for a grace period
+     * no health response needs.
      */
-    private static final int IDLE_TIMEOUT_MILLIS = 30_000;
+    private static final int STOP_DELAY_SECONDS = 0;
+
+    /** Buffer size used when draining a request body. */
+    private static final int DRAIN_BUFFER_BYTES = 8192;
 
     /**
-     * Grace period for reading whatever a client is still sending after an error
-     * response, in milliseconds. Draining briefly before closing is what lets the
-     * client read the response instead of seeing a connection reset.
+     * The length {@code sendResponseHeaders} is given when no body will follow.
+     *
+     * <p>The server's documented sentinel for "header block only". It is used for
+     * exactly one case, a response to HEAD, and using it there is what keeps the
+     * runtime from logging a warning about a declared body length on a method that
+     * carries none.
      */
-    private static final int LINGER_TIMEOUT_MILLIS = 1_000;
-
-    /** Read and write buffer size for one connection. */
-    private static final int IO_BUFFER_BYTES = 8192;
-
-    /** Initial capacity for a request-line or header-field buffer. */
-    private static final int LINE_CAPACITY = 128;
-
-    /** Initial capacity for the assembled response head. */
-    private static final int HEAD_CAPACITY = 192;
-
-    /** A request line longer than this is answered 414 rather than parsed. */
-    private static final int MAX_REQUEST_LINE_BYTES = 65_536;
-
-    /** A single header field line longer than this is answered 431. */
-    private static final int MAX_HEADER_LINE_BYTES = 16_384;
-
-    /** A header block larger than this in total is answered 431. */
-    private static final int MAX_HEADER_BLOCK_BYTES = 16_384;
-
-    /** More header fields than this is answered 431. */
-    private static final int MAX_HEADER_FIELDS = 100;
-
-    /** Exactly three space-separated tokens make a well-formed request line. */
-    private static final int REQUEST_LINE_TOKENS = 3;
+    private static final long NO_RESPONSE_BODY = -1L;
 
     /** Connect and read budget for the self-check; it must fail fast, not hang. */
     private static final int PROBE_TIMEOUT_SECONDS = 3;
@@ -440,55 +480,174 @@ public class User {
     /** IPv6 wildcard, which is likewise not a routable target. */
     private static final String WILDCARD_HOST_V6 = "::";
 
+    /** Bracketed IPv6 wildcard, the form an authority carries it in. */
+    private static final String WILDCARD_HOST_V6_BRACKETED = "[::]";
+
+    /** The shorthand some tooling writes for "every interface". */
+    private static final String WILDCARD_HOST_ANY = "*";
+
     /**
-     * Upper bound on request-body bytes drained before the connection is closed.
+     * Every spelling of "bind everywhere", none of which is a destination.
      *
-     * <p>The endpoint never inspects a body, but bytes left unread desynchronise
-     * a persistent connection and closing a socket with unread data queued makes
-     * the kernel answer with a reset - which is what turned a large POST into "no
-     * HTTP response at all" before this cap was raised. Eight mebibytes is far
-     * above any body a health request could plausibly carry, so every realistic
-     * request is drained in full and answered on a connection that stays usable;
-     * a body beyond the cap is still answered, and the connection is then retired
-     * rather than reused, because its framing can no longer be trusted.
+     * <p>Compared against the lower-cased, trimmed configured host, so
+     * {@code "0.0.0.0"}, {@code "::"}, {@code "[::]"} and {@code "*"} all resolve
+     * the probe to loopback. app.py and index.js hold the identical set.
+     */
+    private static final Set<String> WILDCARD_HOSTS = Set.of(
+            WILDCARD_HOST_V4, WILDCARD_HOST_V6, WILDCARD_HOST_V6_BRACKETED, WILDCARD_HOST_ANY);
+
+    /** The IPv6 loopback authority, bracketed so it can carry a port in a URL. */
+    private static final String LOOPBACK_AUTHORITY_V6 = "[::1]";
+
+    /**
+     * Every spelling of IPv6 loopback this probe accepts as already-loopback.
+     *
+     * <p>All four are mapped to {@link #LOOPBACK_AUTHORITY_V6} rather than passed
+     * through, so one destination is reached however the address was written.
+     */
+    private static final Set<String> IPV6_LOOPBACK_FORMS = Set.of(
+            "::1", "[::1]", "0:0:0:0:0:0:0:1", "[0:0:0:0:0:0:0:1]");
+
+    /**
+     * The loopback host NAME, mapped rather than resolved.
+     *
+     * <p>Deliberately not handed to the resolver: a hosts-file entry mapping
+     * {@code localhost} elsewhere would otherwise redirect a probe that is supposed
+     * to be able to reach nothing but this process.
+     */
+    private static final String LOOPBACK_NAME = "localhost";
+
+    /** Prefix of the whole 127.0.0.0/8 range, every address in which is loopback. */
+    private static final String IPV4_LOOPBACK_PREFIX = "127.";
+
+    /** Number of dot-separated octets in an IPv4 literal. */
+    private static final int IPV4_OCTET_COUNT = 4;
+
+    /** Most decimal digits an IPv4 octet may carry. */
+    private static final int IPV4_OCTET_MAX_DIGITS = 3;
+
+    /** Largest value an IPv4 octet may hold. */
+    private static final int IPV4_OCTET_MAX = 255;
+
+    /**
+     * Largest response body the self-check will read, in bytes.
+     *
+     * <p>The reference payload is 108 bytes, so this is two orders of magnitude of
+     * headroom and still a hard bound. It exists because the probe is the one
+     * component a container runs on a timer, forever: a listener answering with an
+     * endless stream would otherwise exhaust this process's heap on a schedule.
+     * One byte over the ceiling is read deliberately, which is how the ceiling is
+     * detected rather than silently truncated to a body that might still parse.
+     * app.py and index.js use the same number, so the same body is graded the same
+     * way by all three.
+     */
+    private static final int MAX_PROBE_BODY_BYTES = 8192;
+
+    /** Deepest JSON nesting the self-check's reader will descend. */
+    private static final int MAX_JSON_DEPTH = 32;
+
+    /** Hexadecimal digits in a JSON {@code \\uXXXX} escape. */
+    private static final int JSON_UNICODE_DIGITS = 4;
+
+    /** Radix of a JSON {@code \\uXXXX} escape. */
+    private static final int JSON_UNICODE_RADIX = 16;
+
+    /** Name of the request field the self-check sends, for parity with app.py. */
+    private static final String HEADER_ACCEPT = "Accept";
+
+    /** Thread name prefix for the bounded exchange the self-check runs. */
+    private static final String PROBE_THREAD_NAME = "health-probe";
+
+    // -------------------------------------------------------------------------
+    // Input grammars
+    //
+    // Every configured value that is not free text is matched against a grammar
+    // written out here, and the same three grammars appear in app.py and index.js.
+    // Writing them out is the point: the platform's own conversions are each
+    // lenient in a different direction - Integer.parseInt accepts a Unicode digit
+    // that Number() refuses, Python's int() accepts an underscore separator that
+    // neither of the others does - so three implementations that each trusted their
+    // runtime would disagree about the same configuration file.
+    // -------------------------------------------------------------------------
+
+    /**
+     * A port as all three implementations accept one: ASCII decimal, sign optional.
+     *
+     * <p>This gate is what makes {@link Integer#parseInt(String)} safe to use here.
+     * That method delegates to {@link Character#digit(char, int)}, which accepts
+     * every Unicode decimal digit, so {@code JAVA_PORT} written in Arabic-Indic
+     * digits would otherwise bind a port that {@code index.js} refuses outright -
+     * one configuration file, two behaviours. Matched before any conversion runs.
+     */
+    private static final Pattern PORT_GRAMMAR = Pattern.compile("^[+-]?[0-9]+$");
+
+    /** A three-part dotted numeric version, the only form {@code app.version} may take. */
+    private static final Pattern VERSION_GRAMMAR =
+            Pattern.compile("^[0-9]+\\.[0-9]+\\.[0-9]+$");
+
+    /**
+     * A whole-second UTC instant, the only form the {@code timestamp} field may take.
+     *
+     * <p>Used by the self-check to grade the field by FORMAT and never by value,
+     * which is what keeps the one non-deterministic field in the payload from
+     * making a gate time-flaky.
+     */
+    private static final Pattern TIMESTAMP_GRAMMAR = Pattern.compile(
+            "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+
+    /** Lowest byte a request target may carry: every control character is below it. */
+    private static final char TARGET_MIN_CHAR = 0x21;
+
+    /** Highest byte a request target may carry: DEL and everything above are out. */
+    private static final char TARGET_MAX_CHAR = 0x7E;
+
+    /** Lowest character a configured value may carry; below this is a control character. */
+    private static final char PRINTABLE_MIN_CHAR = 0x20;
+
+    /** DEL, a control character despite sitting above the printable range. */
+    private static final char DEL_CHAR = 0x7F;
+
+    /**
+     * Upper bound on request-body bytes drained before a response is written.
+     *
+     * <p>The endpoint never inspects a body, but bytes left unread make the kernel
+     * answer the close with a reset instead of letting the client read the reply:
+     * a one-mebibyte POST that is not drained is observed by the client as
+     * "connection reset by peer" rather than as the 405 it was sent. Eight
+     * mebibytes is far above any body a health request could plausibly carry, so
+     * every realistic request is drained in full and answered normally; a body
+     * beyond the cap is still answered, and the server retires that connection
+     * itself because its framing can no longer be trusted.
      */
     private static final long MAX_REQUEST_DRAIN_BYTES = 8L * 1024L * 1024L;
 
-    /** Bytes read from an abandoned request before an error close gives up. */
-    private static final long MAX_LINGER_DRAIN_BYTES = 1024L * 1024L;
-
-    /** Largest chunked body this server will drain, in bytes. */
-    private static final long MAX_CHUNKED_BODY_BYTES = MAX_REQUEST_DRAIN_BYTES;
-
-    /** Largest number of chunked-encoding trailer fields tolerated. */
-    private static final int MAX_TRAILER_FIELDS = MAX_HEADER_FIELDS;
-
-    /** Interim response sent when a client asks permission before sending a body. */
-    private static final String CONTINUE_RESPONSE = HTTP_VERSION + " 100 Continue" + CRLF + CRLF;
-
-    /** Request header names this server acts on, compared case-insensitively. */
-    private static final String HEADER_NAME_HOST = "host";
-    private static final String HEADER_NAME_CONTENT_LENGTH = "content-length";
-    private static final String HEADER_NAME_TRANSFER_ENCODING = "transfer-encoding";
-    private static final String HEADER_NAME_CONNECTION = "connection";
-    private static final String HEADER_NAME_EXPECT = "expect";
-
-    private static final String TRANSFER_ENCODING_CHUNKED = "chunked";
-    private static final String CONNECTION_CLOSE = "close";
-    private static final String CONNECTION_KEEP_ALIVE = "keep-alive";
-    private static final String EXPECT_CONTINUE = "100-continue";
-
-    /** Radix of a chunk-size line in a chunked request body. */
-    private static final int CHUNK_SIZE_RADIX = 16;
-
-    /** Characters other than ALPHA and DIGIT that may appear in a method token. */
-    private static final String METHOD_TOKEN_SPECIALS = "!#$%&'*+-.^_`|~";
-
-    /** Lowest byte value a request target may contain; SP and the CTLs are out. */
-    private static final char TARGET_MIN_CHAR = 0x21;
-
-    /** Highest byte value a request target may contain; DEL and above are out. */
-    private static final char TARGET_MAX_CHAR = 0x7E;
+    /**
+     * The platform property bounding how long one request may take to arrive, and
+     * the budget installed into it.
+     *
+     * <p>Draining the request body is a BLOCKING read and {@code HttpServer}
+     * applies no request-time limit of its own, so without this the ceiling above
+     * bounds only how MUCH is read, never how LONG the read waits. A client that
+     * promises a hundred body bytes, sends three and then says nothing holds a
+     * handler thread for the lifetime of the process; verified by execution, such a
+     * connection was still unanswered forty seconds later. A peer that opens many
+     * of them retains a thread for each.
+     *
+     * <p>This is the platform's own documented knob for exactly that, listed among
+     * the configurable properties of {@code com.sun.net.httpserver}, and it bounds
+     * the header read as well as the body - which a timeout wrapped around the
+     * drain alone would not. The budget matches the JavaScript listener's
+     * {@code requestTimeout}, so one number governs the same behaviour in both.
+     *
+     * <p>The three implementations bound the same hazard and reach it differently,
+     * which is a property of the platform rather than of the contract: Node answers
+     * immediately and discards the unread body afterwards, Python answers when its
+     * own drain budget expires, and this server reaps the connection unanswered.
+     * The frozen contract governs well-formed requests, and every one of those is
+     * answered identically by all three.
+     */
+    private static final String MAX_REQUEST_TIME_PROPERTY = "sun.net.httpserver.maxReqTime";
+    private static final String MAX_REQUEST_TIME_SECONDS = "15";
 
     /** Scheme separator that marks an absolute-form request target. */
     private static final String SCHEME_SEPARATOR = "://";
@@ -594,26 +753,29 @@ public class User {
     /**
      * Chooses which properties file to read.
      *
-     * <p>Three candidates are tried in a fixed order: the {@value #CONFIG_FILE_ENV}
-     * override, then the file sitting beside this class's own code source, then
-     * the working directory. The middle candidate is the one that matters: app.py
-     * resolves the file relative to {@code __file__} and index.js relative to
-     * {@code __dirname}, so resolving it only against the working directory made
-     * Java the single implementation that lost its configuration when the process
-     * was started from another directory.
+     * <p>Two candidates are tried in a fixed order, and they are exactly the two
+     * candidates app.py and index.js use: the file sitting beside this class's own
+     * code source, then the file in the working directory. The first is the one
+     * that matters - app.py resolves the file relative to {@code __file__} and
+     * index.js relative to {@code __dirname}, so resolving it only against the
+     * working directory would make Java the single implementation that loses its
+     * configuration when the process is started from another directory - and the
+     * second is what answers when the code source cannot be expressed as a
+     * filesystem path at all.
+     *
+     * <p>There is deliberately <em>no</em> environment variable that names an
+     * arbitrary properties file. The configuration surface is shared, and it is
+     * shared exactly: the seven keys of {@value #CONFIG_FILE} and the environment
+     * variables that override them are the same in all three implementations, so
+     * adding a Java-only variable here would let this implementation serve
+     * metadata its siblings could never serve, from a file they would never read.
+     * Every value in that file is already overridable one key at a time through the
+     * variables documented in {@code .env.example}, which is the portable way to
+     * change what this endpoint reports.
      *
      * @return the path to read, or {@code null} if no candidate can be formed
      */
     private static Path configLocation() {
-        String override = System.getenv(CONFIG_FILE_ENV);
-        if (override != null && !override.isEmpty()) {
-            try {
-                return Path.of(override);
-            } catch (InvalidPathException unusable) {
-                System.err.println(LOG_PREFIX + "ignoring unusable " + CONFIG_FILE_ENV + " value");
-                return null;
-            }
-        }
         Path beside = codeSourceDirectory();
         if (beside != null) {
             Path candidate = beside.resolve(CONFIG_FILE);
@@ -710,13 +872,22 @@ public class User {
                 ? universal
                 : resolve(props, key, envName, Integer.toString(fallback));
         String trimmed = raw.trim();
-        try {
-            int parsed = Integer.parseInt(trimmed);
-            if (parsed >= MIN_PORT && parsed <= MAX_PORT) {
-                return parsed;
+        // The grammar is matched BEFORE any conversion, and that ordering is the
+        // fix rather than a formality. Integer.parseInt delegates to
+        // Character.digit, which accepts every Unicode decimal digit, so a port
+        // written in Arabic-Indic digits parses here and is refused outright by
+        // index.js - one configuration file producing two behaviours, which is
+        // exactly the class of divergence the shared grammar exists to close.
+        if (PORT_GRAMMAR.matcher(trimmed).matches()) {
+            try {
+                int parsed = Integer.parseInt(trimmed);
+                if (parsed >= MIN_PORT && parsed <= MAX_PORT) {
+                    return parsed;
+                }
+            } catch (NumberFormatException beyondIntRange) {
+                // A run of ASCII digits too long for an int. It is out of range by
+                // definition, so it falls through to the same rejection.
             }
-        } catch (NumberFormatException notANumber) {
-            // Fall through to the rejection below; the value is reported there.
         }
         throw new IllegalArgumentException("invalid port value: " + trimmed);
     }
@@ -814,6 +985,125 @@ public class User {
                 resolve(props, KEY_APP_HOST, ENV_APP_HOST, DEFAULT_APP_HOST),
                 resolvePort(props, KEY_JAVA_PORT, ENV_JAVA_PORT,
                         ENV_UNIVERSAL_PORT, DEFAULT_JAVA_PORT));
+    }
+
+    // -------------------------------------------------------------------------
+    // Configuration validation
+    //
+    // Resolution answers "what did the operator ask for". Validation answers "may
+    // that be published", and it runs before a socket is bound and before a probe
+    // is sent. Without it a control character in app.name reached the response body
+    // and a version of "not-a-version" was served with a 200 and a status of UP -
+    // an endpoint asserting its own health while carrying a payload no consumer of
+    // the frozen contract could accept. Failing closed here is the only way the
+    // 200 can be trusted at all.
+    //
+    // The messages name the KEY and never quote the VALUE. That is deliberate and
+    // it is what lets the probe print one of these messages verbatim: the offending
+    // value is a configured input, so a message that quoted it would carry that
+    // input into a log line. The one exception is the port, whose refusal names the
+    // value it refused - see resolvePort and probe(Config) - because a mistyped port
+    // an operator cannot trace back to what they typed is only half a diagnostic.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Reports whether a value is usable as single-line configured text.
+     *
+     * <p>The rule for the two configured values that are neither a route nor a
+     * number: non-empty, and free of every character below
+     * {@value #PRINTABLE_MIN_CHAR} as well as DEL. Emptiness is a fault rather than
+     * a fallback because these values reach the response body, and a name that is
+     * absent from the payload is not the same document as one that is present and
+     * blank.
+     *
+     * @param text the configured value to test; {@code null} is not usable
+     * @return {@code true} when the value may be published
+     */
+    static boolean isSingleLineText(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        for (int index = 0; index < text.length(); index++) {
+            char current = text.charAt(index);
+            if (current < PRINTABLE_MIN_CHAR || current == DEL_CHAR) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Reports whether a value is usable as an HTTP request target.
+     *
+     * <p>Every character must be visible US-ASCII - {@value #TARGET_MIN_CHAR}
+     * through {@value #TARGET_MAX_CHAR} - which excludes the space, every control
+     * character, DEL and everything above it. A configured path carrying CR or LF
+     * is what a log-forgery attempt looks like, and it is refused here before a
+     * request is ever built from it.
+     *
+     * @param candidate the configured route to test; {@code null} is not usable
+     * @return {@code true} when the value may be requested
+     */
+    static boolean isRequestTarget(String candidate) {
+        if (candidate == null || candidate.isEmpty()) {
+            return false;
+        }
+        for (int index = 0; index < candidate.length(); index++) {
+            char current = candidate.charAt(index);
+            if (current < TARGET_MIN_CHAR || current > TARGET_MAX_CHAR) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Refuses a configuration that could not be published truthfully.
+     *
+     * <p>Four rules, applied in the order the payload declares its fields:
+     * <ul>
+     *   <li>{@code app.name} is non-empty text with no control character - it is a
+     *       payload field, and a control character in it would forge a line in a
+     *       consumer's log as readily as in this program's own.</li>
+     *   <li>{@code app.version} matches {@link #VERSION_GRAMMAR} - the frozen
+     *       contract states the field is a three-part dotted number, so serving
+     *       anything else with a 200 and a status of UP is a lie the consumer
+     *       cannot detect.</li>
+     *   <li>{@code health.path} starts with {@code /} and is a valid request
+     *       target - a route that cannot be requested is a route no probe and no
+     *       orchestrator can ever reach.</li>
+     *   <li>{@code app.host} is non-empty text with no control character - it
+     *       reaches the startup banner and the probe's target URL.</li>
+     * </ul>
+     *
+     * <p>The port is deliberately NOT checked here: it is already refused at
+     * resolution time by {@link #resolvePort}, which is the earliest point it is
+     * knowable, and checking it twice would put the same refusal behind two
+     * different messages.
+     *
+     * @param config the resolved snapshot to check
+     * @throws IllegalArgumentException on the first rule that fails, naming the key
+     *                                  and never quoting the value
+     */
+    static void validateConfig(Config config) {
+        if (!isSingleLineText(config.name())) {
+            throw new IllegalArgumentException(
+                    "invalid app.name: it must be non-empty text with no control character");
+        }
+        if (config.version() == null
+                || !VERSION_GRAMMAR.matcher(config.version()).matches()) {
+            throw new IllegalArgumentException(
+                    "invalid app.version: it must be a three-part dotted numeric version");
+        }
+        String route = config.healthPath();
+        if (route == null || !route.startsWith(ROOT_PATH) || !isRequestTarget(route)) {
+            throw new IllegalArgumentException(
+                    "invalid health.path: it is not a valid request target");
+        }
+        if (!isSingleLineText(config.host())) {
+            throw new IllegalArgumentException(
+                    "invalid app.host: it must be non-empty text with no control character");
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1035,618 +1325,144 @@ public class User {
         return current >= '0' && current <= '9';
     }
 
-    /**
-     * One line read from a connection, and how the read ended.
-     *
-     * @param text        the line with its CRLF or LF terminator removed
-     * @param truncated   {@code true} if the byte cap was reached first
-     * @param endOfStream {@code true} if the stream ended before any byte arrived
-     */
-    private record Line(String text, boolean truncated, boolean endOfStream) { }
+    // -------------------------------------------------------------------------
+    // Request handling
+    //
+    // One handler answers every exchange the server accepts. It is registered on
+    // the root context rather than on the configured route, so the routing rules
+    // above - and not the server's longest-prefix context matcher - decide what a
+    // near-miss target means, which is what keeps the 404 body identical to the
+    // one app.py and index.js produce.
+    // -------------------------------------------------------------------------
 
     /**
-     * One parsed request line, or the status that rejects it.
+     * Answers one exchange according to the frozen contract.
      *
-     * @param method  the method token exactly as sent
-     * @param target  the request target exactly as sent
-     * @param major   HTTP major version, or {@code 0} when the request is rejected
-     * @param minor   HTTP minor version, or {@code 0} when the request is rejected
-     * @param failure the status to answer with, or {@code 0} when the line is valid
+     * <p>The configuration snapshot is captured when the server is created and
+     * passed in here, so no request ever touches the filesystem and two responses
+     * from one server can never disagree about what they were serving.
+     *
+     * <p>The two contract headers are set before the status is chosen, because
+     * every one of the three responses carries both: a health answer that could be
+     * cached is worse than no health answer at all, so the no-store directive is
+     * never conditional. {@code Allow: GET} is added on the 405 alone.
+     *
+     * <p>The target is taken from {@code getRequestURI().toString()} rather than
+     * from {@code getRawPath()}. That is deliberate and it is what keeps this
+     * implementation's routing identical to its siblings': the full request target
+     * still carries the query string and, for an absolute-form request line, the
+     * scheme and authority, so {@link #normalisePath(String)} performs exactly the
+     * same four transformations here that it performs on the raw target in app.py
+     * and index.js. Taking the pre-parsed path instead would have the server strip
+     * the query and the authority first, silently moving two of those rules out of
+     * this class and out of reach of the tests that cover them.
+     *
+     * <p>A {@link RuntimeException} is caught, logged to stderr and swallowed. It
+     * is unreachable in practice - the payload builder and the path normaliser are
+     * total functions over their inputs - but a handler that let one escape would
+     * take down nothing at all while leaving an operator no record of it, and the
+     * contract defines no 5xx response to send instead.
+     *
+     * @param exchange the exchange to answer; always closed before this returns
+     * @param config   the snapshot every response from this server is built from
+     * @throws IOException if the response cannot be written to the connection
      */
-    private record RequestLine(String method, String target, int major, int minor, int failure) {
-
-        /** @return {@code true} when this line was rejected and must not be routed */
-        boolean rejected() {
-            return failure != 0;
-        }
-
-        /** @return {@code true} when the client may reuse the connection by default */
-        boolean persistentByDefault() {
-            return major > 1 || (major == 1 && minor >= 1);
-        }
-    }
-
-    /**
-     * Reads one line of a request, bounded, without decoding it.
-     *
-     * <p>Bytes are mapped to characters one for one through ISO-8859-1 rather than
-     * decoded as UTF-8. A request line and a header field are ASCII by
-     * specification, and any byte outside that range is rejected rather than
-     * interpreted, so a lossless byte-preserving mapping is exactly what is wanted:
-     * no replacement character can silently turn an illegal request into a legal
-     * one.
-     *
-     * @param source the connection to read from
-     * @param limit  the largest number of bytes this line may occupy
-     * @return the line, flagged if it was truncated or the stream had ended
-     * @throws IOException if the connection fails or falls idle
-     */
-    private static Line readLine(InputStream source, int limit) throws IOException {
-        StringBuilder text = new StringBuilder(LINE_CAPACITY);
-        int consumed = 0;
-        while (true) {
-            int next = source.read();
-            if (next < 0) {
-                return new Line(text.toString(), false, consumed == 0);
+    private static void handle(HttpExchange exchange, Config config) throws IOException {
+        try (exchange) {
+            drainRequestBody(exchange);
+            Headers response = exchange.getResponseHeaders();
+            response.set(HEADER_CONTENT_TYPE, CONTENT_TYPE_JSON);
+            response.set(HEADER_CACHE_CONTROL, CACHE_CONTROL_NO_STORE);
+            if (!METHOD_GET.equals(exchange.getRequestMethod())) {
+                response.set(HEADER_ALLOW, METHOD_GET);
+                sendResponse(exchange, HTTP_METHOD_NOT_ALLOWED, BODY_METHOD_NOT_ALLOWED);
+                return;
             }
-            consumed++;
-            if (next == '\n') {
-                int length = text.length();
-                if (length > 0 && text.charAt(length - 1) == '\r') {
-                    text.setLength(length - 1);
-                }
-                return new Line(text.toString(), false, false);
+            String requested = normalisePath(exchange.getRequestURI().toString());
+            if (config.healthPath().equals(requested)) {
+                sendResponse(exchange, HTTP_OK, healthPayload(config));
+            } else {
+                sendResponse(exchange, HTTP_NOT_FOUND, BODY_NOT_FOUND);
             }
-            if (consumed > limit) {
-                return new Line(text.toString(), true, false);
-            }
-            text.append((char) next);
-        }
-    }
-
-    /**
-     * Parses and validates a request line against RFC 9112.
-     *
-     * <p>The line must be exactly {@value #REQUEST_LINE_TOKENS} single-space
-     * separated tokens; the method must be a token as RFC 9110 defines one; the
-     * target must be non-empty and made only of visible US-ASCII; and the version
-     * must be {@code HTTP/}, digits, {@code .}, digits. Anything else is a 400. A
-     * well-formed version whose major is not 1 is a 505 - the request was
-     * understood, it simply cannot be served.
-     *
-     * @param line the request line with its terminator removed
-     * @return the parsed line, or one carrying the status that rejects it
-     */
-    private static RequestLine parseRequestLine(String line) {
-        String[] tokens = line.split(" ", -1);
-        if (tokens.length != REQUEST_LINE_TOKENS) {
-            return rejectedLine(HTTP_BAD_REQUEST);
-        }
-        String method = tokens[0];
-        String target = tokens[1];
-        String version = tokens[2];
-        if (!isMethodToken(method) || !isRequestTarget(target)) {
-            return rejectedLine(HTTP_BAD_REQUEST);
-        }
-        int separator = version.indexOf('/');
-        if (!version.startsWith("HTTP/") || separator < 0) {
-            return rejectedLine(HTTP_BAD_REQUEST);
-        }
-        String number = version.substring(separator + 1);
-        int dot = number.indexOf('.');
-        if (dot <= 0 || dot == number.length() - 1) {
-            return rejectedLine(HTTP_BAD_REQUEST);
-        }
-        String majorText = number.substring(0, dot);
-        String minorText = number.substring(dot + 1);
-        if (!isDigits(majorText) || !isDigits(minorText)) {
-            return rejectedLine(HTTP_BAD_REQUEST);
-        }
-        int major = parseBoundedNumber(majorText);
-        int minor = parseBoundedNumber(minorText);
-        if (major != 1) {
-            return new RequestLine(method, target, major, minor, HTTP_VERSION_NOT_SUPPORTED);
-        }
-        return new RequestLine(method, target, major, minor, 0);
-    }
-
-    /** @return a rejected request line carrying {@code status} and nothing else */
-    private static RequestLine rejectedLine(int status) {
-        return new RequestLine("", "", 0, 0, status);
-    }
-
-    /**
-     * Parses a run of digits without overflowing on an absurd one.
-     *
-     * @param digits a non-empty run of ASCII digits
-     * @return the value, or {@link Integer#MAX_VALUE} if it does not fit
-     */
-    private static int parseBoundedNumber(String digits) {
-        try {
-            return Integer.parseInt(digits);
-        } catch (NumberFormatException tooLarge) {
-            return Integer.MAX_VALUE;
-        }
-    }
-
-    /** @return {@code true} if every character is an ASCII digit and there is one */
-    private static boolean isDigits(String candidate) {
-        if (candidate.isEmpty()) {
-            return false;
-        }
-        for (int index = 0; index < candidate.length(); index++) {
-            if (!isAsciiDigit(candidate.charAt(index))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Reports whether a string is a method token as RFC 9110 defines one.
-     *
-     * <p>This is what makes an unknown or wrongly-cased verb a 405 rather than a
-     * parse failure: {@code FOO}, {@code GETX}, {@code get} and {@code Get} are all
-     * valid tokens, so all four are routed and all four are answered 405 with
-     * {@code Allow: GET}, exactly as {@code TRACE} and {@code PROPFIND} are.
-     *
-     * @param candidate the first token of the request line
-     * @return {@code true} if it is a legal, non-empty method token
-     */
-    private static boolean isMethodToken(String candidate) {
-        if (candidate.isEmpty()) {
-            return false;
-        }
-        for (int index = 0; index < candidate.length(); index++) {
-            char current = candidate.charAt(index);
-            boolean allowed = isAsciiLetter(current) || isAsciiDigit(current)
-                    || METHOD_TOKEN_SPECIALS.indexOf(current) >= 0;
-            if (!allowed) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Reports whether a request target is made only of characters allowed in one.
-     *
-     * <p>Every byte must be visible US-ASCII: {@value #TARGET_MIN_CHAR} through
-     * {@value #TARGET_MAX_CHAR}. That excludes the space, every control character
-     * including CR, LF and TAB, DEL, and every byte above the ASCII range. A tab
-     * inside a target is therefore a 400 rather than something the router has to
-     * reason about, and a CR or LF can never reach the router at all, which is what
-     * makes response-header injection through the target structurally impossible.
-     *
-     * @param candidate the second token of the request line
-     * @return {@code true} if the target is non-empty and entirely legal
-     */
-    private static boolean isRequestTarget(String candidate) {
-        if (candidate.isEmpty()) {
-            return false;
-        }
-        for (int index = 0; index < candidate.length(); index++) {
-            char current = candidate.charAt(index);
-            if (current < TARGET_MIN_CHAR || current > TARGET_MAX_CHAR) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Writes one complete response: status line, header block and optional body.
-     *
-     * <p>Every byte is assembled here, which is the whole point of owning the
-     * socket: the three contract headers appear in a fixed order with fixed casing
-     * and nothing is added behind this method's back - no Date, no Server, no
-     * transport header on a contract response. {@code Content-Length} is the
-     * encoded byte length, never the character count, so a multi-byte character in
-     * a configured value cannot desynchronise the length from the body.
-     *
-     * <p>The head is encoded as ISO-8859-1 and every value placed in it is either a
-     * compile-time constant or a number, so no request-supplied text can reach it.
-     *
-     * @param sink        the connection to write to
-     * @param status      HTTP status code
-     * @param reason      reason phrase for the status line
-     * @param body        complete response body, already compact JSON
-     * @param sendAllow   whether to add {@code Allow: GET}
-     * @param sendClose   whether to add {@code Connection: close}
-     * @param includeBody whether the body bytes follow the header block
-     * @throws IOException if the response cannot be written
-     */
-    private static void writeResponse(OutputStream sink, int status, String reason, String body,
-            boolean sendAllow, boolean sendClose, boolean includeBody) throws IOException {
-        byte[] encoded = body.getBytes(StandardCharsets.UTF_8);
-        StringBuilder head = new StringBuilder(HEAD_CAPACITY)
-                .append(HTTP_VERSION).append(' ').append(status).append(' ').append(reason)
-                .append(CRLF)
-                .append(HEADER_CONTENT_TYPE).append(CRLF)
-                .append(HEADER_CACHE_CONTROL).append(CRLF)
-                .append(HEADER_CONTENT_LENGTH_PREFIX).append(encoded.length).append(CRLF);
-        if (sendAllow) {
-            head.append(HEADER_ALLOW_GET).append(CRLF);
-        }
-        if (sendClose) {
-            head.append(HEADER_CONNECTION_CLOSE).append(CRLF);
-        }
-        head.append(CRLF);
-        sink.write(head.toString().getBytes(StandardCharsets.ISO_8859_1));
-        if (includeBody) {
-            sink.write(encoded);
-        }
-        sink.flush();
-    }
-
-    /**
-     * Writes one of the four transport-error responses and gives up the connection.
-     *
-     * <p>These are the only responses that carry {@code Connection: close}, because
-     * they are the only ones after which this server stops reading: once a request
-     * line could not be parsed, whatever follows it on the connection cannot be
-     * framed either.
-     *
-     * @param sink   the connection to write to
-     * @param status one of 400, 414, 431 or 505
-     * @throws IOException if the response cannot be written
-     */
-    private static void writeTransportError(OutputStream sink, int status) throws IOException {
-        String reason;
-        String body;
-        switch (status) {
-            case HTTP_URI_TOO_LONG -> {
-                reason = REASON_URI_TOO_LONG;
-                body = BODY_URI_TOO_LONG;
-            }
-            case HTTP_HEADERS_TOO_LARGE -> {
-                reason = REASON_HEADERS_TOO_LARGE;
-                body = BODY_HEADERS_TOO_LARGE;
-            }
-            case HTTP_VERSION_NOT_SUPPORTED -> {
-                reason = REASON_VERSION_NOT_SUPPORTED;
-                body = BODY_VERSION_NOT_SUPPORTED;
-            }
-            case HTTP_INTERNAL_ERROR -> {
-                reason = REASON_INTERNAL_ERROR;
-                body = BODY_INTERNAL_ERROR;
-            }
-            default -> {
-                reason = REASON_BAD_REQUEST;
-                body = BODY_BAD_REQUEST;
-            }
-        }
-        writeResponse(sink, status, reason, body, false, true, true);
-    }
-
-    /**
-     * Finds one request header value, comparing the field name case-insensitively.
-     *
-     * @param headers the header block as received, one entry per field line
-     * @param name    the lower-case field name to look for
-     * @return the first matching value with surrounding whitespace removed, or
-     *         {@code null} when the field is absent
-     */
-    private static String headerValue(List<String> headers, String name) {
-        for (String field : headers) {
-            int colon = field.indexOf(':');
-            if (colon <= 0) {
-                continue;
-            }
-            String fieldName = field.substring(0, colon).trim().toLowerCase(Locale.ROOT);
-            if (fieldName.equals(name)) {
-                return field.substring(colon + 1).trim();
-            }
-        }
-        return null;
-    }
-
-    /** @return {@code true} if a comma-separated header value contains a token */
-    private static boolean containsToken(String value, String token) {
-        if (value == null) {
-            return false;
-        }
-        for (String part : value.split(",", -1)) {
-            if (part.trim().equalsIgnoreCase(token)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Reads the header block that follows a request line.
-     *
-     * @param source  the connection to read from
-     * @param headers collects one entry per header field line, in order
-     * @return {@code 0} when the block was read in full, or 431 when a cap was hit
-     * @throws IOException if the connection fails or falls idle
-     */
-    private static int readHeaders(InputStream source, List<String> headers) throws IOException {
-        int consumed = 0;
-        while (true) {
-            Line line = readLine(source, MAX_HEADER_LINE_BYTES);
-            if (line.truncated()) {
-                return HTTP_HEADERS_TOO_LARGE;
-            }
-            if (line.endOfStream()) {
-                // The client stopped in the middle of its own header block; the
-                // request is incomplete rather than oversized.
-                return HTTP_BAD_REQUEST;
-            }
-            if (line.text().isEmpty()) {
-                return 0;
-            }
-            consumed += line.text().length() + CRLF.length();
-            if (consumed > MAX_HEADER_BLOCK_BYTES || headers.size() >= MAX_HEADER_FIELDS) {
-                return HTTP_HEADERS_TOO_LARGE;
-            }
-            headers.add(line.text());
-        }
-    }
-
-    /**
-     * Consumes a request body so that the connection can be reused.
-     *
-     * <p>Nothing this endpoint answers depends on a body, but bytes left unread
-     * desynchronise a persistent connection, and closing a socket that still has
-     * unread data queued makes the kernel reply with a reset instead of letting the
-     * client read the response that was already written. Draining is therefore part
-     * of answering correctly, not an optimisation.
-     *
-     * @param source            the connection to read from
-     * @param contentLength     the {@code Content-Length} value, or {@code null}
-     * @param transferEncoding  the {@code Transfer-Encoding} value, or {@code null}
-     * @return {@code true} if the body was consumed in full and the connection may
-     *         be reused, {@code false} if the connection must now be closed
-     * @throws IOException if the connection fails or falls idle
-     */
-    private static boolean drainRequestBody(InputStream source, String contentLength,
-            String transferEncoding) throws IOException {
-        if (transferEncoding != null && !transferEncoding.isEmpty()) {
-            return containsToken(transferEncoding, TRANSFER_ENCODING_CHUNKED)
-                    && drainChunkedBody(source);
-        }
-        if (contentLength == null || contentLength.isEmpty()) {
-            return true;
-        }
-        long declared;
-        try {
-            declared = Long.parseLong(contentLength.trim());
-        } catch (NumberFormatException unparseable) {
-            return false;
-        }
-        if (declared < 0) {
-            return false;
-        }
-        if (declared > MAX_REQUEST_DRAIN_BYTES) {
-            return false;
-        }
-        return skipExactly(source, declared);
-    }
-
-    /**
-     * Discards a chunked request body, including its trailer section.
-     *
-     * @param source the connection to read from
-     * @return {@code true} if the whole body and trailer were consumed
-     * @throws IOException if the connection fails or falls idle
-     */
-    private static boolean drainChunkedBody(InputStream source) throws IOException {
-        long total = 0;
-        while (true) {
-            Line sizeLine = readLine(source, MAX_HEADER_LINE_BYTES);
-            if (sizeLine.truncated() || sizeLine.endOfStream()) {
-                return false;
-            }
-            String size = sizeLine.text();
-            int extension = size.indexOf(';');
-            if (extension >= 0) {
-                size = size.substring(0, extension);
-            }
-            size = size.trim();
-            long chunk;
-            try {
-                chunk = Long.parseLong(size, CHUNK_SIZE_RADIX);
-            } catch (NumberFormatException unparseable) {
-                return false;
-            }
-            if (chunk < 0) {
-                return false;
-            }
-            if (chunk == 0) {
-                return skipTrailer(source);
-            }
-            total += chunk;
-            if (total > MAX_CHUNKED_BODY_BYTES || !skipExactly(source, chunk)) {
-                return false;
-            }
-            Line terminator = readLine(source, MAX_HEADER_LINE_BYTES);
-            if (!terminator.text().isEmpty() || terminator.endOfStream()) {
-                return false;
-            }
-        }
-    }
-
-    /**
-     * Discards the trailer section that closes a chunked body.
-     *
-     * @param source the connection to read from
-     * @return {@code true} if the trailer ended with its blank line
-     * @throws IOException if the connection fails or falls idle
-     */
-    private static boolean skipTrailer(InputStream source) throws IOException {
-        for (int field = 0; field <= MAX_TRAILER_FIELDS; field++) {
-            Line line = readLine(source, MAX_HEADER_LINE_BYTES);
-            if (line.truncated() || line.endOfStream()) {
-                return false;
-            }
-            if (line.text().isEmpty()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Reads and discards an exact number of bytes.
-     *
-     * @param source the connection to read from
-     * @param count  how many bytes to discard
-     * @return {@code true} if every byte arrived
-     * @throws IOException if the connection fails or falls idle
-     */
-    private static boolean skipExactly(InputStream source, long count) throws IOException {
-        byte[] scratch = new byte[IO_BUFFER_BYTES];
-        long remaining = count;
-        while (remaining > 0) {
-            int wanted = (int) Math.min(remaining, scratch.length);
-            int read = source.read(scratch, 0, wanted);
-            if (read < 0) {
-                return false;
-            }
-            remaining -= read;
-        }
-        return true;
-    }
-
-    /**
-     * Serves one request on an established connection.
-     *
-     * <p>Grades the request through the frozen order documented on this class and
-     * writes exactly one response. Nothing about the request - not the target, not
-     * the method, not an exception message - is ever placed in a response.
-     *
-     * @param source the connection to read the request from
-     * @param sink   the connection to write the response to
-     * @param config the snapshot this server was created with
-     * @return {@code true} if the connection may be reused for another request
-     * @throws IOException if the connection fails or falls idle
-     */
-    private static boolean serveExchange(InputStream source, OutputStream sink, Config config)
-            throws IOException {
-        Line line = readLine(source, MAX_REQUEST_LINE_BYTES);
-        if (line.endOfStream()) {
-            return false;
-        }
-        if (!line.truncated() && line.text().isEmpty()) {
-            // RFC 9112 asks a server to tolerate one empty line before a request
-            // line, because a client that terminated its previous request with an
-            // extra CRLF is common and harmless. Exactly one is skipped.
-            line = readLine(source, MAX_REQUEST_LINE_BYTES);
-            if (line.endOfStream()) {
-                return false;
-            }
-        }
-        if (line.truncated()) {
-            writeTransportError(sink, HTTP_URI_TOO_LONG);
-            return false;
-        }
-        RequestLine request = parseRequestLine(line.text());
-        if (request.rejected()) {
-            writeTransportError(sink, request.failure());
-            return false;
-        }
-        List<String> headers = new ArrayList<>();
-        int headerFailure = readHeaders(source, headers);
-        if (headerFailure != 0) {
-            writeTransportError(sink, headerFailure);
-            return false;
-        }
-        if (request.persistentByDefault() && headerValue(headers, HEADER_NAME_HOST) == null) {
-            // RFC 9112 requires exactly this: an HTTP/1.1 request without a Host
-            // header is malformed, and a server must reject it rather than guess.
-            writeTransportError(sink, HTTP_BAD_REQUEST);
-            return false;
-        }
-        String expect = headerValue(headers, HEADER_NAME_EXPECT);
-        if (containsToken(expect, EXPECT_CONTINUE)) {
-            sink.write(CONTINUE_RESPONSE.getBytes(StandardCharsets.ISO_8859_1));
-            sink.flush();
-        }
-        boolean bodyConsumed = drainRequestBody(source,
-                headerValue(headers, HEADER_NAME_CONTENT_LENGTH),
-                headerValue(headers, HEADER_NAME_TRANSFER_ENCODING));
-        String connection = headerValue(headers, HEADER_NAME_CONNECTION);
-        boolean clientWantsClose = containsToken(connection, CONNECTION_CLOSE)
-                || (!request.persistentByDefault() && !containsToken(connection, CONNECTION_KEEP_ALIVE));
-        boolean reusable = bodyConsumed && !clientWantsClose;
-        // A contract response carries no Connection header in any of the three
-        // implementations, so the header set stays at exactly three fields whatever
-        // the client asked for; the connection is simply closed afterwards when it
-        // has to be.
-        boolean sendBody = !METHOD_HEAD.equals(request.method());
-        if (!METHOD_GET.equals(request.method())) {
-            writeResponse(sink, HTTP_METHOD_NOT_ALLOWED, REASON_METHOD_NOT_ALLOWED,
-                    BODY_METHOD_NOT_ALLOWED, true, false, sendBody);
-            return reusable;
-        }
-        if (config.healthPath().equals(normalisePath(request.target()))) {
-            writeResponse(sink, HTTP_OK, REASON_OK, healthPayload(config), false, false, true);
-        } else {
-            writeResponse(sink, HTTP_NOT_FOUND, REASON_NOT_FOUND, BODY_NOT_FOUND, false, false, true);
-        }
-        return reusable;
-    }
-
-    /**
-     * Serves one accepted connection, on its own virtual thread, until it ends.
-     *
-     * <p>Requests are answered one after another for as long as the client keeps the
-     * connection open and useful, which is what makes a keep-alive client see the
-     * same behaviour here as it does from the other two implementations. The socket
-     * is always closed, and it is closed politely: the write side is shut down first
-     * and anything the client is still sending is drained briefly, because closing
-     * on top of unread data is what makes a kernel answer with a reset and a client
-     * report "no response" for a request that was in fact answered.
-     *
-     * @param accepted the connection to serve
-     * @param config   the snapshot this server was created with
-     */
-    private static void serveConnection(Socket accepted, Config config) {
-        try (Socket connection = accepted) {
-            connection.setSoTimeout(IDLE_TIMEOUT_MILLIS);
-            connection.setTcpNoDelay(true);
-            InputStream source =
-                    new BufferedInputStream(connection.getInputStream(), IO_BUFFER_BYTES);
-            OutputStream sink =
-                    new BufferedOutputStream(connection.getOutputStream(), IO_BUFFER_BYTES);
-            boolean reusable = true;
-            while (reusable) {
-                reusable = serveExchange(source, sink, config);
-            }
-            politeClose(connection, source);
-        } catch (SocketTimeoutException idle) {
-            // A client that stopped mid-request; its connection is simply reclaimed.
-        } catch (IOException disconnected) {
-            // A client that vanished. Not this server's problem and not worth a line
-            // of output: an unreachable peer is normal traffic on a public port.
         } catch (RuntimeException unexpected) {
-            System.err.println(LOG_PREFIX + "connection failed unexpectedly: " + unexpected);
+            logWarning("handler failed: " + unexpected);
         }
     }
 
     /**
-     * Shuts down the write side and drains briefly before the socket is closed.
+     * Reads and discards a request body, bounded.
      *
-     * @param connection the connection being retired
-     * @param source     the connection's buffered input
+     * <p>The endpoint never inspects a body, but it must not leave one unread:
+     * bytes still queued when the connection closes make the kernel answer with a
+     * reset, so the client sees "connection reset by peer" instead of the response
+     * that was written for it. Reproduced with a one-mebibyte POST, which is
+     * answered 405 normally once the body is drained and reset without this method.
+     *
+     * <p>The read is capped at {@value #MAX_REQUEST_DRAIN_BYTES} bytes so that a
+     * deliberately endless body cannot hold a thread forever. Closing the stream
+     * afterwards is what lets the server decide whether the connection is still
+     * usable, and it is the reason a body beyond the cap costs nothing but that one
+     * connection.
+     *
+     * @param exchange the exchange whose request body is to be discarded
+     * @throws IOException if the connection fails while the body is being read
      */
-    private static void politeClose(Socket connection, InputStream source) {
-        try {
-            connection.shutdownOutput();
-            connection.setSoTimeout(LINGER_TIMEOUT_MILLIS);
-            byte[] scratch = new byte[IO_BUFFER_BYTES];
-            long discarded = 0;
-            while (discarded < MAX_LINGER_DRAIN_BYTES) {
-                int read = source.read(scratch);
+    private static void drainRequestBody(HttpExchange exchange) throws IOException {
+        try (InputStream body = exchange.getRequestBody()) {
+            byte[] scratch = new byte[DRAIN_BUFFER_BYTES];
+            long discarded = 0L;
+            while (discarded < MAX_REQUEST_DRAIN_BYTES) {
+                int read = body.read(scratch);
                 if (read < 0) {
                     return;
                 }
                 discarded += read;
             }
-        } catch (IOException alreadyGone) {
-            // Nothing left to do; the caller closes the socket either way.
+        }
+    }
+
+    /**
+     * Writes one complete response: status, length and body.
+     *
+     * <p>The length handed to the server is the encoded byte count, never the
+     * character count, so a multi-byte character in a configured value cannot
+     * desynchronise {@code Content-Length} from the body it describes.
+     *
+     * <p>{@code Content-Length} is declared in the header map as well as through
+     * the length argument, and the two carry the same value. The duplication earns
+     * its place on the response to HEAD: the server omits the field it would
+     * otherwise derive once it knows the method carries no body, and RFC 9110
+     * section 9.3.2 asks a HEAD response to carry the same fields the equivalent
+     * GET response would. A pre-set field is honoured, so declaring it here is what
+     * makes the HEAD header set equal to app.py's and index.js's rather than one
+     * field short of them.
+     *
+     * <p>The length argument, in contrast, becomes {@value #NO_RESPONSE_BODY} for a
+     * HEAD request, which is the server's sentinel for "header block only". Passing
+     * a real length instead still produces a correct response - the server
+     * substitutes a discarding sink - but it also makes the runtime log a warning
+     * about a body length declared for a method that has no body, and a mode of
+     * this program that writes an unexpected diagnostic is a mode that fails a
+     * clean-output check.
+     *
+     * <p>Writing the body is unconditional even so. The discarding sink makes it
+     * harmless, and one write path rather than two is one fewer place for the
+     * bodied and bodiless responses to drift apart.
+     *
+     * @param exchange the exchange to respond on
+     * @param status   HTTP status code
+     * @param body     complete response body, already compact JSON
+     * @throws IOException if the response cannot be written to the connection
+     */
+    private static void sendResponse(HttpExchange exchange, int status, String body)
+            throws IOException {
+        byte[] encoded = body.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders()
+                .set(HEADER_CONTENT_LENGTH, Integer.toString(encoded.length));
+        boolean bodyless = METHOD_HEAD.equals(exchange.getRequestMethod());
+        exchange.sendResponseHeaders(status, bodyless ? NO_RESPONSE_BODY : encoded.length);
+        try (OutputStream sink = exchange.getResponseBody()) {
+            sink.write(encoded);
         }
     }
 
@@ -1655,33 +1471,43 @@ public class User {
     // -------------------------------------------------------------------------
 
     /**
-     * A listening health endpoint: one socket, one acceptor, one thread per client.
+     * A listening health endpoint: one bound server, one virtual thread per exchange.
      *
-     * <p>The acceptor is a platform thread and deliberately <em>not</em> a daemon,
-     * because it is what keeps the process alive in --serve mode. Each accepted
-     * connection is handed to its own virtual thread, so the cost of a client that
-     * connects and then stalls is one parked virtual thread - a few hundred bytes -
-     * and no other client waits behind it. Virtual threads are daemon threads, so
-     * they never delay shutdown, and {@link #stop()} closes the socket, which is
-     * what releases the acceptor and lets a JVM that started a server exit on its
-     * own.
+     * <p>A thin lifecycle wrapper around {@link HttpServer}. It exists for three
+     * reasons rather than as ceremony: it carries the configuration snapshot beside
+     * the listener so that every response is built from the same values, it owns the
+     * executor so that stopping the server also releases the threads that were
+     * serving it, and it makes {@link #stop()} idempotent, which the raw server is
+     * not obliged to be and which matters because stop is reachable both from a
+     * shutdown hook and from a caller that stops the server itself.
+     *
+     * <p>The socket is bound by {@link User#createServer(Config)} before this object
+     * exists, so {@link #port()} answers the real port - including the one the
+     * operating system chose for an ephemeral bind - from the moment the server is
+     * created and before it is started.
+     *
+     * <p>Exchanges run on virtual threads: a client that connects and then stalls
+     * costs one parked virtual thread, a few hundred bytes, and no other client
+     * waits behind it. Those threads are daemon threads and never delay shutdown.
+     * What keeps a --serve process alive is the server's own non-daemon
+     * HTTP-Dispatcher thread, and what lets that process exit is {@link #stop()},
+     * which ends it.
      */
     static final class HealthServer {
-        private final ServerSocket listener;
+        private final HttpServer listener;
         private final Config config;
         private final ExecutorService workers;
         private final AtomicBoolean running = new AtomicBoolean(true);
-        private volatile Thread acceptor;
 
-        private HealthServer(ServerSocket listener, Config config) {
+        private HealthServer(HttpServer listener, Config config, ExecutorService workers) {
             this.listener = listener;
             this.config = config;
-            this.workers = Executors.newVirtualThreadPerTaskExecutor();
+            this.workers = workers;
         }
 
         /** @return the port actually bound, which is resolved even when 0 was asked for */
         int port() {
-            return listener.getLocalPort();
+            return listener.getAddress().getPort();
         }
 
         /** @return the snapshot every response from this server is built from */
@@ -1689,63 +1515,24 @@ public class User {
             return config;
         }
 
-        /** Starts accepting connections. Returns as soon as the acceptor is running. */
+        /** Starts accepting connections. Returns as soon as the dispatcher is running. */
         void start() {
-            Thread thread = new Thread(this::acceptLoop, ACCEPTOR_THREAD_NAME);
-            thread.setDaemon(false);
-            acceptor = thread;
-            thread.start();
+            listener.start();
         }
 
         /**
-         * Stops accepting, interrupts connections in flight and closes the socket.
+         * Stops accepting, abandons exchanges in flight and releases the port.
          *
          * <p>Idempotent, because it is reachable both from a shutdown hook and from
-         * a caller that stops the server itself.
+         * a caller that stops the server itself; the guard is what makes a second
+         * call a no-op rather than a second pass over a closed selector.
          */
         void stop() {
             if (!running.compareAndSet(true, false)) {
                 return;
             }
-            try {
-                listener.close();
-            } catch (IOException alreadyClosed) {
-                // The socket is going away regardless; nothing to report.
-            }
+            listener.stop(STOP_DELAY_SECONDS);
             workers.shutdownNow();
-            Thread thread = acceptor;
-            if (thread != null) {
-                thread.interrupt();
-            }
-        }
-
-        private void acceptLoop() {
-            while (running.get()) {
-                Socket accepted;
-                try {
-                    accepted = listener.accept();
-                } catch (IOException closedOrRefused) {
-                    if (running.get()) {
-                        System.err.println(LOG_PREFIX + "accept failed: " + closedOrRefused);
-                        continue;
-                    }
-                    return;
-                }
-                try {
-                    workers.execute(() -> serveConnection(accepted, config));
-                } catch (RejectedExecutionException stopping) {
-                    closeQuietly(accepted);
-                    return;
-                }
-            }
-        }
-
-        private static void closeQuietly(Socket socket) {
-            try {
-                socket.close();
-            } catch (IOException alreadyClosed) {
-                // Nothing to do: the connection is being abandoned deliberately.
-            }
         }
     }
 
@@ -1785,19 +1572,42 @@ public class User {
      * @throws IOException if the address cannot be bound
      */
     static HealthServer createServer(Config config) throws IOException {
-        ServerSocket listener = new ServerSocket();
+        // Validation runs before the bind, which is what makes the refusal total: a
+        // configuration that could not be published truthfully never reaches a
+        // listening socket, so there is no window in which a port is held by a
+        // server that would answer 200 with a payload the contract forbids.
+        validateConfig(config);
+        // The request-time bound is installed before the first touch of the server
+        // class, whose configuration is read once from a static initialiser: set it
+        // afterwards and it is ignored. An operator who passed -D explicitly is
+        // honoured rather than overridden.
+        if (System.getProperty(MAX_REQUEST_TIME_PROPERTY) == null) {
+            System.setProperty(MAX_REQUEST_TIME_PROPERTY, MAX_REQUEST_TIME_SECONDS);
+        }
+        // The executor is built before the bind, deliberately. A server that has
+        // been created but never started does not release its port when it is
+        // stopped - the socket is closed from the dispatcher thread, which does not
+        // exist yet, and that was confirmed by execution - so there must be no step
+        // between the bind and the return that could throw and leave a bound socket
+        // with no owner. Everything fallible therefore happens first, and the two
+        // calls that follow the bind cannot fail for these arguments: the context
+        // path is a compile-time constant beginning with "/", the handler is never
+        // null, and the executor is installed before the server is started.
+        ThreadFactory factory = Thread.ofVirtual()
+                .name(WORKER_THREAD_PREFIX, WORKER_THREAD_START)
+                .factory();
+        ExecutorService workers = Executors.newThreadPerTaskExecutor(factory);
+        HttpServer listener;
         try {
-            listener.setReuseAddress(true);
-            listener.bind(new InetSocketAddress(config.host(), config.port()), SERVER_BACKLOG);
+            listener = HttpServer.create(new InetSocketAddress(config.host(), config.port()),
+                    SERVER_BACKLOG);
         } catch (IOException | RuntimeException bindFailure) {
-            try {
-                listener.close();
-            } catch (IOException alsoFailed) {
-                bindFailure.addSuppressed(alsoFailed);
-            }
+            workers.shutdownNow();
             throw bindFailure;
         }
-        return new HealthServer(listener, config);
+        listener.createContext(CONTEXT_PATH, exchange -> handle(exchange, config));
+        listener.setExecutor(workers);
+        return new HealthServer(listener, config, workers);
     }
 
     /**
@@ -1825,11 +1635,18 @@ public class User {
      * it, so a configured value can never move the cursor, clear the screen or
      * forge a second line in an operator's log.
      *
-     * <p>A shutdown hook stops the listener so that a container stop or a Ctrl-C
-     * closes the socket in an orderly way instead of dropping connections in
-     * flight. Both failure modes are fatal and fail closed with a non-zero exit
-     * status and a one-line diagnostic rather than a stack trace: an address that
-     * cannot be bound, and a configured port that is not a port at all.
+     * <p>This method returns as soon as the listener is up; it does not block. What
+     * keeps the process running afterwards is the server's own non-daemon dispatcher
+     * thread, which is also what a stop has to end. A shutdown hook therefore calls
+     * {@code stop} so that a container stop or a Ctrl-C closes the listening socket
+     * and releases the port deterministically rather than leaving the JVM to be
+     * killed with the port still held. The stop is immediate and does not wait for
+     * exchanges in flight, which costs nothing worth having: a health response is
+     * written in microseconds, so there is no work a grace period would rescue, and
+     * an orchestrator that has decided to stop this container wants the port back.
+     * Both failure modes are fatal and fail closed with a non-zero exit status and a
+     * one-line diagnostic rather than a stack trace: an address that cannot be
+     * bound, and a configured port that is not a port at all.
      *
      * <p>Termination convention. The hook runs to completion, but the JVM still
      * reports the signal that ended it, so this process exits {@code 130} on
@@ -1847,7 +1664,12 @@ public class User {
         try {
             config = loadConfig();
         } catch (IllegalArgumentException unusable) {
-            System.err.println(LOG_PREFIX + "refusing to start: " + unusable.getMessage());
+            // An interactive start names the value it refused. The operator is at
+            // the terminal and the value came from their own environment, so
+            // tracing the refusal back to what they typed is worth more here than
+            // withholding it - the probe path, which runs unattended, is the one
+            // that reports the same fault as a bare category.
+            logWarning("refusing to start: " + unusable.getMessage());
             System.exit(EXIT_FAILURE);
             return;
         }
@@ -1856,14 +1678,36 @@ public class User {
             Runtime.getRuntime().addShutdownHook(
                     new Thread(server::stop, SHUTDOWN_THREAD_NAME));
             server.start();
-            System.err.println(LOG_PREFIX + "health endpoint listening on http://"
-                    + sanitiseForLog(config.host()) + ":" + server.port()
-                    + sanitiseForLog(config.healthPath()));
+            logWarning("health endpoint listening on http://" + config.host() + ":"
+                    + server.port() + config.healthPath());
+        } catch (IllegalArgumentException unpublishable) {
+            logWarning("refusing to start: " + unpublishable.getMessage());
+            System.exit(EXIT_FAILURE);
         } catch (IOException bindFailure) {
-            System.err.println(LOG_PREFIX + "could not bind " + sanitiseForLog(config.host())
-                    + ":" + config.port() + ": " + bindFailure);
+            logWarning("could not bind " + config.host() + ":" + config.port() + ": "
+                    + bindFailure.getClass().getSimpleName());
             System.exit(EXIT_FAILURE);
         }
+    }
+
+    /**
+     * Writes one diagnostic line to stderr, sanitised, and nothing to stdout.
+     *
+     * <p>The single emitter for every diagnostic this program produces. It exists
+     * because sanitising at each call site is a rule that holds only until the next
+     * call site is added: before this method every {@code LOG_PREFIX} write but one
+     * bypassed the sanitiser, so a carriage return in a configured value or in an
+     * exception message could forge a second log line. Routing all of them through
+     * one method makes the property structural instead of a convention.
+     *
+     * <p>stderr rather than stdout is not a style choice either: the default mode's
+     * stdout is hashed byte for byte by the backward-compatibility gate, so stdout
+     * carries the one preserved line and nothing else, ever.
+     *
+     * @param message the diagnostic text, already prefix-free
+     */
+    private static void logWarning(String message) {
+        System.err.println(LOG_PREFIX + sanitiseForLog(message));
     }
 
     /**
@@ -1899,10 +1743,39 @@ public class User {
 
     // -------------------------------------------------------------------------
     // Self-check consumed by the container health check
+    //
+    // This is the mode a container runs on a timer, forever, and its exit status is
+    // the only thing the runtime looks at, so every property below is load-bearing
+    // rather than defensive decoration.
+    //
+    //   * It is a PARSE, not a substring test. The defect this replaces graded a
+    //     body healthy whenever it contained the bytes "status":"UP" anywhere, so a
+    //     truncated document with no closing brace, a document with the fragment
+    //     buried inside another field's value, and any unrelated body that happened
+    //     to carry those bytes all reported a broken application as healthy - to a
+    //     runtime whose only remedy is a restart it would then never perform.
+    //   * It targets LOOPBACK ONLY, from an allowlist. app.host is an input; a
+    //     probe that honoured it verbatim could be aimed at a third party, whose
+    //     healthy answer would then vouch for this process.
+    //   * It uses NO PROXY and follows NO REDIRECT, so nothing ambient can put
+    //     another party between this process and its own endpoint.
+    //   * It reads a BOUNDED body under an ABSOLUTE deadline, so neither an endless
+    //     stream nor a listener that accepts and then trickles can exhaust or wedge
+    //     the one component that runs forever on a schedule.
+    //   * It NEVER throws and never writes to stdout. Every fault is a verdict.
+    //
+    // The rejection wording is identical in app.py, index.js and here, because an
+    // operator greps one deployment's logs and not one language's.
     // -------------------------------------------------------------------------
 
     /**
      * Self-checks the endpoint described by the effective configuration.
+     *
+     * <p>Validates the configuration before it probes anything. A configuration
+     * that could not be published truthfully cannot be proven healthy either, so
+     * the same rules that refuse a start refuse a probe - which is what stops a
+     * container from reporting itself healthy while serving a payload the frozen
+     * contract forbids.
      *
      * @return {@value #EXIT_SUCCESS} when healthy, {@value #EXIT_FAILURE} otherwise
      */
@@ -1910,79 +1783,613 @@ public class User {
         Config config;
         try {
             config = loadConfig();
-        } catch (IllegalArgumentException unusable) {
-            System.err.println(LOG_PREFIX + "probe cannot run: " + unusable.getMessage());
+        } catch (IllegalArgumentException unusablePort) {
+            // The category is identical in all three implementations; the offending
+            // value is appended because this program's own suite requires an
+            // operator to be able to trace the refusal back to what they typed.
+            logWarning("probe cannot run: the configured port is unusable: "
+                    + unusablePort.getMessage());
+            return EXIT_FAILURE;
+        }
+        try {
+            validateConfig(config);
+        } catch (IllegalArgumentException unpublishable) {
+            // Printed verbatim, which is safe by construction: every message
+            // validateConfig produces names a key and quotes no value.
+            logWarning("probe cannot run: " + unpublishable.getMessage());
             return EXIT_FAILURE;
         }
         return probe(config.host(), config.port(), config.healthPath());
     }
 
     /**
-     * Performs one in-process GET of a health endpoint and grades the result.
+     * Self-checks one explicit endpoint and grades the answer against the contract.
      *
-     * <p>Healthy means both a 200 status and a body that actually reports the
-     * status as {@code UP}; a 200 carrying anything else is treated as
-     * unhealthy. The check is a substring test rather than a parse, which is
-     * deliberate: it needs no JSON parser, and the JDK has none to offer.
+     * <p>Kept separate from {@link #probe()} so that a harness can aim it at an
+     * arbitrary port without an environment override, which is what makes the
+     * positive and negative cases testable in-process.
      *
-     * <p>Everything else - an unreachable port, a timeout, a malformed
-     * configured path, an interrupt - is graded unhealthy. The method fails
-     * closed, never throws, and never writes to stdout, so it is safe to use as
-     * a container health command whose only channel is an exit status.
+     * <p>The deadline is ABSOLUTE and covers the whole exchange - connect, request,
+     * status line, header block and body - because the two per-operation budgets the
+     * client offers do not. A connect timeout expires before a connection exists and
+     * a request timeout expires before the response headers arrive; neither bounds
+     * the body read that follows, so a listener that accepted the connection,
+     * answered 200 and then sent one byte a minute would hold this method open for
+     * as long as it liked. Running the exchange on one virtual thread and bounding
+     * it with a single {@code get} is what makes the whole thing finish.
      *
      * @param host       host the server was bound to; a wildcard is probed over loopback
      * @param port       port the server is listening on
-     * @param healthPath path to request
+     * @param healthPath route to request
      * @return {@value #EXIT_SUCCESS} when healthy, {@value #EXIT_FAILURE} otherwise
      */
     static int probe(String host, int port, String healthPath) {
-        String target = "";
+        String route = normalisePath(healthPath);
+        if (!isRequestTarget(route)) {
+            // The route is withheld from this line on purpose: a configured path
+            // carrying CR or LF is what a log-forgery attempt looks like, so the
+            // one line the refusal emits carries none of it.
+            logWarning("probe cannot run: the configured health path is not a valid"
+                    + " request target");
+            return EXIT_FAILURE;
+        }
+        if (port < MIN_PORT || port > MAX_PORT) {
+            logWarning("probe cannot run: the configured port is unusable");
+            return EXIT_FAILURE;
+        }
+        String authority = probeAuthority(host);
+        String target = "http://" + authority + ":" + port + route;
+        URI uri;
         try {
-            target = "http://" + probeAuthority(host) + ":" + port + healthPath;
-            HttpRequest request = HttpRequest.newBuilder(URI.create(target))
+            uri = new URI(target);
+        } catch (URISyntaxException malformed) {
+            logWarning("probe cannot run: the configured health path is not a valid"
+                    + " request target");
+            return EXIT_FAILURE;
+        }
+        return probeAnswer(uri, target);
+    }
+
+    /**
+     * Runs one bounded exchange and turns its answer into a verdict.
+     *
+     * @param uri    the loopback URL to request
+     * @param target the same URL as text, for the one diagnostic that names it
+     * @return {@value #EXIT_SUCCESS} when healthy, {@value #EXIT_FAILURE} otherwise
+     */
+    private static int probeAnswer(URI uri, String target) {
+        HttpClient client = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .proxy(HttpClient.Builder.NO_PROXY)
+                .followRedirects(HttpClient.Redirect.NEVER)
+                .connectTimeout(Duration.ofSeconds(PROBE_TIMEOUT_SECONDS))
+                .build();
+        ExecutorService runner = Executors.newSingleThreadExecutor(
+                Thread.ofVirtual().name(PROBE_THREAD_NAME).factory());
+        try {
+            HttpRequest request = HttpRequest.newBuilder(uri)
                     .timeout(Duration.ofSeconds(PROBE_TIMEOUT_SECONDS))
+                    .header(HEADER_ACCEPT, CONTENT_TYPE_JSON)
                     .GET()
                     .build();
-            try (HttpClient client = HttpClient.newBuilder()
-                    .version(HttpClient.Version.HTTP_1_1)
-                    .connectTimeout(Duration.ofSeconds(PROBE_TIMEOUT_SECONDS))
-                    .build()) {
-                HttpResponse<String> response =
-                        client.send(request, HttpResponse.BodyHandlers.ofString());
-                if (response.statusCode() == HTTP_OK && response.body().contains(STATUS_UP_FRAGMENT)) {
-                    return EXIT_SUCCESS;
+            Future<Answer> pending = runner.submit(() -> {
+                HttpResponse<InputStream> response =
+                        client.send(request, HttpResponse.BodyHandlers.ofInputStream());
+                try (InputStream stream = response.body()) {
+                    // One byte over the ceiling, deliberately: reading exactly the
+                    // ceiling could not tell a body that fits from one that was
+                    // truncated to fit, and a truncated body might still parse.
+                    return new Answer(response.statusCode(),
+                            stream.readNBytes(MAX_PROBE_BODY_BYTES + 1));
                 }
-                System.err.println(LOG_PREFIX + "probe rejected " + target
-                        + ": status " + response.statusCode());
-                return EXIT_FAILURE;
+            });
+            Answer answer = pending.get(PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            String rejection = probeRejection(answer.status(), answer.body());
+            if (rejection == null) {
+                return EXIT_SUCCESS;
             }
+            logWarning("probe rejected: " + rejection);
+            return EXIT_FAILURE;
+        } catch (TimeoutException expired) {
+            logWarning("probe rejected: no response within the probe deadline");
+            return EXIT_FAILURE;
+        } catch (ExecutionException failed) {
+            // The cause's TYPE, never its message: the message can quote the target
+            // and, through it, a configured value.
+            Throwable cause = (failed.getCause() == null) ? failed : failed.getCause();
+            logWarning("probe could not reach " + target + ": "
+                    + cause.getClass().getSimpleName());
+            return EXIT_FAILURE;
         } catch (InterruptedException interrupted) {
             // Restore the flag so an enclosing caller can still observe it.
             Thread.currentThread().interrupt();
-            System.err.println(LOG_PREFIX + "probe interrupted");
+            logWarning("probe rejected: interrupted before an answer arrived");
             return EXIT_FAILURE;
-        } catch (IOException | RuntimeException unreachable) {
-            System.err.println(LOG_PREFIX + "probe could not reach " + target + ": " + unreachable);
+        } catch (RuntimeException unexpected) {
+            logWarning("probe could not reach " + target + ": "
+                    + unexpected.getClass().getSimpleName());
             return EXIT_FAILURE;
+        } finally {
+            // shutdownNow on both, in this order. The runner is cancelled first so
+            // that no task is still reading when the client's connection is closed
+            // under it, and the client is closed rather than left to a finaliser so
+            // that a timed-out exchange cannot hold a socket past this method.
+            runner.shutdownNow();
+            client.shutdownNow();
         }
     }
 
     /**
-     * Converts a bind address into an address a client can actually connect to.
+     * One endpoint answer: the status code and the bounded body bytes.
      *
-     * <p>A wildcard bind address is not a destination, so the probe targets
-     * loopback instead - which is also the only interface a container health
-     * check needs. An IPv6 literal is wrapped in brackets so that it can carry a
-     * port in a URL without the colons being misread.
-     *
-     * @param host the configured bind address
-     * @return an authority suitable for placing in an HTTP URL
+     * @param status HTTP status code the endpoint answered with
+     * @param body   the body as read, at most one byte past the probe ceiling
      */
-    private static String probeAuthority(String host) {
-        if (host == null || host.isEmpty()
-                || WILDCARD_HOST_V4.equals(host) || WILDCARD_HOST_V6.equals(host)) {
+    private record Answer(int status, byte[] body) { }
+
+    /**
+     * Converts a configured bind address into a loopback destination.
+     *
+     * <p>This is an ALLOWLIST, and that is the whole point. {@code app.host} is an
+     * input: before this method a configured host was honoured verbatim, so a probe
+     * could be aimed at any address at all and a third party's healthy answer would
+     * vouch for this process. The only destinations reachable now are the loopback
+     * interface and nothing else.
+     *
+     * <table border="1">
+     * <caption>The complete mapping</caption>
+     * <tr><th>Configured {@code app.host}</th><th>Probe destination</th></tr>
+     * <tr><td>{@code null}, empty, blank</td><td>{@code 127.0.0.1}</td></tr>
+     * <tr><td>{@code 0.0.0.0}, {@code ::}, {@code [::]}, {@code *}</td>
+     *     <td>{@code 127.0.0.1}</td></tr>
+     * <tr><td>{@code localhost}</td><td>{@code 127.0.0.1} - MAPPED, never resolved,
+     *     so a hosts-file entry cannot redirect the probe</td></tr>
+     * <tr><td>{@code ::1}, {@code [::1]}, {@code 0:0:0:0:0:0:0:1},
+     *     {@code [0:0:0:0:0:0:0:1]}</td><td>{@code [::1]}</td></tr>
+     * <tr><td>any address in {@code 127.0.0.0/8}</td><td>itself, as configured</td></tr>
+     * <tr><td>anything else</td><td>{@code 127.0.0.1}, with one warning that does
+     *     NOT echo the refused value</td></tr>
+     * </table>
+     *
+     * <p>Matching is case-insensitive and trims surrounding whitespace, so the same
+     * destination is reached however the value was written. The warning withholds
+     * the refused host because it is a configured input, and a diagnostic that
+     * quoted it would carry that input into a log line.
+     *
+     * @param host the configured bind address; {@code null} is accepted
+     * @return {@code 127.0.0.1}, {@code [::1]}, or a 127.0.0.0/8 address as configured
+     */
+    static String probeAuthority(String host) {
+        String candidate = (host == null) ? "" : host.trim();
+        String lowered = candidate.toLowerCase(Locale.ROOT);
+        if (candidate.isEmpty() || WILDCARD_HOSTS.contains(lowered)
+                || LOOPBACK_NAME.equals(lowered)) {
             return LOOPBACK_HOST;
         }
-        return (host.indexOf(':') >= 0) ? "[" + host + "]" : host;
+        if (IPV6_LOOPBACK_FORMS.contains(lowered)) {
+            return LOOPBACK_AUTHORITY_V6;
+        }
+        if (isIpv4Loopback(candidate)) {
+            return candidate;
+        }
+        logWarning("probe target is not loopback; probing loopback instead");
+        return LOOPBACK_HOST;
+    }
+
+    /**
+     * Reports whether a value is a dotted-quad address inside {@code 127.0.0.0/8}.
+     *
+     * <p>Written out rather than delegated to {@link java.net.InetAddress}, which
+     * would resolve a name and could therefore be steered by a hosts file or a DNS
+     * answer - the exact redirection this allowlist exists to prevent. Nothing here
+     * touches the network.
+     *
+     * @param candidate the trimmed configured host
+     * @return {@code true} only for {@code 127.b.c.d} with four octets in 0-255
+     */
+    private static boolean isIpv4Loopback(String candidate) {
+        if (!candidate.startsWith(IPV4_LOOPBACK_PREFIX)) {
+            return false;
+        }
+        String[] octets = candidate.split("\\.", -1);
+        if (octets.length != IPV4_OCTET_COUNT) {
+            return false;
+        }
+        for (String octet : octets) {
+            if (!isAsciiDigits(octet) || octet.length() > IPV4_OCTET_MAX_DIGITS
+                    || Integer.parseInt(octet) > IPV4_OCTET_MAX) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Reports whether a value is a non-empty run of ASCII digits and nothing else.
+     *
+     * @param candidate the text to test
+     * @return {@code true} for one or more characters, all of them 0-9
+     */
+    private static boolean isAsciiDigits(String candidate) {
+        if (candidate == null || candidate.isEmpty()) {
+            return false;
+        }
+        for (int index = 0; index < candidate.length(); index++) {
+            if (!isAsciiDigit(candidate.charAt(index))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Grades one answer against the frozen contract.
+     *
+     * <p>Package-private and free of any transport so that every rule below is
+     * reachable by a direct call. The reason strings are part of the shared
+     * contract - app.py's counterpart is module-level and index.js exports its own
+     * for the same reason - because a reason observable only by reading stderr is a
+     * reason that drifts unnoticed between three implementations.
+     *
+     * <p>The rules, in the order they are applied. The ORDER is part of the
+     * contract: the cheapest and most fundamental checks come first, and the
+     * {@code status} field is examined before the three descriptive fields so that
+     * an endpoint reporting itself down is reported as DOWN rather than as whichever
+     * of its other fields happened also to be wrong.
+     * <ol>
+     *   <li>the body fits inside {@value #MAX_PROBE_BODY_BYTES} bytes;</li>
+     *   <li>the status is exactly 200 - the IETF health-check draft couples a
+     *       passing status to a 2xx code and this contract narrows that to one;</li>
+     *   <li>the body is UTF-8, is well-formed JSON, carries no repeated key and has
+     *       nothing trailing it;</li>
+     *   <li>the body is a JSON OBJECT;</li>
+     *   <li>it carries exactly {@link #PAYLOAD_KEYS}, in that order;</li>
+     *   <li>{@code status} equals {@value #STATUS_UP};</li>
+     *   <li>{@code name} is a non-empty string, {@code version} matches
+     *       {@link #VERSION_GRAMMAR}, and {@code timestamp} matches
+     *       {@link #TIMESTAMP_GRAMMAR} - the timestamp by FORMAT, never by
+     *       value, so no gate can become time-flaky.</li>
+     * </ol>
+     *
+     * @param status HTTP status code the endpoint answered with
+     * @param body   the body as read, at most one byte past the probe ceiling
+     * @return {@code null} when the answer proves health, otherwise the reason it
+     *         does not
+     */
+    static String probeRejection(int status, byte[] body) {
+        if (body == null || body.length > MAX_PROBE_BODY_BYTES) {
+            return "body exceeds the probe limit of " + MAX_PROBE_BODY_BYTES + " bytes";
+        }
+        if (status != HTTP_OK) {
+            return "the endpoint answered status " + status;
+        }
+        Object document;
+        try {
+            document = new JsonReader(decodeStrictUtf8(body)).readDocument();
+        } catch (IllegalArgumentException malformed) {
+            return "body is not the expected JSON document";
+        }
+        if (!(document instanceof Map<?, ?> members)) {
+            return "body is not a JSON object and carries no status field";
+        }
+        if (!PAYLOAD_KEYS.equals(List.copyOf(members.keySet()))) {
+            return PROBE_KEY_SET_REASON;
+        }
+        if (!STATUS_UP.equals(members.get(PAYLOAD_KEY_STATUS))) {
+            return "the status field is not the expected value";
+        }
+        if (!(members.get(PAYLOAD_KEY_NAME) instanceof String name) || name.isEmpty()) {
+            return "the name field is not a non-empty string";
+        }
+        if (!(members.get(PAYLOAD_KEY_VERSION) instanceof String version)
+                || !VERSION_GRAMMAR.matcher(version).matches()) {
+            return "the version field is not a three-part dotted numeric version";
+        }
+        if (!(members.get(PAYLOAD_KEY_TIMESTAMP) instanceof String moment)
+                || !TIMESTAMP_GRAMMAR.matcher(moment).matches()) {
+            return "the timestamp field is not a whole-second UTC instant";
+        }
+        return null;
+    }
+
+    /**
+     * Decodes body bytes as UTF-8, refusing anything that is not.
+     *
+     * <p>{@code new String(bytes, UTF_8)} silently substitutes a replacement
+     * character for a malformed sequence, which would let a body that is not UTF-8
+     * at all reach the reader as something that might parse. app.py's
+     * {@code bytes.decode("utf-8")} raises on the same input, so reporting is what
+     * keeps the two graders in step.
+     *
+     * @param body the bytes as read from the endpoint
+     * @return the decoded text
+     * @throws IllegalArgumentException if the bytes are not valid UTF-8
+     */
+    private static String decodeStrictUtf8(byte[] body) {
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(body))
+                    .toString();
+        } catch (CharacterCodingException notUtf8) {
+            throw new IllegalArgumentException("body is not UTF-8");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // A strict reader for one JSON document
+    //
+    // The JDK ships no JSON parser, so rather than add a dependency and lose the
+    // repository's zero-dependency property, the self-check reads the one document
+    // shape it has to grade. It is strict where a lenient reader would let a
+    // hostile body through, and it refuses, among other things: a document with
+    // trailing content after the first value; an unquoted or single-quoted member
+    // name; an unescaped control character inside a string; an unknown escape; a
+    // \\u escape that is not four hexadecimal digits; a number with a leading zero,
+    // a leading plus, a bare decimal point or a missing exponent digit; a trailing
+    // comma; a comment; and a REPEATED member name.
+    //
+    // The repeated name is refused rather than resolved, and that is a deliberate
+    // divergence from both sibling runtimes' parsers. JSON.parse and json.loads
+    // both keep the LAST value for a duplicated key and say nothing, so a body
+    // carrying status twice would be graded on whichever value the parser kept -
+    // a document with two answers is not a document this endpoint could ever have
+    // produced, so all three implementations refuse it outright instead.
+    //
+    // Nesting is capped at MAX_JSON_DEPTH levels. A recursive-descent reader with
+    // no cap answers ten thousand opening brackets with a StackOverflowError, which
+    // is an error rather than a verdict; the cap turns it into a rejection. The
+    // input length is capped by the caller before this reader ever sees it.
+    //
+    // Members are kept in insertion order, which is what lets the caller assert the
+    // key SEQUENCE and not merely the key set.
+    // -------------------------------------------------------------------------
+
+    /** A recursive-descent reader for exactly one JSON document. */
+    private static final class JsonReader {
+        private final String text;
+        private int index;
+
+        /**
+         * @param text the document to read; {@code null} is read as empty and
+         *             therefore refused, never accepted by default
+         */
+        JsonReader(String text) {
+            this.text = (text == null) ? "" : text;
+        }
+
+        /**
+         * Reads the one value this document must consist of, in full.
+         *
+         * @return the parsed value: a {@code Map}, {@code List}, {@code String},
+         *         {@code Double}, {@code Boolean} or {@code null}
+         * @throws IllegalArgumentException if the document is not well-formed
+         */
+        Object readDocument() {
+            skipWhitespace();
+            Object value = readValue(1);
+            skipWhitespace();
+            if (index != text.length()) {
+                throw fail("unexpected trailing content");
+            }
+            return value;
+        }
+
+        private Object readValue(int depth) {
+            if (depth > MAX_JSON_DEPTH) {
+                throw fail("nesting deeper than " + MAX_JSON_DEPTH + " levels");
+            }
+            return switch (peek()) {
+                case '{' -> readObject(depth);
+                case '[' -> readArray(depth);
+                case '"' -> readString();
+                case 't' -> readKeyword("true", Boolean.TRUE);
+                case 'f' -> readKeyword("false", Boolean.FALSE);
+                case 'n' -> readKeyword("null", null);
+                default -> readNumber();
+            };
+        }
+
+        private Map<String, Object> readObject(int depth) {
+            expect('{');
+            Map<String, Object> members = new LinkedHashMap<>();
+            skipWhitespace();
+            if (peek() == '}') {
+                index++;
+                return members;
+            }
+            while (true) {
+                skipWhitespace();
+                if (peek() != '"') {
+                    throw fail("expected a quoted member name");
+                }
+                String name = readString();
+                skipWhitespace();
+                expect(':');
+                skipWhitespace();
+                Object value = readValue(depth + 1);
+                if (members.putIfAbsent(name, value) != null) {
+                    throw fail("repeated member name");
+                }
+                skipWhitespace();
+                char separator = next();
+                if (separator == '}') {
+                    return members;
+                }
+                if (separator != ',') {
+                    throw fail("expected ',' or '}'");
+                }
+            }
+        }
+
+        private List<Object> readArray(int depth) {
+            expect('[');
+            List<Object> elements = new ArrayList<>();
+            skipWhitespace();
+            if (peek() == ']') {
+                index++;
+                return elements;
+            }
+            while (true) {
+                skipWhitespace();
+                elements.add(readValue(depth + 1));
+                skipWhitespace();
+                char separator = next();
+                if (separator == ']') {
+                    return elements;
+                }
+                if (separator != ',') {
+                    throw fail("expected ',' or ']'");
+                }
+            }
+        }
+
+        private String readString() {
+            expect('"');
+            StringBuilder value = new StringBuilder();
+            while (true) {
+                char current = next();
+                if (current == '"') {
+                    return value.toString();
+                }
+                if (current == '\\') {
+                    value.append(readEscape());
+                    continue;
+                }
+                if (current < PRINTABLE_MIN_CHAR) {
+                    throw fail("unescaped control character in a string");
+                }
+                value.append(current);
+            }
+        }
+
+        private char readEscape() {
+            char marker = next();
+            return switch (marker) {
+                case '"' -> '"';
+                case '\\' -> '\\';
+                case '/' -> '/';
+                case 'b' -> '\b';
+                case 'f' -> '\f';
+                case 'n' -> '\n';
+                case 'r' -> '\r';
+                case 't' -> '\t';
+                case 'u' -> readUnicodeEscape();
+                default -> throw fail("unknown escape");
+            };
+        }
+
+        private char readUnicodeEscape() {
+            if (index + JSON_UNICODE_DIGITS > text.length()) {
+                throw fail("truncated unicode escape");
+            }
+            String digits = text.substring(index, index + JSON_UNICODE_DIGITS);
+            for (int offset = 0; offset < JSON_UNICODE_DIGITS; offset++) {
+                if (!isHexDigit(digits.charAt(offset))) {
+                    throw fail("unicode escape is not four hexadecimal digits");
+                }
+            }
+            index += JSON_UNICODE_DIGITS;
+            return (char) Integer.parseInt(digits, JSON_UNICODE_RADIX);
+        }
+
+        private Double readNumber() {
+            int start = index;
+            if (peek() == '-') {
+                index++;
+            }
+            readDigits(true);
+            if (index < text.length() && text.charAt(index) == '.') {
+                index++;
+                readDigits(false);
+            }
+            if (index < text.length()
+                    && (text.charAt(index) == 'e' || text.charAt(index) == 'E')) {
+                index++;
+                if (index < text.length()
+                        && (text.charAt(index) == '+' || text.charAt(index) == '-')) {
+                    index++;
+                }
+                readDigits(false);
+            }
+            // The value is never read - only its well-formedness matters - but
+            // producing it keeps the reader honest about what it accepted.
+            return Double.valueOf(text.substring(start, index));
+        }
+
+        /**
+         * @param integerPart {@code true} for the integer part, where the grammar
+         *                    forbids a leading zero followed by further digits
+         */
+        private void readDigits(boolean integerPart) {
+            int start = index;
+            while (index < text.length() && isAsciiDigit(text.charAt(index))) {
+                index++;
+            }
+            if (index == start) {
+                throw fail("expected a digit");
+            }
+            if (integerPart && text.charAt(start) == '0' && index - start > 1) {
+                throw fail("a number may not have a leading zero");
+            }
+        }
+
+        private Object readKeyword(String keyword, Object value) {
+            if (!text.startsWith(keyword, index)) {
+                throw fail("expected '" + keyword + "'");
+            }
+            index += keyword.length();
+            return value;
+        }
+
+        private char peek() {
+            if (index >= text.length()) {
+                throw fail("unexpected end of document");
+            }
+            return text.charAt(index);
+        }
+
+        private char next() {
+            char current = peek();
+            index++;
+            return current;
+        }
+
+        private void expect(char required) {
+            if (next() != required) {
+                throw fail("expected '" + required + "'");
+            }
+        }
+
+        /** Skips the four characters RFC 8259 counts as whitespace, and no others. */
+        private void skipWhitespace() {
+            while (index < text.length()) {
+                char current = text.charAt(index);
+                if (current != ' ' && current != '\t' && current != '\n' && current != '\r') {
+                    return;
+                }
+                index++;
+            }
+        }
+
+        private static boolean isHexDigit(char current) {
+            return isAsciiDigit(current)
+                    || (current >= 'a' && current <= 'f')
+                    || (current >= 'A' && current <= 'F');
+        }
+
+        /**
+         * Builds the rejection. The message names the offset and never quotes the
+         * document, so a hostile body cannot place its own text in a log line
+         * through this path - and the caller collapses every one of these into a
+         * single fixed category anyway.
+         *
+         * @param reason what was expected or found
+         * @return the exception for the caller to throw
+         */
+        private IllegalArgumentException fail(String reason) {
+            return new IllegalArgumentException(reason + " at offset " + index);
+        }
     }
 }

@@ -25,37 +25,13 @@
  * script expect; and HEAD is answered with 405, because the endpoint is
  * GET-only by design and no identified consumer issues a HEAD request.
  *
- * Request validation is owned by this file rather than delegated to the
- * runtime, because Node's default error paths emit responses that are off the
- * frozen contract: a bare "400 Bad Request" with no body for anything the
- * parser rejects, a chunked 400 carrying a `Date` header for a missing Host,
- * and no response at all for CONNECT. Every one of those paths is intercepted
- * here so that a client always receives the same three headers and the same
- * JSON error shape the Python and Java implementations return:
+ * Reading and framing a request is the runtime's job. `node:http` is the whole
+ * HTTP implementation here; this file supplies a plain request handler that
+ * decides which of exactly three responses to write, and nothing else:
  *
- *   400 Bad Request                    malformed request line, target or Host
- *   404 Not Found                      any target other than the health route
- *   405 Method Not Allowed             any method other than GET (+ Allow: GET)
- *   414 URI Too Long                   request line >= 65536 bytes
- *   431 Request Header Fields Too Large  header block, line or field cap exceeded
- *   505 HTTP Version Not Supported     well-formed version with major != 1
- *
- * Node's HTTP parser (llhttp) is stricter than the hand-written parsers in
- * app.py and User.java on three inputs, and more lenient on one. The
- * divergences are accepted rather than papered over, because reconstructing a
- * request the primary parser rejected would mean answering 200 on the strength
- * of a second, unproven parser - a fail-open behaviour. Answering 400 is
- * fail-closed, and every one of these responses is still on contract:
- *
- *   bare LF line endings      400 here, 200 in Python/Java. RFC 9112 section
- *                             2.2 makes LF-only recognition a MAY, so both are
- *                             conformant.
- *   obs-fold continuation     400 here, 200 in Python/Java. RFC 9112 section
- *                             5.2 names 400 as the preferred rejection.
- *   invalid Content-Length    400 here for a GET; a non-GET still resolves to
- *                             405 from the request line, matching the others.
- *   >1 leading empty line     200 here, 400 in Python/Java. RFC 9112 section
- *                             2.2 asks a server to ignore "at least one".
+ *   200 OK                     GET on the configured health route
+ *   404 Not Found              any other target
+ *   405 Method Not Allowed     any other method (+ Allow: GET)
  *
  * The module is dependency-free: everything below comes from the Node
  * standard library, so `node index.js` works on a bare runtime with no
@@ -129,7 +105,104 @@ const WILDCARD_HOSTS = Object.freeze(["", "*", "0.0.0.0", "::", "[::]"]);
 const LOOPBACK_HOST = "127.0.0.1";
 
 /**
- * Returns the first argument that is a non-empty string, trimmed; undefined
+ * The IPv6 loopback authority. Bracketed, because a URL authority carrying a
+ * bare `::1` would have its colons read as a port separator.
+ */
+const LOOPBACK_AUTHORITY_V6 = "[::1]";
+
+/**
+ * Every spelling of IPv6 loopback that is accepted, because a properties file
+ * may write the address compressed or expanded and both name the same interface.
+ */
+const IPV6_LOOPBACK_FORMS = Object.freeze([
+  "::1",
+  "[::1]",
+  "0:0:0:0:0:0:0:1",
+  "[0:0:0:0:0:0:0:1]",
+]);
+
+/**
+ * The one host NAME treated as loopback. RFC 6761 reserves it for exactly that,
+ * and it is MAPPED to the numeric address rather than resolved, so a hosts-file
+ * entry cannot redirect a self-check off this machine.
+ */
+const LOOPBACK_NAME = "localhost";
+
+/**
+ * Every IPv4 address in 127.0.0.0/8 is loopback, so a listener deliberately
+ * bound to, say, 127.0.0.2 is still probed at the address it is actually on.
+ */
+const IPV4_LOOPBACK_PREFIX = "127.";
+
+/**
+ * The shared port grammar: an optional sign, then ASCII digits, and nothing
+ * else. Written as an explicit character class rather than `\d` so that the
+ * intent survives a future `u` flag - and so that it reads as the same rule the
+ * Python and Java implementations apply, which is the point of pinning it.
+ */
+const PORT_GRAMMAR = /^[+-]?[0-9]+$/;
+
+/** The frozen three-part dotted version contract from the response schema. */
+const VERSION_GRAMMAR = /^[0-9]+\.[0-9]+\.[0-9]+$/;
+
+/**
+ * The frozen timestamp contract: a fixed-width UTC instant truncated to whole
+ * seconds with a `Z` designator. Used only to assert the SHAPE of a field, never
+ * its value - the timestamp is the one non-deterministic part of the payload.
+ */
+const TIMESTAMP_GRAMMAR = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
+
+/**
+ * The character range a request target may be made of: visible US-ASCII only.
+ * Space and every control character are therefore excluded, which is what stops
+ * a configured route from carrying a CR and an LF - a header-injection
+ * primitive the moment such a value reaches a request line or a log line.
+ */
+const TARGET_MIN_CHAR = 0x21;
+const TARGET_MAX_CHAR = 0x7e;
+
+/**
+ * The key set and the key ORDER the probe requires of an answer, and the single
+ * wording all three implementations use when an answer does not carry them. The
+ * reason is pinned as a constant because an operator greps one deployment's
+ * logs rather than one language's, and this is the easiest reason in the set to
+ * drift: every language has a different natural way to print a list.
+ */
+const PAYLOAD_KEYS = Object.freeze(["name", "version", "timestamp", "status"]);
+const PROBE_KEY_SET_REASON =
+  'body does not carry exactly the keys ["name","version","timestamp","status"] in order';
+
+/**
+ * Largest health answer the probe will read. The contract body is 108 bytes, so
+ * this is roughly seventy times the largest legitimate answer and exists only to
+ * bound MEMORY: an endpoint that streams without end must be refused rather than
+ * accumulated. The same ceiling is applied in app.py and User.java.
+ */
+const MAX_PROBE_BODY_BYTES = 8192;
+
+/**
+ * Listener timeouts, all four of them, because Node's defaults are wrong for a
+ * health endpoint in two directions at once.
+ *
+ * `headersTimeout` defaults to 60 s and `requestTimeout` to 300 s, so a client
+ * that opens a connection and then trickles can hold a socket - and the memory
+ * behind it - for five minutes; on a container whose only job is to answer a
+ * 108-byte document in milliseconds, that is a slow-loris budget rather than a
+ * grace period. `server.timeout` defaults to 0, meaning an established socket
+ * that goes quiet is never reclaimed at all.
+ *
+ * `connectionsCheckingInterval` is how often the runtime sweeps for connections
+ * that have outlived those budgets; it is a CONSTRUCTOR option rather than a
+ * property, so it is passed to createServer() where it takes effect.
+ */
+const CONNECTION_CHECK_INTERVAL_MS = 500;
+const HEADERS_TIMEOUT_MS = 10000;
+const REQUEST_TIMEOUT_MS = 15000;
+const SOCKET_TIMEOUT_MS = 30000;
+const KEEP_ALIVE_TIMEOUT_MS = 5000;
+
+/**
+ * Returns the first argument that is a supplied string, verbatim; undefined
  * when there is none.
  *
  * An environment variable set to the empty string is treated as absent rather
@@ -137,13 +210,35 @@ const LOOPBACK_HOST = "127.0.0.1";
  * non-empty name and a dotted version, so an empty value must fall through to
  * the next source instead of producing a payload that violates the contract.
  *
+ * ONLY the empty string is absent, and the winning value is returned exactly as
+ * it was supplied. Both halves of that sentence are correctness requirements
+ * rather than preferences, because the same precedence chain exists in app.py
+ * and User.java and all three must agree on every input:
+ *
+ *   * app.py resolves with `if override:` and User.java with
+ *     `!fromEnvironment.isEmpty()`, so a whitespace-only value is a SUPPLIED
+ *     value in both. Trimming before the presence test - which this function
+ *     used to do - silently erased it here, and a supplied-but-invalid PORT of
+ *     "   " then fell through to the built-in default instead of being
+ *     rejected. That is precisely the failure fail-closed exists to prevent:
+ *     the operator asked for a specific port, so a healthy process listening
+ *     somewhere they are not watching is worse than a refusal. Whitespace is
+ *     now carried through to `resolvePort`, which rejects it.
+ *   * Neither sibling trims the value it returns either, so trimming here would
+ *     make a configured name, version, path or host differ across the three
+ *     implementations for the same input. Values that legitimately need
+ *     trimming are trimmed at the point of use: `resolvePort` trims before
+ *     parsing, exactly as User.java's `raw.trim()` and app.py's
+ *     `int(str(value).strip())` do, and the properties parser already trims
+ *     what it reads from the file.
+ *
  * @param {...unknown} candidates Values in precedence order.
- * @returns {string|undefined} The first usable value.
+ * @returns {string|undefined} The first supplied value, exactly as supplied.
  */
 function firstNonEmpty(...candidates) {
   for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim() !== "") {
-      return candidate.trim();
+    if (typeof candidate === "string" && candidate !== "") {
+      return candidate;
     }
   }
   return undefined;
@@ -152,15 +247,26 @@ function firstNonEmpty(...candidates) {
 /**
  * Writes a diagnostic to stderr.
  *
- * Every message this module emits goes through here, because stdout carries
- * the legacy output that a committed hash asserts byte for byte - a single
- * stray console.log would break backward compatibility.
+ * Every message this module emits goes through here, and two guarantees follow
+ * from that being a single exit rather than a convention every call site has to
+ * remember.
+ *
+ * Nothing reaches stdout: stdout carries the legacy output that a committed hash
+ * asserts byte for byte, so a single stray console.log would break backward
+ * compatibility.
+ *
+ * And no caller can forge a log line. The text is stripped of control characters
+ * by sanitizeForLog before the newline is appended, so a configured value
+ * carrying a CR and an LF cannot produce a second line in whatever collects this
+ * process's stderr, and a terminal escape sequence cannot rewrite what an
+ * operator sees. sanitizeForLog is declared further down the file; function
+ * declarations are hoisted, so the call below resolves.
  *
  * @param {string} message Human-readable diagnostic, without a trailing newline.
  * @returns {void}
  */
 function warn(message) {
-  process.stderr.write(`index.js: ${message}\n`);
+  process.stderr.write(`index.js: ${sanitizeForLog(String(message))}\n`);
 }
 
 /**
@@ -211,7 +317,10 @@ function readProperties(file) {
     return parseProperties(fs.readFileSync(file, "utf8"));
   } catch (error) {
     if (error && error.code !== "ENOENT") {
-      warn(`could not read ${file} (${error.code || error.message}); using defaults`);
+      // The category is reported and nothing else. The path is a deployment
+      // detail and the error message embeds it, so neither reaches the line -
+      // the file is one command away from the operator reading it.
+      warn("cannot read the configuration file; using defaults");
     }
     return {};
   }
@@ -244,6 +353,13 @@ function withLeadingSlash(value) {
  * The accepted grammar is the same one Integer.parseInt and int() accept, so
  * all three implementations reject the same values.
  *
+ * Surrounding whitespace is removed before that test and nowhere else, which is
+ * what makes PORT=" 8080 " resolve to 8080 here just as it does in User.java's
+ * `Integer.parseInt(raw.trim())` and app.py's `int(str(value).strip())` - while
+ * PORT="   " trims to the empty string, fails the digit test and is REJECTED
+ * rather than skipped. A supplied value is always graded; only a value that was
+ * never supplied at all falls through to the next candidate.
+ *
  * Port 0 is legal: it is how a test binds an ephemeral port and reads the
  * assignment back from the server.
  *
@@ -253,12 +369,15 @@ function withLeadingSlash(value) {
  */
 function resolvePort(candidates) {
   for (const candidate of candidates) {
-    const value = firstNonEmpty(candidate);
-    if (value === undefined) {
+    const supplied = firstNonEmpty(candidate);
+    if (supplied === undefined) {
       continue;
     }
-    if (!/^[+-]?\d+$/.test(value)) {
-      throw new RangeError(`invalid port ${JSON.stringify(value)}: expected an integer`);
+    const value = supplied.trim();
+    if (!PORT_GRAMMAR.test(value)) {
+      throw new RangeError(
+        `invalid port ${JSON.stringify(supplied)}: expected an ASCII decimal integer`,
+      );
     }
     const port = Number(value);
     if (port < PORT_MIN || port > PORT_MAX) {
@@ -276,6 +395,12 @@ function resolvePort(candidates) {
  * then the built-in default. The port has one extra rung above all of those -
  * the universal PORT variable - so PORT beats NODE_PORT beats `node.port`
  * beats 8001.
+ *
+ * A variable set to the empty string is the ONLY value treated as absent; every
+ * other supplied value wins its rung and is used exactly as supplied. app.py and
+ * User.java resolve the same chain the same way, so the three implementations
+ * agree on every input - including the awkward ones, where a supplied but
+ * unusable port is refused by all three rather than quietly replaced.
  *
  * Both the file path and the environment map are injectable so that callers
  * (notably the unit tests) can assert the precedence chain without mutating
@@ -304,6 +429,121 @@ function loadConfig(options = {}) {
   });
 }
 
+/**
+ * Returns true when text is a non-empty string carrying no control character.
+ *
+ * The rule for the two configured values that are neither a route nor a number:
+ * a name that appears in the published payload, and a host that appears in a
+ * diagnostic. For both, the only real constraint is that they can be printed on
+ * one line - which is also what stops either of them forging a second one.
+ *
+ * @param {unknown} text Candidate value.
+ * @returns {boolean} True when the value is safe to publish and to print.
+ */
+function isSingleLineText(text) {
+  if (typeof text !== "string" || text === "") {
+    return false;
+  }
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Returns true when a target is made only of characters allowed in one.
+ *
+ * Every character must be visible US-ASCII. Applied to the CONFIGURED route
+ * rather than to an inbound request - reading an inbound request is the platform
+ * server's job - so that a health path carrying a space, a CR or an LF is
+ * refused where it is configured instead of becoming an injected request line in
+ * probe().
+ *
+ * @param {unknown} target Candidate request target.
+ * @returns {boolean} True when every character is visible US-ASCII.
+ */
+function isRequestTarget(target) {
+  if (typeof target !== "string" || target === "") {
+    return false;
+  }
+  for (let index = 0; index < target.length; index += 1) {
+    const code = target.charCodeAt(index);
+    if (code < TARGET_MIN_CHAR || code > TARGET_MAX_CHAR) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Refuses a configuration this endpoint must not publish.
+ *
+ * Configuration is an input, and every value it carries ends up either in the
+ * public health document or in the route that serves it. Without this check a
+ * non-empty but malformed value was accepted verbatim: `APP_VERSION` of
+ * `not-a-version` was served inside a 200 response whose `status` field read
+ * `UP`, so the endpoint attested to its own health while describing itself in a
+ * form no consumer of the frozen contract could parse. A health endpoint that
+ * reports success while breaking its own contract is worse than one that refuses
+ * to start, because nothing downstream can tell.
+ *
+ * Four rules, identical in app.py and User.java:
+ *
+ *   - `name` is non-empty and carries no control character. It is a payload
+ *     field, and a control character in it would also break the single-line
+ *     startup banner and diagnostics.
+ *   - `version` matches VERSION_GRAMMAR exactly.
+ *   - `healthPath` begins with "/" and is a valid request target.
+ *   - `host` is non-empty and carries no control character.
+ *
+ * Enforced at both of the points where a bad value would otherwise become
+ * observable: creating the server, before the socket is bound, so a misconfigured
+ * process never listens at all; and running the probe, so a probe cannot report
+ * healthy a configuration the server would refuse to serve.
+ *
+ * No message quotes the offending value. The key names the setting, which is all
+ * an operator needs in order to find it, and withholding the value is what lets
+ * probe() print this message verbatim without a configured string reaching a log
+ * line. The port is deliberately NOT checked here: resolvePort already grades it
+ * at the point of use, where the failure can be reported as the transport fault
+ * it is.
+ *
+ * @param {{name?: string, version?: string, healthPath?: string, host?: string}} config
+ *   Configuration to check, normally from loadConfig.
+ * @returns {void}
+ * @throws {RangeError} On the first rule that fails.
+ */
+function validateConfig(config) {
+  if (config === undefined || config === null || typeof config !== "object") {
+    throw new RangeError("no configuration was resolved");
+  }
+  if (!isSingleLineText(config.name)) {
+    throw new RangeError(
+      "invalid app.name: it must be non-empty text with no control character",
+    );
+  }
+  if (typeof config.version !== "string" || !VERSION_GRAMMAR.test(config.version)) {
+    throw new RangeError(
+      "invalid app.version: it must be a three-part dotted numeric version",
+    );
+  }
+  if (
+    typeof config.healthPath !== "string" ||
+    !config.healthPath.startsWith(ROOT_PATH) ||
+    !isRequestTarget(config.healthPath)
+  ) {
+    throw new RangeError("invalid health.path: it is not a valid request target");
+  }
+  if (!isSingleLineText(config.host)) {
+    throw new RangeError(
+      "invalid app.host: it must be non-empty text with no control character",
+    );
+  }
+}
+
 /* -------------------------------------------------------------------------- *
  * Health payload - the frozen response contract
  * -------------------------------------------------------------------------- */
@@ -328,145 +568,36 @@ const ALLOWED_METHODS = "GET";
  */
 const NOT_FOUND_BODY = JSON.stringify({ error: "Not Found" });
 const METHOD_NOT_ALLOWED_BODY = JSON.stringify({ error: "Method Not Allowed" });
-const BAD_REQUEST_BODY = JSON.stringify({ error: "Bad Request" });
-const URI_TOO_LONG_BODY = JSON.stringify({ error: "URI Too Long" });
-const HEADERS_TOO_LARGE_BODY = JSON.stringify({
-  error: "Request Header Fields Too Large",
-});
-const VERSION_NOT_SUPPORTED_BODY = JSON.stringify({
-  error: "HTTP Version Not Supported",
-});
 
 /* -------------------------------------------------------------------------- *
- * Request validation - limits and grammar shared with app.py and User.java
+ * Health payload construction and route normalisation
  * -------------------------------------------------------------------------- */
 
-/** Root path, and the value an empty target normalises to. */
+/** Root path, and the value an empty or query-only target normalises to. */
 const ROOT_PATH = "/";
 
-/** Line terminator, and the version token every response status line carries. */
-const CRLF = "\r\n";
-const HTTP_VERSION_LINE = "HTTP/1.1";
-
-/** Separator that marks an absolute-form request target ("http://host/path"). */
+/**
+ * Marks an absolute-form request target, as in `GET http://host/health`.
+ *
+ * RFC 9112 section 3.2.2 requires a server to accept this form even though almost
+ * no client emits it, and all three implementations reduce it to its path so that
+ * the same request reaches the same route in every one of them.
+ *
+ * @type {string}
+ */
 const SCHEME_SEPARATOR = "://";
 
 /**
- * Size limits, identical to the constants in User.java and app.py so that a
- * request at a boundary is answered with the same status by all three servers.
+ * Introduces a URI fragment.
  *
- * A request line of exactly 65535 bytes is accepted (it is merely routed, and
- * will normally 404); 65536 or more is 414. A single header line of 16384 bytes
- * or more is 431, as is a header block above 16384 bytes in total or a field
- * count above 100.
- */
-const MAX_REQUEST_LINE_BYTES = 65536;
-const MAX_HEADER_LINE_BYTES = 16384;
-const MAX_HEADER_BLOCK_BYTES = 16384;
-const MAX_HEADER_FIELDS = 100;
-
-/**
- * Parser buffer cap, set well above every limit above.
+ * A real request target never carries one - RFC 9110 section 7.1 has the client
+ * strip it before sending - so this is stripped defensively, and because the same
+ * function normalises the CONFIGURED health path, where one could be written by
+ * hand.
  *
- * The default (16 KiB) makes llhttp reject an over-long request line before the
- * handler ever runs, which would answer 431 where the other two servers answer
- * 414. Raising the cap lets an oversized-but-parseable request reach the
- * handler, where the limits above classify it exactly as they do elsewhere. The
- * largest request this policy can accept is a 65535-byte request line plus a
- * 16384-byte header block, so 128 KiB leaves generous headroom while still
- * bounding what a single connection may buffer.
+ * @type {string}
  */
-const MAX_HEADER_SIZE = 131072;
-
-/** Idle timeout for a persistent connection, matching the other two servers. */
-const KEEP_ALIVE_TIMEOUT_MS = 30000;
-
-/**
- * Largest request body that is read and discarded before an answer is written.
- *
- * The endpoint never uses a request body, but it must still read one. A client
- * that sends "POST /health" with a megabyte of content and "Connection: close"
- * is still uploading when the 405 is ready, and answering-then-closing at that
- * moment resets the connection: the client's send fails and the response it
- * needed is lost. Draining first turns that reset into a readable answer.
- *
- * The drain is bounded so a declared body cannot occupy a connection
- * indefinitely; past the bound the answer is written and the connection is
- * retired, which is the same trade-off app.py and User.java make.
- */
-const MAX_DRAIN_BYTES = 8 * 1024 * 1024;
-
-/**
- * Marker under which a decided-but-unwritten answer is parked on its socket.
- *
- * A request whose body is truncated reaches the handler first - so its answer is
- * already known - and only then raises a parser error. Node delivers that error
- * before the request stream reports the abort, so without this marker the error
- * path would overwrite a correct 405 with a 400. Parking the answer lets the
- * error path write what was already decided, which is what app.py and User.java
- * do: they classify from the request line, and a truncated body does not change
- * that classification.
- */
-const PENDING_ANSWER = Symbol("pendingAnswer");
-
-/**
- * Punctuation permitted in an RFC 9110 token, which is the grammar a method
- * name must satisfy. A method built only from these characters and ALPHA/DIGIT
- * is well formed but unsupported, so it earns 405; anything else is malformed
- * and earns 400.
- */
-const METHOD_TOKEN_SPECIALS = "!#$%&'*+-.^_`|~";
-
-/**
- * A request target must be visible US-ASCII. Space terminates the target, and
- * every other byte outside this range - control characters, TAB, and anything
- * above 0x7E - makes the request line malformed.
- */
-const TARGET_MIN_CHAR = 0x21;
-const TARGET_MAX_CHAR = 0x7e;
-
-/** A well-formed HTTP version token, captured so the major digit can be read. */
-const VERSION_PATTERN = /^HTTP\/(\d+)\.(\d+)$/;
-
-/**
- * The version Node reports for a two-token request line ("GET /health"). That
- * form is HTTP/0.9, which this policy rejects as malformed rather than
- * unsupported, matching app.py and User.java.
- */
-const HTTP_09_VERSION = "0.9";
-
-/**
- * Reason phrases for the status codes written directly to a socket, where no
- * ServerResponse object exists to supply one.
- */
-const REASON_PHRASES = Object.freeze({
-  400: "Bad Request",
-  405: "Method Not Allowed",
-  414: "URI Too Long",
-  431: "Request Header Fields Too Large",
-  505: "HTTP Version Not Supported",
-});
-
-/** Response body for each status code written directly to a socket. */
-const ERROR_BODIES = Object.freeze({
-  400: BAD_REQUEST_BODY,
-  405: METHOD_NOT_ALLOWED_BODY,
-  414: URI_TOO_LONG_BODY,
-  431: HEADERS_TOO_LARGE_BODY,
-  505: VERSION_NOT_SUPPORTED_BODY,
-});
-
-/**
- * The statuses that end the connection and announce it.
- *
- * These four say the byte stream itself could not be understood, so the parser
- * cannot know where the next request would begin and reuse is unsafe. They are
- * the only responses that carry a Connection header; 200, 404 and 405 never do,
- * because a routing or method decision leaves the stream perfectly parseable.
- * The split is by status code alone, so it is identical in all three languages
- * regardless of which internal path produced the response.
- */
-const CLOSING_STATUSES = Object.freeze([400, 414, 431, 505]);
+const FRAGMENT_MARKER = "#";
 
 /**
  * Current UTC instant, truncated to whole seconds, with a trailing "Z".
@@ -530,35 +661,60 @@ function renderPayload(source) {
 }
 
 /**
- * Reports whether a character is an ASCII letter.
+ * Normalises a request target to a comparable path.
  *
- * @param {string} character Single character.
- * @returns {boolean} True for A-Z or a-z.
+ * Two steps, in order and identical to normalisePath in User.java and
+ * normalize_path in app.py: drop everything from the first "?", then remove
+ * exactly one trailing slash when something is left in front of it.
+ *
+ * What the function deliberately does NOT do matters as much as what it does.
+ * It performs no percent-decoding, so "/health%2f" stays distinct from
+ * "/health/"; it resolves no dot segments, so "/health/../health" does not
+ * reach the route; and it collapses no leading slashes, so "//health" and
+ * "///health" are distinct from "/health". Each of those transformations would
+ * widen the route to targets an operator did not configure.
+ *
+ * The function is pure and total - an absent, empty or query-only target
+ * normalises to the root rather than throwing - which is what lets the tests
+ * assert its behaviour directly without a server.
+ *
+ * @param {string} rawUrl Raw request target, e.g. req.url.
+ * @returns {string} Normalised path.
  */
-function isAsciiLetter(character) {
-  return (character >= "A" && character <= "Z") || (character >= "a" && character <= "z");
+function normalizePath(rawUrl) {
+  const raw = typeof rawUrl === "string" && rawUrl !== "" ? rawUrl : ROOT_PATH;
+  let normalised = stripAuthority(raw);
+  const queryIndex = normalised.indexOf("?");
+  if (queryIndex >= 0) {
+    normalised = normalised.slice(0, queryIndex);
+  }
+  const fragmentIndex = normalised.indexOf(FRAGMENT_MARKER);
+  if (fragmentIndex >= 0) {
+    normalised = normalised.slice(0, fragmentIndex);
+  }
+  if (normalised.length > 1 && normalised.endsWith(ROOT_PATH)) {
+    normalised = normalised.slice(0, -1);
+  }
+  return normalised === "" ? ROOT_PATH : normalised;
 }
 
 /**
- * Reports whether a character is an ASCII digit.
+ * Reports whether a character is an unaccented ASCII letter.
  *
- * @param {string} character Single character.
- * @returns {boolean} True for 0-9.
+ * @param {string} current A single character.
+ * @returns {boolean} `true` for A-Z and a-z only.
  */
-function isAsciiDigit(character) {
-  return character >= "0" && character <= "9";
+function isAsciiLetter(current) {
+  return (current >= "a" && current <= "z") || (current >= "A" && current <= "Z");
 }
 
 /**
- * Reports whether a string is a URI scheme: ALPHA followed by any number of
- * ALPHA, DIGIT, "+", "-" or ".".
+ * Reports whether a string is a URI scheme as RFC 3986 defines one.
  *
- * Checking the scheme is what stops "//health" being mistaken for an
- * absolute-form target: the text before the "://" must look like a scheme
- * before any authority is stripped.
+ * ALPHA followed by any number of ALPHA, DIGIT, `+`, `-` or `.`.
  *
- * @param {string} candidate Text before the "://" separator.
- * @returns {boolean} True when the text is a syntactically valid scheme.
+ * @param {string} candidate The text before `://` in a request target.
+ * @returns {boolean} `true` when it could be a scheme.
  */
 function isScheme(candidate) {
   if (candidate === "" || !isAsciiLetter(candidate.charAt(0))) {
@@ -568,7 +724,7 @@ function isScheme(candidate) {
     const current = candidate.charAt(index);
     const allowed =
       isAsciiLetter(current) ||
-      isAsciiDigit(current) ||
+      (current >= "0" && current <= "9") ||
       current === "+" ||
       current === "-" ||
       current === ".";
@@ -580,16 +736,22 @@ function isScheme(candidate) {
 }
 
 /**
- * Reduces an absolute-form request target to its path.
+ * Reduces an absolute-form request target to its path component.
  *
- * RFC 9112 permits "GET http://host/health HTTP/1.1" against an origin server,
- * and a proxy-aware client may send exactly that. The authority is dropped so
- * the path routes identically to the origin form. A target that is not
- * absolute-form - including "//health", whose "" prefix is not a scheme - is
- * returned unchanged.
+ * `GET http://host:8001/health HTTP/1.1` is a request shape RFC 9112 section
+ * 3.2.2 requires a server to accept, and it is the only shape in which the target
+ * carries a scheme and an authority. Reducing it here is what makes the absolute
+ * form reach the same route the origin form reaches - and what makes this module
+ * agree with `app.py` and `User.java`, which perform the identical reduction.
  *
- * @param {string} target Raw request target.
- * @returns {string} Target with any scheme and authority removed.
+ * The scheme is VALIDATED before anything is stripped, and that ordering is the
+ * whole safety of this function: a relative target whose query string happens to
+ * contain `://` - a redirect parameter such as `/health?next=http://elsewhere/` -
+ * has `/health?next=http` before the separator, which is not a scheme, so it is
+ * returned completely untouched.
+ *
+ * @param {string} target The request target as it arrived.
+ * @returns {string} The path component of an absolute-form target, or the target.
  */
 function stripAuthority(target) {
   const separator = target.indexOf(SCHEME_SEPARATOR);
@@ -599,95 +761,6 @@ function stripAuthority(target) {
   const authorityStart = separator + SCHEME_SEPARATOR.length;
   const pathStart = target.indexOf("/", authorityStart);
   return pathStart < 0 ? ROOT_PATH : target.slice(pathStart);
-}
-
-/**
- * Normalises a request target to a comparable path.
- *
- * The steps are, in order and identical to normalisePath in User.java and
- * normalize_path in app.py: drop any scheme and authority, drop everything from
- * the first "?", drop everything from the first "#", then remove exactly one
- * trailing slash when something is left in front of it.
- *
- * What the function deliberately does NOT do matters as much as what it does.
- * It performs no percent-decoding, so "/health%2f" stays distinct from
- * "/health/"; it resolves no dot segments, so "/health/../health" does not
- * reach the route; and it collapses no leading slashes, so "//health" and
- * "///health" are distinct from "/health". Each of those transformations would
- * widen the route to targets an operator did not configure.
- *
- * The function is pure, which is what lets the tests assert its behaviour
- * directly without a server.
- *
- * @param {string} rawUrl Raw request target, e.g. req.url.
- * @returns {string} Normalised path, always starting with "/".
- */
-function normalizePath(rawUrl) {
-  const raw = typeof rawUrl === "string" && rawUrl !== "" ? rawUrl : ROOT_PATH;
-  let path = stripAuthority(raw);
-  const queryIndex = path.indexOf("?");
-  if (queryIndex >= 0) {
-    path = path.slice(0, queryIndex);
-  }
-  const fragmentIndex = path.indexOf("#");
-  if (fragmentIndex >= 0) {
-    path = path.slice(0, fragmentIndex);
-  }
-  if (path.length > 1 && path.endsWith(ROOT_PATH)) {
-    path = path.slice(0, -1);
-  }
-  return path === "" ? ROOT_PATH : path;
-}
-
-/**
- * Reports whether a method name is a well-formed RFC 9110 token.
- *
- * The distinction decides the status code: a token Node does not recognise
- * ("FOO", or the lowercase "get") is a valid but unsupported method and earns
- * 405 with an Allow header, while a non-token ("<script>alert(1)</script>") is
- * a malformed request line and earns 400. Answering 405 to a non-token would
- * imply the request was understood.
- *
- * @param {string} method Candidate method name.
- * @returns {boolean} True when every character is tchar and the name is non-empty.
- */
-function isMethodToken(method) {
-  if (typeof method !== "string" || method === "") {
-    return false;
-  }
-  for (const character of method) {
-    const allowed =
-      isAsciiLetter(character) ||
-      isAsciiDigit(character) ||
-      METHOD_TOKEN_SPECIALS.includes(character);
-    if (!allowed) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/**
- * Reports whether a request target is non-empty visible US-ASCII.
- *
- * A target carrying a TAB, a control character or any byte above 0x7E is
- * malformed: such a request line cannot be unambiguously delimited, and
- * accepting it would let a caller smuggle a second line past the parser.
- *
- * @param {string} target Candidate request target.
- * @returns {boolean} True when the target is safe to route.
- */
-function isRequestTarget(target) {
-  if (typeof target !== "string" || target === "") {
-    return false;
-  }
-  for (let index = 0; index < target.length; index += 1) {
-    const code = target.charCodeAt(index);
-    if (code < TARGET_MIN_CHAR || code > TARGET_MAX_CHAR) {
-      return false;
-    }
-  }
-  return true;
 }
 
 /**
@@ -715,23 +788,27 @@ function sanitizeForLog(text) {
  * -------------------------------------------------------------------------- */
 
 /**
- * Writes a JSON response with exactly the contract headers.
+ * Writes a JSON response carrying exactly the contract headers.
  *
- * `sendDate` is switched off because Node would otherwise add a Date header
- * that neither the Python nor the Java implementation emits. `Connection` is
- * removed for the same reason: Node adds `Connection: keep-alive` plus a
- * `Keep-Alive` header on a persistent HTTP/1.1 response, which the other two
- * servers do not, and removing it before writeHead() stops both from being
- * computed. Persistence itself is unaffected - it is governed by the parser's
- * own keep-alive decision, not by the header this function suppresses - so the
- * connection is still reused across requests. No Server header is ever set, so
- * the runtime version is not advertised.
+ * Two suppressions are load-bearing rather than cosmetic. `sendDate` is
+ * switched off because Node would otherwise add a `Date` header that the Python
+ * implementation does not emit. `Connection` is removed for the same reason:
+ * Node adds `Connection: keep-alive` plus a `Keep-Alive` header on a persistent
+ * HTTP/1.1 response, and removing the header before writeHead() stops both from
+ * being computed. Persistence itself is unaffected - it is governed by the
+ * parser's own keep-alive decision rather than by the header suppressed here -
+ * so the connection is still reused across requests. No `Server` header is ever
+ * set, so the runtime version is not advertised.
  *
- * The result is the same three-header set in all three languages:
+ * The result is the same three-header set the other two implementations emit:
  * Content-Type, Cache-Control and Content-Length, plus Allow on a 405.
  *
+ * `Content-Length` is the BYTE length rather than the character count, so a
+ * multi-byte character in a configured value cannot desynchronise the
+ * advertised length from the body.
+ *
  * @param {import("node:http").ServerResponse} res Response to write.
- * @param {number} statusCode HTTP status code.
+ * @param {number} statusCode 200, 404 or 405.
  * @param {string} body Already-rendered JSON document.
  * @param {Record<string, string>} [extraHeaders] Additional headers, e.g. Allow.
  * @returns {void}
@@ -744,11 +821,6 @@ function writeJson(res, statusCode, body, extraHeaders) {
     "Cache-Control": CACHE_CONTROL,
     "Content-Length": Buffer.byteLength(body),
   };
-  if (CLOSING_STATUSES.includes(statusCode)) {
-    // Setting the header back is what makes Node end the connection after this
-    // response, which is the behaviour these four statuses require.
-    headers.Connection = "close";
-  }
   if (extraHeaders) {
     Object.assign(headers, extraHeaders);
   }
@@ -757,365 +829,65 @@ function writeJson(res, statusCode, body, extraHeaders) {
 }
 
 /**
- * Writes a contract error response straight to a socket and closes it.
+ * Builds an unstarted HTTP server for the health endpoint.
  *
- * Used on the paths where no ServerResponse exists: a request the parser
- * rejected, and a CONNECT tunnel request. The status line, the three contract
- * headers and the JSON body are identical to what writeJson would have
- * produced, so a caller cannot tell which path answered it - including the
- * Connection header, which is present for the four transport-error statuses and
- * absent for 405, exactly as writeJson and the other two servers arrange it.
+ * The handler is three lines of routing over `node:http`: a method other than
+ * GET is 405 with an `Allow` header, a target that does not normalise to the
+ * configured route is 404, and everything else is the health document. There is
+ * no fourth outcome, and nothing here reads the request body - the endpoint
+ * answers from configuration and the clock alone.
  *
- * The socket is always closed afterwards, whether or not the close was
- * announced. A 405 raised from here follows a parser error, so the stream
- * cannot be resumed even though the status alone does not say so; app.py and
- * User.java likewise omit the header on a contract response that happens to be
- * the connection's last.
+ * Configuration is resolved ONCE here rather than per request, so every response
+ * a given server produces describes the same application; the Python and Java
+ * implementations snapshot at construction for the same reason. Reloading is
+ * what a restart is for.
  *
- * The function is safe to call on a socket that has already been answered or
- * destroyed, which matters because a single malformed request can raise more
- * than one parser error (a bad Transfer-Encoding, for instance, is reported
- * after the response to that request has already been written).
+ * It is also VALIDATED here, before any socket exists. A server that bound a
+ * port and then answered 200/UP with a malformed version would have published
+ * the very thing the validation exists to refuse, and would have looked healthy
+ * while doing it - so the refusal happens at construction, where the caller's own
+ * catch block learns about the typo rather than a monitoring system three layers
+ * away.
  *
- * @param {import("node:net").Socket} socket Socket to answer.
- * @param {number} statusCode One of the codes in REASON_PHRASES.
- * @param {Record<string, string>} [extraHeaders] Additional headers, e.g. Allow.
- * @returns {void}
- */
-function writeTransportError(socket, statusCode, extraHeaders) {
-  if (!socket || socket.destroyed || !socket.writable) {
-    if (socket && !socket.destroyed) {
-      socket.destroy();
-    }
-    return;
-  }
-  const body = ERROR_BODIES[statusCode];
-  const lines = [
-    `${HTTP_VERSION_LINE} ${statusCode} ${REASON_PHRASES[statusCode]}`,
-    `Content-Type: ${CONTENT_TYPE}`,
-    `Cache-Control: ${CACHE_CONTROL}`,
-    `Content-Length: ${Buffer.byteLength(body)}`,
-  ];
-  if (CLOSING_STATUSES.includes(statusCode)) {
-    lines.push("Connection: close");
-  }
-  if (extraHeaders) {
-    for (const [name, value] of Object.entries(extraHeaders)) {
-      lines.push(`${name}: ${value}`);
-    }
-  }
-  try {
-    socket.end(`${lines.join(CRLF)}${CRLF}${CRLF}${body}`);
-  } catch {
-    // The peer vanished mid-write. There is nothing left to report to and
-    // nothing to clean up beyond the socket itself.
-    socket.destroy();
-  }
-}
-
-/**
- * Reconstructs the byte length of the request line Node parsed.
- *
- * Node exposes the method, the raw target and the version separately rather
- * than the line it read, but the line is exactly those three joined by single
- * spaces, so the length is recoverable. It is needed because the 414 threshold
- * is defined on the request line, and a request line of up to MAX_HEADER_SIZE
- * bytes now reaches the handler rather than being rejected by the parser.
- *
- * @param {import("node:http").IncomingMessage} req Request to measure.
- * @returns {number} Length in bytes of the request line, excluding CRLF.
- */
-function requestLineLength(req) {
-  return (
-    Buffer.byteLength(req.method) +
-    1 +
-    Buffer.byteLength(req.url) +
-    1 +
-    Buffer.byteLength(`HTTP/${req.httpVersion}`)
-  );
-}
-
-/**
- * Reports whether a request's header section exceeds any of the shared caps.
- *
- * Node's parser buffer is deliberately larger than every limit here, so the
- * limits are enforced in this function instead. The block is measured the way
- * the other two servers measure it - each field as "Name: Value" plus CRLF - so
- * a request at a boundary is answered with the same status everywhere. A single
- * over-long field is caught as well as an over-large total, because a 20 KiB
- * value in one header would otherwise slip past a block check that only sums.
- *
- * @param {import("node:http").IncomingMessage} req Request to check.
- * @returns {boolean} True when the request must be answered with 431.
- */
-function headersTooLarge(req) {
-  const raw = req.rawHeaders;
-  if (raw.length / 2 > MAX_HEADER_FIELDS) {
-    return true;
-  }
-  let block = 0;
-  for (let index = 0; index < raw.length; index += 2) {
-    const text = Buffer.byteLength(raw[index]) + 2 + Buffer.byteLength(raw[index + 1]);
-    if (text >= MAX_HEADER_LINE_BYTES) {
-      return true;
-    }
-    block += text + CRLF.length;
-    if (block > MAX_HEADER_BLOCK_BYTES) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Reports whether a request declares a body that must be read before answering.
- *
- * A chunked request always has one. A Content-Length request has one unless the
- * length is zero. Every other request - notably the GET this endpoint exists to
- * serve - has none, and is answered without waiting for a stream event.
- *
- * @param {import("node:http").IncomingMessage} req Request to inspect.
- * @returns {boolean} True when a body is declared.
- */
-function hasRequestBody(req) {
-  if (req.headers["transfer-encoding"] !== undefined) {
-    return true;
-  }
-  const declared = req.headers["content-length"];
-  return declared !== undefined && declared !== "0";
-}
-
-/**
- * Reads and discards a declared request body, then writes the response.
- *
- * The answer is decided before the drain starts, so a slow or oversized upload
- * cannot change what the client is told - it only changes when the client is
- * told it. Once the bound is reached the answer is written immediately and the
- * connection is retired rather than reading further.
- *
- * @param {import("node:http").IncomingMessage} req Request being drained.
- * @param {import("node:http").ServerResponse} res Response to write.
- * @param {{status: number, body: string, headers?: Record<string, string>}} outcome
- *   The already-decided answer.
- * @returns {void}
- */
-function drainThenRespond(req, res, outcome) {
-  const socket = req.socket;
-  let answered = false;
-  let drained = 0;
-  function respond() {
-    if (answered) {
-      return;
-    }
-    answered = true;
-    if (socket) {
-      socket[PENDING_ANSWER] = undefined;
-    }
-    if (res.writableEnded || !socket || socket.destroyed || !socket.writable) {
-      return;
-    }
-    writeJson(res, outcome.status, outcome.body, outcome.headers);
-  }
-  // Park the answer before the first drain event, so a parser error raised for a
-  // truncated body writes this answer instead of a generic 400.
-  if (socket) {
-    socket[PENDING_ANSWER] = respond;
-  }
-  req.on("data", (chunk) => {
-    drained += chunk.length;
-    if (drained > MAX_DRAIN_BYTES) {
-      respond();
-      socket.destroy();
-    }
-  });
-  req.on("end", respond);
-  // A client that vanished outright leaves nothing to answer: retire the parked
-  // answer so no later event writes to a dead socket.
-  const abandon = () => {
-    answered = true;
-    if (socket) {
-      socket[PENDING_ANSWER] = undefined;
-    }
-  };
-  req.on("aborted", abandon);
-  req.on("error", abandon);
-}
-
-/**
- * Classifies a request line that Node's parser rejected.
- *
- * The parser error code alone is not enough. A header overflow must be decided
- * from the code, because its raw packet is the mid-stream chunk that overflowed
- * rather than the head of the request. Everything else is decided by re-reading
- * the first line of the raw packet under the same grammar app.py and User.java
- * apply, which is what lets an unsupported-but-valid method still earn 405 and
- * a bad version still earn 505 instead of a blanket 400.
- *
- * HPE_INVALID_VERSION deserves particular care: Node raises it both for a
- * malformed version token and for a request whose lines end in a bare LF, and
- * in the second case the version token is perfectly well formed. The three arms
- * below keep those apart - malformed token 400, well-formed non-1 major 505,
- * well-formed 1.x (the bare-LF case) 400.
- *
- * @param {Error & {code?: string, rawPacket?: Buffer}} error Parser error.
- * @returns {{status: number, headers?: Record<string, string>}} Response to send.
- */
-function classifyParserError(error) {
-  const code = error && error.code;
-  if (code === "HPE_HEADER_OVERFLOW") {
-    return { status: 431 };
-  }
-  const raw = error && error.rawPacket ? error.rawPacket.toString("latin1") : "";
-  const lineEnd = raw.indexOf("\n");
-  const firstLine = (lineEnd < 0 ? raw : raw.slice(0, lineEnd)).replace(/\r$/, "");
-  if (Buffer.byteLength(firstLine) >= MAX_REQUEST_LINE_BYTES) {
-    return { status: 414 };
-  }
-  const parts = firstLine.split(" ");
-  if (parts.length !== 3) {
-    return { status: 400 };
-  }
-  const [method, target, version] = parts;
-  if (!isMethodToken(method) || !isRequestTarget(target)) {
-    return { status: 400 };
-  }
-  const versionMatch = VERSION_PATTERN.exec(version);
-  if (versionMatch === null) {
-    return { status: 400 };
-  }
-  if (Number(versionMatch[1]) !== 1) {
-    return { status: 505 };
-  }
-  if (method !== ALLOWED_METHODS) {
-    return { status: 405, headers: { Allow: ALLOWED_METHODS } };
-  }
-  // A well-formed GET/1.x line that the parser still rejected: bare LF
-  // terminators, an obs-fold continuation, or an unparseable Content-Length.
-  // The request is malformed even though its first line is not.
-  return { status: 400 };
-}
-
-/**
- * Creates the health server.
- *
- * Two parser options are set deliberately. `requireHostHeader: false` moves the
- * missing-Host decision into this file: Node's own answer is a chunked 400 that
- * carries a Date header, which is off the contract, so the check is made below
- * instead. `maxHeaderSize` is raised above every size limit so an oversized but
- * parseable request reaches the handler and is classified there rather than by
- * the parser, which would report every overflow as 431 where the other two
- * servers report 414 for an over-long request line.
- *
- * Validation order matches serveExchange in User.java and handle_one_request in
- * app.py exactly, because the status a boundary request receives depends on it:
- * request-line length, then request-line grammar, then version, then header
- * limits, then Host, then method, then route. Host is checked before the method
- * so a hostless POST answers 400 rather than 405.
+ * The four listener budgets are applied here too, for the reason given at their
+ * declaration: Node's defaults let a client that trickles hold a socket for five
+ * minutes and never reclaim one that goes quiet.
  *
  * The server is returned rather than started, so the tests can drive it on an
  * ephemeral port (listen(0)) without competing for the configured one.
  *
  * @param {ReturnType<typeof loadConfig>} [config] Effective configuration.
  * @returns {import("node:http").Server} An unstarted HTTP server.
+ * @throws {RangeError} When the configuration cannot be published.
  */
 function createServer(config) {
   const resolved = config === undefined || config === null ? loadConfig() : config;
+  validateConfig(resolved);
   const routePath = normalizePath(resolved.healthPath);
-  const options = { requireHostHeader: false, maxHeaderSize: MAX_HEADER_SIZE };
 
-  /**
-   * Decides the answer for one request without writing anything.
-   *
-   * The eight checks run in the same order as serveExchange in User.java and
-   * handle_one_request in app.py. The order is part of the contract: it decides
-   * which status a request that violates two rules at once receives.
-   *
-   * @param {import("node:http").IncomingMessage} req Request to classify.
-   * @returns {{status: number, body: string, headers?: Record<string, string>}}
-   */
-  const classify = (req) => {
-    if (requestLineLength(req) >= MAX_REQUEST_LINE_BYTES) {
-      return { status: 414, body: URI_TOO_LONG_BODY };
-    }
-    // Defence in depth: llhttp rejects a non-token method and a target carrying
-    // a control character before the handler runs, but a target byte above 0x7E
-    // can still arrive here, and the other two servers refuse it.
-    if (!isMethodToken(req.method) || !isRequestTarget(req.url)) {
-      return { status: 400, body: BAD_REQUEST_BODY };
-    }
-    // HTTP/0.9 has no version token at all, which this policy treats as a
-    // malformed request line; any other major version is understood but
-    // unsupported. Node reports 0.9 for a two-token request line, so the two
-    // cases are indistinguishable here and both resolve to 400.
-    if (req.httpVersion === HTTP_09_VERSION) {
-      return { status: 400, body: BAD_REQUEST_BODY };
-    }
-    if (req.httpVersionMajor !== 1) {
-      return { status: 505, body: VERSION_NOT_SUPPORTED_BODY };
-    }
-    if (headersTooLarge(req)) {
-      return { status: 431, body: HEADERS_TOO_LARGE_BODY };
-    }
-    // Host is mandatory from HTTP/1.1 onwards and optional in 1.0. It is
-    // checked before the method so a hostless POST answers 400, not 405.
-    if (req.httpVersionMinor >= 1 && req.headers.host === undefined) {
-      return { status: 400, body: BAD_REQUEST_BODY };
-    }
-    if (req.method !== ALLOWED_METHODS) {
-      return {
-        status: 405,
-        body: METHOD_NOT_ALLOWED_BODY,
-        headers: { Allow: ALLOWED_METHODS },
-      };
-    }
-    if (normalizePath(req.url) !== routePath) {
-      return { status: 404, body: NOT_FOUND_BODY };
-    }
-    return { status: 200, body: renderPayload(resolved) };
-  };
-
-  const server = http.createServer(options, (req, res) => {
-    const outcome = classify(req);
-    if (hasRequestBody(req)) {
-      drainThenRespond(req, res, outcome);
-      return;
-    }
-    writeJson(res, outcome.status, outcome.body, outcome.headers);
-  });
-
-  // A malformed request line or header block never reaches the handler above.
-  // Answer on contract - same headers, same JSON shape - echoing nothing back
-  // from the error, so a caller learns no more from a rejected request than
-  // from an accepted one.
-  server.on("clientError", (error, socket) => {
-    if (error && error.code === "ECONNRESET") {
-      socket.destroy();
-      return;
-    }
-    const pending = socket && socket[PENDING_ANSWER];
-    if (typeof pending === "function") {
-      // This request already reached the handler, so its answer is decided; the
-      // error concerns the body that followed, which cannot change it.
-      pending();
-      return;
-    }
-    const outcome = classifyParserError(error);
-    writeTransportError(socket, outcome.status, outcome.headers);
-  });
-
-  // CONNECT never reaches the request handler: Node routes it to this event and
-  // closes the socket with no response at all when nothing is listening. The
-  // endpoint is GET-only, so the tunnel request is refused the same way any
-  // other unsupported method is.
-  server.on("connect", (req, socket) => {
-    writeTransportError(socket, 405, { Allow: ALLOWED_METHODS });
-  });
-
-  // Match the idle timeout the other two servers apply to a kept-alive socket,
-  // so a client that opens a connection and never speaks is reclaimed rather
-  // than holding a slot indefinitely.
-  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
-
+  const server = http.createServer(
+    {
+      connectionsCheckingInterval: CONNECTION_CHECK_INTERVAL_MS,
+      headersTimeout: HEADERS_TIMEOUT_MS,
+      requestTimeout: REQUEST_TIMEOUT_MS,
+      keepAliveTimeout: KEEP_ALIVE_TIMEOUT_MS,
+    },
+    (req, res) => {
+      if (req.method !== ALLOWED_METHODS) {
+        writeJson(res, 405, METHOD_NOT_ALLOWED_BODY, { Allow: ALLOWED_METHODS });
+        return;
+      }
+      if (normalizePath(req.url) !== routePath) {
+        writeJson(res, 404, NOT_FOUND_BODY);
+        return;
+      }
+      writeJson(res, 200, renderPayload(resolved));
+    },
+  );
+  // An established socket that goes quiet is never reclaimed at Node's default of
+  // 0, so the inactivity ceiling is set explicitly. It is a property rather than
+  // a constructor option, which is why it is applied here.
+  server.timeout = SOCKET_TIMEOUT_MS;
   return server;
 }
 
@@ -1176,6 +948,7 @@ function registerShutdown(server) {
  * @param {{config?: object, host?: string, port?: number|string,
  *          file?: string, env?: Record<string, string|undefined>}} [options]
  * @returns {import("node:http").Server} The listening server.
+ * @throws {RangeError} When the configuration cannot be published.
  */
 function serve(options = {}) {
   const config = options.config === undefined ? loadConfig(options) : options.config;
@@ -1186,11 +959,13 @@ function serve(options = {}) {
   server.on("error", (error) => {
     // Almost always a port already in use. Report it as one readable line and
     // fail closed: an orchestrator that cannot bind must not see a success code.
+    // The runtime error CODE is reported and its message is not: a code is a
+    // fixed enumerated value, whereas a message can carry resolver-derived text.
     // The exit code is set rather than forced so the event loop drains and this
     // diagnostic is flushed before the process goes away.
     warn(
-      `cannot start the health server: could not bind ${sanitizeForLog(String(host))}:${port} ` +
-        `(${error.code || error.message})`,
+      `cannot start the health server: could not bind ${String(host)}:${port} ` +
+        `(${error.code || "bind failed"})`,
     );
     process.exitCode = 1;
   });
@@ -1198,54 +973,394 @@ function serve(options = {}) {
   server.listen(port, host, () => {
     const address = server.address();
     const boundPort = address && typeof address === "object" ? address.port : port;
-    // Configured values reach this line, so control characters are stripped
-    // from them first: a health path carrying a CR and an LF would otherwise
-    // forge an extra startup line in whatever collects this process's stderr.
-    // The route printed is the NORMALISED one the listener actually answers on,
-    // not the raw configured string, so the banner cannot promise a route that
-    // does not exist.
-    const route = sanitizeForLog(normalizePath(config.healthPath));
-    warn(
-      `health endpoint listening on http://${sanitizeForLog(String(host))}:${boundPort}${route}`,
-    );
+    // Configured values reach this line, and warn() strips control characters
+    // from everything it writes: a health path carrying a CR and an LF would
+    // otherwise forge an extra startup line in whatever collects this process's
+    // stderr. The route printed is the NORMALISED one the listener actually
+    // answers on, not the raw configured string, so the banner cannot promise a
+    // route that does not exist.
+    const route = normalizePath(config.healthPath);
+    warn(`health endpoint listening on http://${String(host)}:${boundPort}${route}`);
   });
 
   registerShutdown(server);
   return server;
 }
 
+/* -------------------------------------------------------------------------- *
+ * Self-check
+ *
+ * The container HEALTHCHECK, written in-process precisely so that the image
+ * needs no HTTP client of its own: the slim Node image ships neither curl nor
+ * wget, and adding one would enlarge the image, widen its attack surface and
+ * hand a post-exploitation attacker a download-and-run helper.
+ *
+ * A probe is a CLIENT, and a client is only as safe as its behaviour against a
+ * peer that does not cooperate. Three properties are therefore built in rather
+ * than assumed: the destination is selected from a loopback allowlist and never
+ * derived from configuration, the exchange is bounded in time AND in bytes, and
+ * the verdict comes from parsing the document against the frozen contract rather
+ * than from looking for a fragment inside it.
+ * -------------------------------------------------------------------------- */
+
 /**
- * Translates a bind address into an address a client can connect to.
+ * Returns true when every character is an ASCII digit and there is at least one.
  *
- * A wildcard bind means "every interface", and no client can dial a wildcard,
- * so the self-probe targets loopback instead. A concrete bind address is used
- * as configured.
+ * ASCII only, deliberately: a near-miss address spelled with an Arabic-Indic
+ * digit must not be graded loopback.
  *
- * @param {string} host Configured bind address.
- * @returns {string} Connectable host.
+ * @param {string} candidate Candidate octet.
+ * @returns {boolean} True for a run of one or more ASCII digits.
  */
-function probeHost(host) {
-  return WILDCARD_HOSTS.includes(host) ? LOOPBACK_HOST : host;
+function isAsciiDigits(candidate) {
+  if (candidate === "") {
+    return false;
+  }
+  for (let index = 0; index < candidate.length; index += 1) {
+    const code = candidate.charCodeAt(index);
+    if (code < 0x30 || code > 0x39) {
+      return false;
+    }
+  }
+  return true;
 }
 
-/** Self-probe timeout. Short, because a health check must answer quickly. */
+/**
+ * Returns true when a string is a dotted-quad IPv4 address in 127.0.0.0/8.
+ *
+ * Written out rather than delegated to a general address parser for the same
+ * reason normalizePath is written out rather than delegated to a URL parser: a
+ * general parser accepts spellings this module has no reason to accept -
+ * `127.1`, `0x7f.0.0.1`, a bare decimal integer - and each of them is a
+ * different way to write a destination the allowlist would then have to reason
+ * about. Four decimal octets or nothing.
+ *
+ * @param {string} candidate Configured host, already trimmed.
+ * @returns {boolean} True only for `127.b.c.d` with four octets in 0-255.
+ */
+function isIpv4Loopback(candidate) {
+  if (!candidate.startsWith(IPV4_LOOPBACK_PREFIX)) {
+    return false;
+  }
+  const octets = candidate.split(".");
+  if (octets.length !== 4) {
+    return false;
+  }
+  return octets.every(
+    (octet) => isAsciiDigits(octet) && octet.length <= 3 && Number(octet) <= 255,
+  );
+}
+
+/**
+ * Returns the loopback authority the probe is permitted to connect to.
+ *
+ * This is an ALLOWLIST, and that is the whole point. `app.host` is an input: it
+ * comes from a properties file and from `APP_HOST` in the environment, both of
+ * which an operator, an orchestrator or a compromised sidecar can set. Rewriting
+ * only the wildcard spellings and using everything else verbatim - which is what
+ * this function used to do - made the container HEALTHCHECK a general-purpose
+ * outbound HTTP client aimed wherever that input pointed: a probe that reports
+ * healthy because some other machine is healthy, and an egress request the
+ * deployment never asked for. So the destination is not derived from the
+ * configured value at all; it is SELECTED from a fixed set of loopback forms, and
+ * a value outside that set is replaced rather than honoured.
+ *
+ *   | Configured host                    | Probe destination                  |
+ *   | ---------------------------------- | ---------------------------------- |
+ *   | unset, empty, whitespace, 0.0.0.0, | 127.0.0.1 - a wildcard names every |
+ *   | ::, [::], *                        | interface, not a destination       |
+ *   | localhost                          | 127.0.0.1 - mapped, never resolved |
+ *   | anything in 127.0.0.0/8            | itself                             |
+ *   | ::1, [::1], the expanded form      | [::1] - bracketed for the URL      |
+ *   | anything else                      | 127.0.0.1, with one warning; the   |
+ *   |                                    | configured value is never logged   |
+ *
+ * Replacing rather than refusing is deliberate. A refusal would report the
+ * application unhealthy because its BIND address is unusual, which is a
+ * misdiagnosis: the listener may well be serving perfectly on an interface this
+ * probe is not allowed to dial. Probing loopback answers the question the probe
+ * is actually asking - is the process in this container serving? - and the
+ * warning is what tells an operator the configured value was not used. app.py and
+ * User.java apply the identical table.
+ *
+ * @param {string|undefined} host Configured bind address.
+ * @returns {string} 127.0.0.1, [::1], or a 127.0.0.0/8 address as configured.
+ */
+function probeAuthority(host) {
+  const candidate = (typeof host === "string" ? host : "").trim();
+  const lowered = candidate.toLowerCase();
+  if (WILDCARD_HOSTS.includes(lowered) || lowered === LOOPBACK_NAME) {
+    return LOOPBACK_HOST;
+  }
+  if (IPV6_LOOPBACK_FORMS.includes(lowered)) {
+    return LOOPBACK_AUTHORITY_V6;
+  }
+  if (isIpv4Loopback(candidate)) {
+    return candidate;
+  }
+  warn("probe target is not loopback; probing loopback instead");
+  return LOOPBACK_HOST;
+}
+
+/** The two-character escapes RFC 8259 defines, other than \\uXXXX. */
+const JSON_SIMPLE_ESCAPES = Object.freeze({
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+});
+
+/**
+ * Advances past JSON insignificant whitespace.
+ *
+ * @param {string} text Document being read.
+ * @param {number} at Cursor.
+ * @returns {number} The first index at or after `at` that is not whitespace.
+ */
+function skipJsonWhitespace(text, at) {
+  let cursor = at;
+  while (cursor < text.length) {
+    const character = text.charAt(cursor);
+    if (character !== " " && character !== "\t" && character !== "\n" && character !== "\r") {
+      return cursor;
+    }
+    cursor += 1;
+  }
+  return cursor;
+}
+
+/**
+ * Reads one RFC 8259 string literal.
+ *
+ * @param {string} text Document being read.
+ * @param {number} at Index of the opening quotation mark.
+ * @returns {{value: string, cursor: number}|null} The decoded value and the
+ *   index after the closing quote, or null when the literal is malformed.
+ */
+function readJsonString(text, at) {
+  if (text.charAt(at) !== '"') {
+    return null;
+  }
+  let cursor = at + 1;
+  let value = "";
+  while (cursor < text.length) {
+    const character = text.charAt(cursor);
+    if (character === '"') {
+      return { value, cursor: cursor + 1 };
+    }
+    if (character === "\\") {
+      const escape = text.charAt(cursor + 1);
+      if (escape === "u") {
+        const hex = text.slice(cursor + 2, cursor + 6);
+        if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
+          return null;
+        }
+        value += String.fromCharCode(Number.parseInt(hex, 16));
+        cursor += 6;
+      } else if (Object.prototype.hasOwnProperty.call(JSON_SIMPLE_ESCAPES, escape)) {
+        value += JSON_SIMPLE_ESCAPES[escape];
+        cursor += 2;
+      } else {
+        return null;
+      }
+      continue;
+    }
+    if (character.charCodeAt(0) < 0x20) {
+      // An unescaped control character is not legal inside a JSON string.
+      return null;
+    }
+    value += character;
+    cursor += 1;
+  }
+  return null;
+}
+
+/**
+ * Reads a flat JSON object whose every member value is a string.
+ *
+ * JSON.parse would be shorter, but it resolves a repeated key by keeping the
+ * LAST occurrence and says nothing about it, which silently turns a
+ * contradictory document into a plausible one: a body carrying
+ * `"status":"DOWN","status":"UP"` parses as healthy. RFC 8259 calls such an
+ * object's behaviour unpredictable, so the probe refuses it rather than picking a
+ * member on the endpoint's behalf. app.py refuses it through an
+ * `object_pairs_hook` and User.java through the same algorithm as this reader, so
+ * all three refuse the same documents.
+ *
+ * Anything that is not exactly a flat object of string values yields null: a
+ * nested object, an array, a numeric or boolean member, a missing quote, a
+ * repeated key, or a single byte of trailing content after the closing brace.
+ *
+ * @param {string} text Candidate JSON document.
+ * @returns {Map<string, string>|null} The members in order, or null.
+ */
+function readFlatStringObject(text) {
+  const members = new Map();
+  let cursor = skipJsonWhitespace(text, 0);
+  if (text.charAt(cursor) !== "{") {
+    return null;
+  }
+  cursor = skipJsonWhitespace(text, cursor + 1);
+  if (text.charAt(cursor) === "}") {
+    return skipJsonWhitespace(text, cursor + 1) === text.length ? members : null;
+  }
+  for (;;) {
+    const key = readJsonString(text, cursor);
+    if (key === null) {
+      return null;
+    }
+    cursor = skipJsonWhitespace(text, key.cursor);
+    if (text.charAt(cursor) !== ":") {
+      return null;
+    }
+    cursor = skipJsonWhitespace(text, cursor + 1);
+    const value = readJsonString(text, cursor);
+    if (value === null || members.has(key.value)) {
+      return null;
+    }
+    members.set(key.value, value.value);
+    cursor = skipJsonWhitespace(text, value.cursor);
+    const delimiter = text.charAt(cursor);
+    if (delimiter === ",") {
+      cursor = skipJsonWhitespace(text, cursor + 1);
+      continue;
+    }
+    if (delimiter === "}") {
+      return skipJsonWhitespace(text, cursor + 1) === text.length ? members : null;
+    }
+    return null;
+  }
+}
+
+/**
+ * Grades the four contract fields of an already-shaped document.
+ *
+ * Split out so that the ordering of the field rules is stated in exactly one
+ * place: `status` is examined before the three descriptive fields, so an endpoint
+ * reporting itself down is reported as down rather than as whichever of its other
+ * fields happened also to be wrong.
+ *
+ * @param {Record<string, unknown>} document Parsed health document.
+ * @returns {string|null} A fixed-category reason, or null when all four hold.
+ */
+function fieldRejection(document) {
+  if (document.status !== HEALTH_STATUS) {
+    return "the status field is not the expected value";
+  }
+  if (typeof document.name !== "string" || document.name === "") {
+    return "the name field is not a non-empty string";
+  }
+  if (typeof document.version !== "string" || !VERSION_GRAMMAR.test(document.version)) {
+    return "the version field is not a three-part dotted numeric version";
+  }
+  if (typeof document.timestamp !== "string" || !TIMESTAMP_GRAMMAR.test(document.timestamp)) {
+    return "the timestamp field is not a whole-second UTC instant";
+  }
+  return null;
+}
+
+/**
+ * Returns why an answer fails to prove health, or null when it proves it.
+ *
+ * Separated from the transport so that every rule below is reachable by a direct
+ * call, and so that all three implementations can be held to the same wording: an
+ * operator greps one deployment's logs, not one language's.
+ *
+ * The rules, in the order they are applied - and the order is part of the
+ * contract, because it decides which of two simultaneous faults is reported:
+ *
+ *   1. the body fits inside MAX_PROBE_BODY_BYTES;
+ *   2. the response code is exactly 200 - the IETF health-check draft couples a
+ *      passing status to a 2xx code, and this contract narrows that to one code;
+ *   3. the body is JSON, with nothing trailing it;
+ *   4. the body is a JSON OBJECT;
+ *   5. it carries exactly PAYLOAD_KEYS, in that order;
+ *   6. the four field rules of fieldRejection;
+ *   7. no key appears twice and every member is a string - the check the strict
+ *      reader exists for, applied last because it is the only one that cannot be
+ *      stated against a parsed document.
+ *
+ * A parse is what makes this fail closed. The defect this replaces tested the raw
+ * body for the fragment `"status":"UP"`, so a truncated, unparseable body that
+ * happened to contain those bytes was graded healthy; every rule here is stated
+ * against a parsed document instead.
+ *
+ * @param {number} status HTTP status code the endpoint answered with.
+ * @param {Buffer|string} body Response body as received.
+ * @returns {string|null} A fixed-category reason, or null when the answer is good.
+ */
+function probeRejection(status, body) {
+  const buffer = Buffer.isBuffer(body)
+    ? body
+    : Buffer.from(body === undefined || body === null ? "" : String(body));
+  if (buffer.length > MAX_PROBE_BODY_BYTES) {
+    return `body exceeds the probe limit of ${MAX_PROBE_BODY_BYTES} bytes`;
+  }
+  if (status !== 200) {
+    return `the endpoint answered status ${Number(status)}`;
+  }
+  const text = buffer.toString("utf8");
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return "body is not the expected JSON document";
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "body is not a JSON object and carries no status field";
+  }
+  const keys = Object.keys(parsed);
+  if (keys.length !== PAYLOAD_KEYS.length || keys.some((key, at) => key !== PAYLOAD_KEYS[at])) {
+    return PROBE_KEY_SET_REASON;
+  }
+  const fieldReason = fieldRejection(parsed);
+  if (fieldReason !== null) {
+    return fieldReason;
+  }
+  if (readFlatStringObject(text) === null) {
+    return "body is not the expected JSON document";
+  }
+  return null;
+}
+
+/** Self-probe deadline. Short, because a health check must answer quickly. */
 const PROBE_TIMEOUT_MS = 2500;
 
 /**
  * Requests this application's own health endpoint and reports the verdict as a
  * process exit code.
  *
- * This is what the container HEALTHCHECK runs. It exists because slim and JRE
- * base images ship neither curl nor wget, and adding one of them would enlarge
- * the image and widen its attack surface - the application already contains an
- * HTTP client, so it checks itself.
+ * This is what the container HEALTHCHECK runs, and it is deliberately strict: 0
+ * is returned only when the endpoint answers 200 AND the body satisfies the
+ * frozen contract. Every other outcome - refused connection, expired deadline,
+ * wrong status code, oversized body, unparseable body, a document that merely
+ * looks right, anything unforeseen - yields 1, because a probe that cannot PROVE
+ * health must not report it.
  *
- * The check is fail-closed: 0 is returned only when the endpoint answers 200
- * and the parsed body reports status "UP". A connection error, a timeout, a
- * non-200 status, a body that is not JSON and a body with the wrong status all
- * yield 1. Diagnostics go to stderr; the resolved value is returned rather than
- * passed to process.exit so the unit tests can call probe() without killing the
- * test runner.
+ * The exchange is bounded twice, because either bound alone can be defeated:
+ *
+ *   - an ABSOLUTE deadline, armed BEFORE the request object exists, so a name
+ *     resolution or a connect that hangs is inside the budget rather than ahead
+ *     of it. The request-level `timeout` option is an inactivity timer and cannot
+ *     do this: a peer that sends one byte just inside every interval satisfies
+ *     all of them and keeps the probe alive for as long as it likes;
+ *   - a ceiling of MAX_PROBE_BODY_BYTES, enforced as chunks ARRIVE rather than
+ *     after the body is complete, so an endpoint that streams without end is
+ *     bounded in memory as well as in time.
+ *
+ * `http.request` is used rather than `fetch`, and that is also a security choice
+ * rather than a stylistic one: `http.request` consults no proxy configuration,
+ * whereas an environment-aware client can be redirected by an injected
+ * `HTTP_PROXY` - which was demonstrated in the Python implementation to let a
+ * fabricated document answer a self-check on behalf of a process that was not
+ * running at all. A loopback self-check must never be proxied.
+ *
+ * The verdict is returned rather than passed to process.exit so the unit tests
+ * can call probe() without killing the test runner.
  *
  * @param {{config?: object, host?: string, port?: number|string, timeout?: number,
  *          file?: string, env?: Record<string, string|undefined>}} [options]
@@ -1253,77 +1368,148 @@ const PROBE_TIMEOUT_MS = 2500;
  */
 function probe(options = {}) {
   let config;
-  let host;
-  let port;
   try {
     config = options.config === undefined ? loadConfig(options) : options.config;
-    host = probeHost(options.host === undefined ? config.host : options.host);
-    port = options.port === undefined ? config.port : resolvePort([String(options.port)]);
+  } catch {
+    // loadConfig only throws for an unusable port in the resolved configuration.
+    // Reporting it as "unreachable" would send an operator looking for a network
+    // fault instead of at the typo, so it is named as the configuration fault it
+    // is - without naming the offending value.
+    warn("probe cannot run: the configured port is unusable");
+    return Promise.resolve(1);
+  }
+  // The same validation the server applies, applied here too. A probe that
+  // accepted a configuration the server refuses would report a process healthy
+  // that cannot start, which is the most misleading verdict available. This runs
+  // FIRST among the checks below, so a value carrying a CR and an LF is refused
+  // before it can be interpolated into anything.
+  try {
+    validateConfig(config);
   } catch (error) {
-    // A misconfigured port would otherwise produce an unparseable URL and be
-    // reported as "unreachable", sending an operator looking for a network
-    // fault instead of at the typo. Name the offending value and fail closed;
-    // the Python and Java probes both do exactly this.
-    warn(`probe cannot run: ${(error && error.message) || error}`);
+    warn(`probe cannot run: ${(error && error.message) || "the configuration is unusable"}`);
+    return Promise.resolve(1);
+  }
+  // The destination is selected from a fixed allowlist rather than taken from
+  // configuration; a value outside it is replaced, not honoured.
+  const host = probeAuthority(options.host === undefined ? config.host : options.host);
+  let port;
+  try {
+    port = options.port === undefined ? config.port : resolvePort([String(options.port)]);
+  } catch {
+    warn("probe cannot run: the configured port is unusable");
+    return Promise.resolve(1);
+  }
+  // The NORMALISED route, which is the one the listener actually answers on, so
+  // the probe cannot ask for a target the endpoint would 404.
+  const route = normalizePath(config.healthPath);
+  if (!isRequestTarget(route)) {
+    warn("probe cannot run: the configured health path is not a valid request target");
     return Promise.resolve(1);
   }
   const timeout = options.timeout === undefined ? PROBE_TIMEOUT_MS : Number(options.timeout);
+  const target = `http://${host}:${port}${route}`;
 
   return new Promise((resolve) => {
     let settled = false;
+    let request = null;
+    let deadline = null;
+
+    /**
+     * Settles the verdict exactly once and releases everything the probe holds.
+     *
+     * Every exit from the exchange comes through here, which is what makes the
+     * 0/1 contract total: the timer is cleared so the process is not held open,
+     * the request is destroyed so no descriptor outlives the verdict, and a
+     * second call from a later event is ignored.
+     *
+     * @param {number} code 0 when healthy, 1 otherwise.
+     * @param {string} [detail] Fixed-category diagnostic for an unhealthy verdict.
+     * @returns {void}
+     */
     const finish = (code, detail) => {
       if (settled) {
         return;
       }
       settled = true;
-      if (code !== 0) {
-        warn(`health probe failed: ${detail}`);
+      if (deadline !== null) {
+        clearTimeout(deadline);
+        deadline = null;
+      }
+      if (detail !== undefined) {
+        warn(detail);
+      }
+      if (request !== null) {
+        try {
+          request.destroy();
+        } catch {
+          // The request was already torn down by the peer or by the runtime.
+          // There is nothing left to release and nothing to report.
+        }
       }
       resolve(code);
     };
 
-    const request = http.request(
+    deadline = setTimeout(
+      () => finish(1, "probe rejected: no response within the probe deadline"),
+      timeout,
+    );
+
+    request = http.request(
       {
         host,
         port,
-        path: config.healthPath,
+        path: route,
         method: ALLOWED_METHODS,
         timeout,
         headers: { Accept: CONTENT_TYPE },
       },
       (res) => {
-        let body = "";
-        res.setEncoding("utf8");
+        let received = 0;
+        const chunks = [];
         res.on("data", (chunk) => {
-          body += chunk;
+          received += chunk.length;
+          // One byte past the ceiling is kept, so probeRejection can still see
+          // that the limit was passed and report it as a size fault rather than
+          // as a truncated document. Settled before the stream is destroyed:
+          // destroying it emits an error of its own, and finish() keeps the first
+          // verdict, so the order is what decides whether the reported category
+          // is the real reason or a symptom of the teardown.
+          if (received > MAX_PROBE_BODY_BYTES) {
+            finish(
+              1,
+              `probe rejected: body exceeds the probe limit of ${MAX_PROBE_BODY_BYTES} bytes`,
+            );
+            res.destroy();
+            return;
+          }
+          chunks.push(chunk);
         });
-        res.on("aborted", () => finish(1, "response aborted"));
+        res.on("aborted", () => finish(1, `probe could not reach ${target}: aborted`));
+        res.on("error", (error) =>
+          finish(1, `probe could not reach ${target}: ${error.code || "read failed"}`),
+        );
         res.on("end", () => {
-          if (res.statusCode !== 200) {
-            finish(1, `unexpected status code ${res.statusCode}`);
-            return;
-          }
-          let parsed;
-          try {
-            parsed = JSON.parse(body);
-          } catch {
-            finish(1, "response body is not valid JSON");
-            return;
-          }
-          if (parsed && parsed.status === HEALTH_STATUS) {
+          const rejection = probeRejection(res.statusCode, Buffer.concat(chunks));
+          if (rejection === null) {
             finish(0);
             return;
           }
-          finish(1, `status field is not "${HEALTH_STATUS}"`);
+          finish(1, `probe rejected: ${rejection}`);
         });
       },
     );
 
     request.on("timeout", () => {
-      request.destroy();
-      finish(1, `no response within ${timeout} ms`);
+      // The inactivity timer, which the absolute deadline above supersedes; it is
+      // kept because it releases the socket the moment the peer goes quiet rather
+      // than waiting for the deadline to expire.
+      finish(1, "probe rejected: no response within the probe deadline");
     });
-    request.on("error", (error) => finish(1, error.code || error.message));
+    // The error CODE is reported and the message is not: a code is a fixed
+    // enumerated value, whereas a message can carry resolver-derived text.
+    request.on("error", (error) =>
+      finish(1, `probe could not reach ${target}: ${(error && error.code) || "request failed"}`),
+    );
     request.end();
   });
 }
@@ -1378,25 +1564,39 @@ if (require.main === module) {
  * Public API. `buildPayload`/`healthPayload` and `createServer`/`buildServer`
  * are the same functions under both of the names the contract documents, so a
  * consumer written against either name resolves.
+ *
+ * `validateConfig`, `probeAuthority`, `probeRejection` and `MAX_PROBE_BODY_BYTES`
+ * are exported because each is a rule the test suite has to be able to state
+ * directly. A rule reachable only through a live socket can be asserted for one
+ * happy path and guessed at for the rest; reachable as a function, every branch of
+ * it is a test - and the same names are reachable in app.py and UserTest.java, so
+ * the three suites assert one contract rather than three dialects of it.
  */
 module.exports = {
   add,
   loadConfig,
   parseProperties,
+  isSingleLineText,
+  isRequestTarget,
+  validateConfig,
   currentTimestamp,
   buildPayload,
   healthPayload: buildPayload,
   renderPayload,
   normalizePath,
+  stripAuthority,
+  sanitizeForLog,
   createServer,
   buildServer: createServer,
   serve,
   probe,
+  probeAuthority,
+  probeRejection,
   CONFIG_FILE,
   DEFAULTS,
   ENV_KEYS,
   HEALTH_STATUS,
   CONTENT_TYPE,
   CACHE_CONTROL,
+  MAX_PROBE_BODY_BYTES,
 };
-

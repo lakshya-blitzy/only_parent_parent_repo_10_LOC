@@ -64,6 +64,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -140,6 +141,57 @@ HEALTH_ENV_NAMES = tuple(app.ENV_OVERRIDES.values()) + (app.UNIVERSAL_PORT_ENV,)
 APP_DIRECTORY = os.path.dirname(os.path.abspath(app.__file__))
 
 
+#: The loopback destinations a probe is permitted to dial, in the exact spelling
+#: :func:`app.probe_authority` must produce for each of them.
+EXPECTED_LOOPBACK_AUTHORITY = "127.0.0.1"
+EXPECTED_LOOPBACK_AUTHORITY_V6 = "[::1]"
+
+
+
+#: How long a deliberately broken endpoint keeps a connection open, and how often
+#: its accept loop wakes to notice it has been asked to stop.  Both are bounded so
+#: that a helper thread can never outlive the test run.
+HOSTILE_ENDPOINT_LIFETIME_SECONDS = 10
+ACCEPT_POLL_SECONDS = 0.25
+
+#: One chunked-encoding chunk carrying a single byte, and the gap between two of
+#: them.  A stream of these is the case a per-read timeout cannot bound: every
+#: individual read succeeds, so only an absolute deadline ever ends it.
+TRICKLE_CHUNK = b"1\r\nA\r\n"
+TRICKLE_INTERVAL_SECONDS = 0.05
+
+#: Ceilings for the raw-socket reads these tests perform.  A test client must be
+#: bounded for the same reason the server is: an unbounded read against a
+#: misbehaving peer hangs the suite instead of failing it.
+RAW_READ_LIMIT = 65536
+RAW_CHUNK_BYTES = 4096
+
+
+#: Gap between two requests pushed down one connection.  Long enough that the
+#: server has certainly answered the first before the second arrives, so the test
+#: observes reuse of an idle connection rather than a pipelined burst.
+PIPELINE_GAP_SECONDS = 0.3
+
+#: Drain budget used by the test that must watch the budget expire.  Applied by
+#: assigning the module attribute for the duration of one test and restored on
+#: every path, so the production budget is never left mutated.
+SHORT_DRAIN_BUDGET_SECONDS = 0.5
+
+#: A body far larger than any legitimate health document, used to prove the probe
+#: refuses rather than accumulates.  The endpoint's own body is 108 bytes.
+OVERSIZED_BODY_BYTES = 60000
+
+#: Largest response body the probe may read, written out here rather than read
+#: from app so that this is a gate on the ceiling and not a mirror of it.  A body
+#: of exactly this length must still be accepted; one byte more must be refused.
+PROBE_BODY_CEILING = 8192
+
+#: A 200 response whose body is valid-looking but truncated JSON that still
+#: CONTAINS the healthy status fragment.  A probe that matched on a substring
+#: would grade this healthy; one that parses cannot.
+FORGED_STATUS_BODY = b'{"name":"x","version":"1.1.0","status":"UP"'
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -206,6 +258,161 @@ def unused_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
         probe_socket.bind((LOOPBACK, 0))
         return probe_socket.getsockname()[1]
+
+
+def json_head(length, status=b"HTTP/1.1 200 OK"):
+    """Build a complete, well-formed response head advertising ``length`` bytes."""
+    return (
+        status
+        + b"\r\nContent-Type: application/json\r\nContent-Length: "
+        + str(length).encode("ascii")
+        + b"\r\n\r\n"
+    )
+
+
+def padded_document(length):
+    """Return a VALID healthy health document padded to exactly ``length`` bytes.
+
+    Used to probe the body ceiling from both sides.  The padding goes in the
+    ``name`` field, so the document stays a well-formed JSON object reporting the
+    healthy status and the only thing under test is its length.
+    """
+    prefix = b'{"name":"'
+    suffix = b'","version":"1.1.0","timestamp":"2026-01-01T00:00:00Z","status":"UP"}'
+    padding = length - len(prefix) - len(suffix)
+    if padding < 0:
+        raise ValueError(f"{length} is shorter than the smallest valid document")
+    return prefix + b"a" * padding + suffix
+
+
+class HostileEndpoint:
+    """A raw TCP listener that answers the way a broken health endpoint would.
+
+    The probe is a client, and a client is only as safe as its behaviour against a
+    peer that does not cooperate.  These are the peers that matter: one that never
+    answers, one that answers forever, one that answers with far too much, and one
+    that answers with something that merely looks right.  Each is a few lines of
+    socket code, which is why this is written out rather than mocked - a mock of
+    :mod:`http.client` would prove the test's own assumptions, not the bound.
+
+    The listener keeps accepting until it is closed, so one instance can serve
+    several probes, and every wait is bounded so that no helper thread can outlive
+    the run.
+    """
+
+    def __init__(self, head=b"", body=b"", trickle=False, mute=False):
+        """Start the listener on an ephemeral loopback port.
+
+        :param head: the response head to send, if any.
+        :param body: the response body to send after the head.
+        :param trickle: keep emitting one-byte chunks until stopped.
+        :param mute: accept the connection and then say nothing at all.
+        """
+        self._head = head
+        self._body = body
+        self._trickle = trickle
+        self._mute = mute
+        self._stop = threading.Event()
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((LOOPBACK, 0))
+        self._listener.listen(4)
+        self._listener.settimeout(ACCEPT_POLL_SECONDS)
+        self.port = self._listener.getsockname()[1]
+        self._thread = threading.Thread(
+            target=self._run, name="hostile-health-endpoint", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self):
+        """Accept connections until stopped, serving each one in turn."""
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with connection:
+                self._serve(connection)
+
+    def _serve(self, connection):
+        """Answer one connection in whichever broken way was configured."""
+        try:
+            if self._mute:
+                self._stop.wait(HOSTILE_ENDPOINT_LIFETIME_SECONDS)
+                return
+            connection.sendall(self._head)
+            if self._body:
+                connection.sendall(self._body)
+            while self._trickle and not self._stop.is_set():
+                connection.sendall(TRICKLE_CHUNK)
+                self._stop.wait(TRICKLE_INTERVAL_SECONDS)
+            self._stop.wait(HOSTILE_ENDPOINT_LIFETIME_SECONDS)
+        except OSError:
+            # The probe hung up, which for most of these cases is the point.
+            return
+
+    def close(self):
+        """Stop the loop, join the thread, release the listening socket."""
+        self._stop.set()
+        self._thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+        self._listener.close()
+
+
+def hostile_endpoint(case, **kwargs):
+    """Return a started :class:`HostileEndpoint` that the test will clean up."""
+    endpoint = HostileEndpoint(**kwargs)
+    case.addCleanup(endpoint.close)
+    return endpoint
+
+
+def read_response(client, limit=RAW_READ_LIMIT):
+    """Read from ``client`` until it closes or ``limit`` bytes have arrived.
+
+    A timeout is treated as end of input rather than as an error: several of these
+    tests are asserting what a server does NOT send, and for those a timeout is
+    the expected outcome.  ``client`` must already have a timeout set.
+    """
+    chunks = []
+    total = 0
+    try:
+        while total < limit:
+            chunk = client.recv(min(RAW_CHUNK_BYTES, limit - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except (TimeoutError, OSError):
+        pass
+    return b"".join(chunks)
+
+
+def read_one_response(client):
+    """Read exactly ONE response - head plus its advertised body - from ``client``.
+
+    Needed by the keep-alive tests, which must consume one response and leave the
+    connection open for the next request.  ``read_response`` cannot do that: it
+    reads to end of stream, which on a persistent connection never comes.
+    """
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = client.recv(RAW_CHUNK_BYTES)
+        if not chunk:
+            return data
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+    while len(body) < length:
+        chunk = client.recv(RAW_CHUNK_BYTES)
+        if not chunk:
+            break
+        body += chunk
+    return head + b"\r\n\r\n" + body
 
 
 def neutralize_health_environment():
@@ -289,16 +496,31 @@ class TestLegacyInvocation(unittest.TestCase):
     """
 
     def _run(self, *arguments):
-        """Run the current interpreter with ``arguments`` in app.py's directory."""
+        """Run the current interpreter with ``arguments`` in app.py's directory.
+
+        Output is captured as RAW BYTES - ``text`` is deliberately left off.
+        With ``text=True`` the child's streams are decoded through
+        universal-newline translation, which rewrites a CRLF the child emitted
+        into a bare LF before any assertion sees it; a length assertion made on
+        the decoded string would then pass on a platform whose ``print``
+        terminates lines with CRLF while the real stream carried fifteen bytes
+        rather than fourteen.  The backward-compatibility contract is a byte
+        sequence, so it is asserted on bytes.  Decoding happens only in
+        :meth:`_diagnostic`, for a message a human reads after a failure.
+        """
         completed = subprocess.run(
             [sys.executable, *arguments],
             cwd=APP_DIRECTORY,
             capture_output=True,
-            text=True,
             timeout=SUBPROCESS_TIMEOUT_SECONDS,
             check=False,
         )
         return completed
+
+    @staticmethod
+    def _diagnostic(stream):
+        """Decode a captured stream for a failure message only, never for an assertion."""
+        return stream.decode("utf-8", "backslashreplace")
 
     def test_importing_app_writes_nothing_to_stdout(self):
         """Importing the module must have no observable side effect.
@@ -308,22 +530,32 @@ class TestLegacyInvocation(unittest.TestCase):
         other consumer would - would print to standard output.
         """
         completed = self._run("-c", "import app")
-        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
-        self.assertEqual(completed.stdout, "")
-        self.assertNotIn("Hello", completed.stderr)
+        self.assertEqual(
+            completed.returncode, 0, msg=self._diagnostic(completed.stderr)
+        )
+        self.assertEqual(completed.stdout, b"")
+        self.assertNotIn(b"Hello", completed.stderr)
 
     def test_importing_app_exposes_the_public_surface(self):
         """A consumer that imports the module can reach every documented name."""
         expected = (
             "greet",
+            "log_warning",
             "read_properties",
             "config_value",
             "load_config",
             "normalize_path",
+            "strip_authority",
             "health_route",
             "health_timestamp",
             "build_payload",
             "render_payload",
+            "is_single_line_text",
+            "is_request_target",
+            "validate_config",
+            "sanitize_for_log",
+            "probe_authority",
+            "probe_rejection",
             "HealthRequestHandler",
             "HealthServer",
             "create_server",
@@ -344,14 +576,16 @@ class TestLegacyInvocation(unittest.TestCase):
         the output has always consisted of.
         """
         completed = self._run("app.py")
-        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
-        self.assertEqual(completed.stdout, "Hello Lakshya\n")
-        self.assertEqual(len(completed.stdout.encode("utf-8")), 14)
+        self.assertEqual(
+            completed.returncode, 0, msg=self._diagnostic(completed.stderr)
+        )
+        self.assertEqual(completed.stdout, b"Hello Lakshya\n")
+        self.assertEqual(len(completed.stdout), 14)
 
     def test_default_invocation_writes_nothing_to_stderr(self):
         """The default mode is silent apart from its one line of output."""
         completed = self._run("app.py")
-        self.assertEqual(completed.stderr, "")
+        self.assertEqual(completed.stderr, b"")
 
     def test_unrecognised_flag_falls_back_to_the_default_mode(self):
         """An unknown argument must not change the legacy behaviour.
@@ -361,8 +595,10 @@ class TestLegacyInvocation(unittest.TestCase):
         greeting instead of starting a listener or failing.
         """
         completed = self._run("app.py", "--not-a-real-flag")
-        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
-        self.assertEqual(completed.stdout, "Hello Lakshya\n")
+        self.assertEqual(
+            completed.returncode, 0, msg=self._diagnostic(completed.stderr)
+        )
+        self.assertEqual(completed.stdout, b"Hello Lakshya\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -595,6 +831,54 @@ class TestRouteResolution(unittest.TestCase):
     def test_normalize_path_removes_only_one_trailing_slash(self):
         """One forgiving slash is a convenience; two describe a different path."""
         self.assertEqual(app.normalize_path("/health//"), "/health/")
+
+    def test_normalize_path_strips_an_absolute_form_authority(self):
+        """A request line may name the whole URL, and RFC 9112 permits it.
+
+        ``GET http://host:8002/health HTTP/1.1`` is the absolute form, and a
+        proxy-aware client emits it.  The Java implementation reduced it from the
+        beginning; these two did not, so the same request reached the route on one
+        implementation and returned 404 on the other two.
+        """
+        cases = {
+            "http://host:8002/health": "/health",
+            "http://host:8002/health/": "/health",
+            "http://host/nope": "/nope",
+            "https://host:443/health?probe=1": "/health",
+            "http://host": "/",
+        }
+        for target, expected in cases.items():
+            with self.subTest(target=target):
+                self.assertEqual(app.normalize_path(target), expected)
+
+    def test_normalize_path_strips_a_fragment(self):
+        """A fragment is a client-side construct and never selects a route."""
+        self.assertEqual(app.normalize_path("/health#section"), "/health")
+        self.assertEqual(app.normalize_path("/health?probe=1#section"), "/health")
+
+    def test_strip_authority_validates_the_scheme_before_removing_anything(self):
+        """``://`` inside a QUERY is data, not an authority.
+
+        The scheme is checked first, so a target whose query happens to carry a
+        URL keeps every byte of it.  Without that check ``/health?next=http://x/``
+        would be truncated to ``/`` and the route would be lost.
+        """
+        for target in (
+            "/health?next=http://elsewhere/",
+            "/health",
+            "/",
+            "//health",
+            "/health%2f",
+            "/9nothing://x",
+            "/-bad://x",
+        ):
+            with self.subTest(target=target):
+                self.assertEqual(app.strip_authority(target), target)
+
+    def test_strip_authority_leaves_a_target_it_does_not_recognise(self):
+        """Only a scheme followed by ``://`` is an authority worth removing."""
+        self.assertEqual(app.strip_authority("http:/health"), "http:/health")
+        self.assertEqual(app.strip_authority(""), "")
 
     def test_health_route_supplies_a_missing_leading_slash(self):
         cases = {
@@ -952,6 +1236,51 @@ class TestRouting(HealthServerTestCase):
                 self.assertEqual(body, EXPECTED_METHOD_NOT_ALLOWED_BODY)
                 self.assertEqual(headers.get("Allow"), EXPECTED_ALLOW_HEADER)
 
+    def test_head_is_refused_but_still_advertises_the_length(self):
+        """HEAD is the one refusal that carries a length yet no body.
+
+        The sibling method test above cannot cover HEAD, because every other
+        verb receives the 30 error bytes and HEAD must receive none.  RFC 9110
+        requires a HEAD response to carry the header fields the corresponding
+        message-body response would have, so suppressing the length would break
+        parity with the Node and Java suites, while writing the 30 bytes anyway
+        would corrupt the next request on a persistent connection.  Both
+        mistakes are caught here.
+        """
+        status, headers, body = self.request(self.route, method="HEAD")
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("Allow"), EXPECTED_ALLOW_HEADER)
+        self.assertEqual(
+            header_names(headers),
+            {"content-type", "cache-control", "content-length", "allow"},
+            msg="the 405 header set is frozen; HEAD must not add to or drop from it",
+        )
+        self.assertEqual(headers.get("Content-Type"), EXPECTED_CONTENT_TYPE)
+        self.assertEqual(
+            int(headers.get("Content-Length")),
+            len(EXPECTED_METHOD_NOT_ALLOWED_BODY),
+            msg="the advertised length is the one a GET-shaped 405 would carry",
+        )
+        self.assertEqual(body, b"", msg="a HEAD response transmits zero body bytes")
+        for directive in ("no-cache", "no-store", "must-revalidate"):
+            with self.subTest(directive=directive):
+                self.assertIn(directive, headers.get("Cache-Control", ""))
+        names = header_names(headers)
+        self.assertNotIn("server", names)
+        self.assertNotIn("date", names)
+
+    def test_head_on_an_unknown_path_is_refused_before_the_route_is_consulted(self):
+        """Method classification precedes route matching, so HEAD /nope is 405.
+
+        The order matters: were the route consulted first, an unknown path would
+        answer 404 for HEAD and 405 for the health path, making the method
+        policy depend on the target.  It does not, and this pins that.
+        """
+        status, headers, body = self.request("/nope", method="HEAD")
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("allow"), EXPECTED_ALLOW_HEADER)
+        self.assertEqual(body, b"")
+
     def test_error_responses_also_refuse_caching(self):
         cases = (("/nope", "GET", None, 404), (self.route, "POST", b"", 405))
         for path, method, data, expected_status in cases:
@@ -1029,12 +1358,22 @@ class TestProbe(HealthServerTestCase):
         self.assertEqual(app.probe(self._config_for("0.0.0.0", self.port)), 0)
 
     def test_the_probe_fails_closed_when_nothing_is_listening(self):
-        """A probe that cannot prove health must report unhealthy."""
+        """A probe that cannot prove health must report unhealthy.
+
+        The diagnostic is asserted too, in two parts.  It must name the target so
+        that an operator knows which endpoint was checked, and it must report the
+        transport fault as an exception TYPE rather than an exception message:
+        message text can carry response-derived or resolver-derived content, and
+        this line goes into a log.
+        """
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             verdict = app.probe(self._config_for(LOOPBACK, unused_port()))
         self.assertEqual(verdict, 1)
-        self.assertIn("unreachable", stderr.getvalue())
+        diagnostic = stderr.getvalue()
+        self.assertIn("could not reach", diagnostic)
+        self.assertIn(f"http://{LOOPBACK}:", diagnostic)
+        self.assertIn("ConnectionRefusedError", diagnostic)
 
     def test_the_probe_fails_closed_on_a_non_health_route(self):
         """Pointed at a path that answers 404, the verdict is unhealthy."""
@@ -1045,6 +1384,490 @@ class TestProbe(HealthServerTestCase):
             verdict = app.probe(config)
         self.assertEqual(verdict, 1)
         self.assertIn("404", stderr.getvalue())
+
+    def test_a_non_loopback_configured_host_is_still_probed_on_loopback(self):
+        """The destination is selected, not derived; see TestProbeAuthority.
+
+        ``app.host`` is an input.  If the probe honoured it, a configured value
+        pointing off the machine would turn the container health check into an
+        outbound HTTP client - reporting this application healthy because some
+        other host answered.  The live endpoint here is on loopback and nothing is
+        listening on the named host, so a verdict of healthy is only possible if
+        loopback was dialled.
+        """
+        stderr = io.StringIO()
+        config = self._config_for("monitoring.example.com", self.port)
+        with contextlib.redirect_stderr(stderr):
+            verdict = app.probe(config)
+        written = stderr.getvalue()
+        self.assertEqual(verdict, 0)
+        self.assertIn("not loopback", written)
+        self.assertNotIn("example.com", written)
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostic safety
+#
+# Everything this module says about itself goes to stderr, and every line of it
+# is a fixed category.  These tests are the gate on that: a configured value or
+# an exception string reaching a log line would both disclose the deployment and
+# - for any value carrying a CR or an LF - let a caller forge log entries.
+# --------------------------------------------------------------------------- #
+
+
+class TestDiagnosticSafety(unittest.TestCase):
+    """Fixed categories only, stderr only, and one line per diagnostic."""
+
+    def test_log_warning_writes_one_prefixed_line_to_stderr_only(self):
+        """Nothing may reach stdout: it is the hashed backward-compatibility
+        contract of this program."""
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
+            app.log_warning("a fixed category")
+        self.assertEqual(stderr.getvalue(), "[app.py] a fixed category\n")
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_log_warning_strips_control_characters_so_no_line_can_be_forged(self):
+        """A CR and an LF in the text must not become a second log entry."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            app.log_warning("real\r\n[app.py] forged entry\x1b[2J\x7fand an escape")
+        written = stderr.getvalue()
+        self.assertEqual(written.count("\n"), 1)
+        self.assertTrue(written.endswith("\n"))
+        self.assertNotIn("\r", written)
+        self.assertNotIn("\x1b", written)
+        self.assertNotIn("\x7f", written)
+        self.assertIn("forged entry", written)
+
+    def test_an_unreadable_configuration_file_reports_no_path_and_no_error_text(self):
+        """A directory is readable as a name but not as a file.
+
+        The failure is neither absence - which is silent and expected - nor a
+        parse problem, so it is exactly the branch that reports.  What it reports
+        must not include the path, which is a deployment detail, nor the exception
+        text, which embeds that path.
+        """
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            properties = app.read_properties(directory.name)
+        written = stderr.getvalue()
+        self.assertEqual(properties, {})
+        self.assertEqual(written.count("\n"), 1)
+        self.assertIn("cannot read the configuration file", written)
+        self.assertNotIn(directory.name, written)
+        self.assertNotIn("Errno", written)
+
+    def test_an_unusable_port_is_reported_without_naming_the_value(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            verdict = app.probe(
+                {
+                    "app.host": LOOPBACK,
+                    "python.port": "not-a-port",
+                    "health.path": "/health",
+                }
+            )
+        written = stderr.getvalue()
+        self.assertEqual(verdict, 1)
+        self.assertEqual(written.count("\n"), 1)
+        self.assertIn("port is unusable", written)
+        self.assertNotIn("not-a-port", written)
+
+    def test_a_health_path_carrying_crlf_cannot_forge_a_probe_log_line(self):
+        """The reproduced log-forgery case, asserted as fixed.
+
+        The path is refused before a request is constructed, and the single line
+        the refusal emits carries none of it.
+        """
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            verdict = app.probe(
+                {
+                    "app.host": LOOPBACK,
+                    "python.port": str(unused_port()),
+                    "health.path": "/health\r\n[app.py] forged entry",
+                }
+            )
+        written = stderr.getvalue()
+        self.assertEqual(verdict, 1)
+        self.assertEqual(written.count("\n"), 1)
+        self.assertIn("not a valid request target", written)
+        self.assertNotIn("forged entry", written)
+
+
+# --------------------------------------------------------------------------- #
+# Probe destination allowlist
+# --------------------------------------------------------------------------- #
+
+
+class TestProbeAuthority(unittest.TestCase):
+    """The probe destination is SELECTED from a loopback set, never derived.
+
+    Two properties are asserted separately because they fail separately: that
+    every legitimate loopback spelling is honoured exactly and silently, and that
+    everything else is replaced - with one fixed line and without echoing the
+    value that was refused.
+    """
+
+    #: Configured value mapped to the authority the probe must dial.
+    ACCEPTED = {
+        None: EXPECTED_LOOPBACK_AUTHORITY,
+        "": EXPECTED_LOOPBACK_AUTHORITY,
+        "   ": EXPECTED_LOOPBACK_AUTHORITY,
+        "0.0.0.0": EXPECTED_LOOPBACK_AUTHORITY,
+        "::": EXPECTED_LOOPBACK_AUTHORITY,
+        "[::]": EXPECTED_LOOPBACK_AUTHORITY,
+        "*": EXPECTED_LOOPBACK_AUTHORITY,
+        "localhost": EXPECTED_LOOPBACK_AUTHORITY,
+        "LocalHost": EXPECTED_LOOPBACK_AUTHORITY,
+        "127.0.0.1": "127.0.0.1",
+        " 127.0.0.1 ": "127.0.0.1",
+        "127.0.0.2": "127.0.0.2",
+        "127.255.255.254": "127.255.255.254",
+        "::1": EXPECTED_LOOPBACK_AUTHORITY_V6,
+        "[::1]": EXPECTED_LOOPBACK_AUTHORITY_V6,
+        "0:0:0:0:0:0:0:1": EXPECTED_LOOPBACK_AUTHORITY_V6,
+        "[0:0:0:0:0:0:0:1]": EXPECTED_LOOPBACK_AUTHORITY_V6,
+    }
+
+    #: Values that must NOT be dialled.  The link-local metadata address and the
+    #: private ranges are the ones that make this a security property rather than
+    #: a tidiness one; the rest are the near-miss spellings a permissive address
+    #: parser would accept as loopback and this one must not.
+    REFUSED = (
+        "monitoring.example.com",
+        "10.0.0.5",
+        "192.168.1.1",
+        "169.254.169.254",
+        "8.8.8.8",
+        "127.0.0.256",
+        "127.1",
+        "0x7f.0.0.1",
+        "2130706433",
+        "127.0.0.1.example.com",
+        "127.0.0.\u0661",
+        "evil\r\nX-Injected: 1",
+        "::2",
+        "localhost.example.com",
+    )
+
+    def test_every_loopback_spelling_is_honoured_exactly_and_silently(self):
+        for host, expected in self.ACCEPTED.items():
+            with self.subTest(host=host):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    resolved = app.probe_authority(host)
+                self.assertEqual(resolved, expected)
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_every_other_value_is_replaced_by_loopback(self):
+        for host in self.REFUSED:
+            with self.subTest(host=host):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    resolved = app.probe_authority(host)
+                self.assertEqual(resolved, EXPECTED_LOOPBACK_AUTHORITY)
+                self.assertIn("not loopback", stderr.getvalue())
+
+    def test_a_refused_value_is_never_echoed_and_emits_exactly_one_line(self):
+        for host in self.REFUSED:
+            with self.subTest(host=host):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    app.probe_authority(host)
+                written = stderr.getvalue()
+                self.assertEqual(written.count("\n"), 1)
+                self.assertNotIn(host, written)
+
+
+# --------------------------------------------------------------------------- #
+# Probe bounds
+#
+# The probe is a client, and a client is only as safe as its behaviour against a
+# peer that does not cooperate.  Each test here points it at a deliberately
+# broken endpoint: one that answers forever, one that never answers, one that
+# answers with far too much, and one that answers with something that merely
+# looks right.  Every one of them must end in a bounded, unhealthy verdict.
+# --------------------------------------------------------------------------- #
+
+
+class TestProbeBounds(unittest.TestCase):
+    """Bounded in time, bounded in bytes, and strict about the document."""
+
+    def _probe(self, port, path="/health", host=LOOPBACK):
+        """Probe ``port`` and return ``(verdict, stderr)``."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            verdict = app.probe(
+                {"app.host": host, "python.port": str(port), "health.path": path}
+            )
+        return verdict, stderr.getvalue()
+
+    def test_an_endpoint_that_streams_without_end_cannot_outlive_the_deadline(self):
+        """The case a per-read timeout cannot bound.
+
+        The chunks arrive faster than any inactivity timeout, so every individual
+        read succeeds and an implementation without an ABSOLUTE deadline stays in
+        this loop for as long as the peer keeps trickling.  Ending at all is the
+        assertion; no duration is compared to anything.
+        """
+        endpoint = hostile_endpoint(
+            self,
+            head=b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            trickle=True,
+        )
+        verdict, written = self._probe(endpoint.port)
+        self.assertEqual(verdict, 1)
+        self.assertIn("deadline", written)
+
+    def test_an_endpoint_that_never_answers_cannot_hold_the_probe(self):
+        """A peer that accepts the connection and then says nothing at all."""
+        endpoint = hostile_endpoint(self, mute=True)
+        verdict, written = self._probe(endpoint.port)
+        self.assertEqual(verdict, 1)
+        self.assertEqual(written.count("\n"), 1)
+
+    def test_a_body_larger_than_the_ceiling_is_refused_rather_than_accumulated(self):
+        body = b"0" * OVERSIZED_BODY_BYTES
+        endpoint = hostile_endpoint(self, head=json_head(len(body)), body=body)
+        verdict, written = self._probe(endpoint.port)
+        self.assertEqual(verdict, 1)
+        self.assertIn("exceeds the probe limit", written)
+
+    def test_the_ceiling_is_inclusive_and_one_byte_past_it_is_refused(self):
+        """Both sides of the limit, so an off-by-one cannot hide in either."""
+        at_limit = padded_document(PROBE_BODY_CEILING)
+        accepted = hostile_endpoint(
+            self, head=json_head(len(at_limit)), body=at_limit
+        )
+        verdict, written = self._probe(accepted.port)
+        self.assertEqual(verdict, 0, msg=written)
+
+        past_limit = padded_document(PROBE_BODY_CEILING + 1)
+        refused = hostile_endpoint(
+            self, head=json_head(len(past_limit)), body=past_limit
+        )
+        verdict, written = self._probe(refused.port)
+        self.assertEqual(verdict, 1)
+        self.assertIn("exceeds the probe limit", written)
+
+    def test_malformed_json_containing_the_healthy_fragment_is_not_healthy(self):
+        """A substring match would grade this healthy; a parse cannot.
+
+        This is the fail-closed property in its sharpest form: the body carries
+        the exact bytes of a healthy status field and is still not a JSON
+        document, so the only correct verdict is unhealthy.
+        """
+        endpoint = hostile_endpoint(
+            self,
+            head=json_head(len(FORGED_STATUS_BODY)),
+            body=FORGED_STATUS_BODY,
+        )
+        verdict, written = self._probe(endpoint.port)
+        self.assertEqual(verdict, 1)
+        self.assertIn("not the expected JSON", written)
+
+    def test_a_json_body_that_is_not_an_object_is_not_healthy(self):
+        body = b'"UP"'
+        endpoint = hostile_endpoint(self, head=json_head(len(body)), body=body)
+        verdict, written = self._probe(endpoint.port)
+        self.assertEqual(verdict, 1)
+        self.assertIn("status field", written)
+
+    def test_a_document_without_the_expected_status_is_not_healthy(self):
+        body = b'{"name":"x","version":"1.1.0","timestamp":"z","status":"DOWN"}'
+        endpoint = hostile_endpoint(self, head=json_head(len(body)), body=body)
+        verdict, written = self._probe(endpoint.port)
+        self.assertEqual(verdict, 1)
+        self.assertIn("status field", written)
+
+    def test_a_non_200_answer_is_reported_by_code_and_nothing_else(self):
+        body = b'{"error":"Internal Server Error"}'
+        endpoint = hostile_endpoint(
+            self,
+            head=json_head(len(body), status=b"HTTP/1.1 500 Internal Server Error"),
+            body=body,
+        )
+        verdict, written = self._probe(endpoint.port)
+        self.assertEqual(verdict, 1)
+        self.assertIn("500", written)
+        self.assertNotIn("/health", written)
+
+    def test_a_well_behaved_endpoint_is_healthy_and_silent(self):
+        """The positive control: these bounds must not reject a correct answer."""
+        body = padded_document(120)
+        endpoint = hostile_endpoint(self, head=json_head(len(body)), body=body)
+        verdict, written = self._probe(endpoint.port)
+        self.assertEqual(verdict, 0, msg=written)
+        self.assertEqual(written, "")
+
+
+# --------------------------------------------------------------------------- #
+
+
+class TestRequestBodyDrain(HealthServerTestCase):
+    """A refused request arrives WITH a body, and the connection is reused.
+
+    ``BaseHTTPRequestHandler`` never reads a request body.  Left queued on a
+    kept-alive connection those bytes are consumed as the start of the NEXT
+    request line: a three-byte body in front of a following ``GET`` parses as the
+    method ``xyzGET``, which the inherited error path answers with a 501 carrying
+    an HTML body and both a ``Server`` and a ``Date`` header - three departures
+    from the frozen contract at once - and the legitimate request behind it is
+    never answered at all.
+
+    The other two implementations do not need this repaired: Node dumps an
+    unconsumed request itself once the response finishes, and Java drains
+    explicitly.  These tests pin the behaviour all three now share.
+    """
+
+    def _exchange(self, first, second, timeout=REQUEST_TIMEOUT_SECONDS):
+        """Send two requests down ONE connection; return everything received."""
+        client = socket.create_connection(
+            (LOOPBACK, self.port), timeout=REQUEST_TIMEOUT_SECONDS
+        )
+        try:
+            client.sendall(first)
+            time.sleep(PIPELINE_GAP_SECONDS)
+            client.sendall(second)
+            client.settimeout(timeout)
+            return read_response(client)
+        finally:
+            client.close()
+
+    def test_a_refused_request_with_a_body_does_not_corrupt_the_next_one(self):
+        body = b"xyz"
+        received = self._exchange(
+            b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\n\r\n%s"
+            % (len(body), body),
+            b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        self.assertEqual(received.count(b"HTTP/1.1 "), 2, msg=repr(received))
+        self.assertIn(b"405 Method Not Allowed", received)
+        self.assertIn(b"200 OK", received)
+        self.assertIn(b'"status":"UP"', received)
+
+    def test_no_leftover_byte_is_ever_parsed_as_a_request_line(self):
+        """The 501, the HTML body and the Server header are all absent."""
+        received = self._exchange(
+            b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nxyz",
+            b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        self.assertNotIn(b"501", received)
+        self.assertNotIn(b"<html", received.lower())
+        self.assertNotIn(b"Server:", received)
+        self.assertNotIn(b"Date:", received)
+
+    def test_a_body_on_the_health_route_itself_is_drained_too(self):
+        """The drain sits on the shared response path, not on the 405 branch."""
+        received = self._exchange(
+            b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nxyz",
+            b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        self.assertEqual(received.count(b"HTTP/1.1 200 OK"), 2, msg=repr(received))
+
+    def test_a_chunked_body_retires_the_connection_instead_of_guessing(self):
+        """Decoding a chunked body needs a reader this server does not carry.
+
+        The response is still written; only the connection is retired.  A second
+        request on it must therefore go unanswered rather than be misparsed.
+        """
+        received = self._exchange(
+            b"POST /health HTTP/1.1\r\nHost: h\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n3\r\nxyz\r\n0\r\n\r\n",
+            b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        self.assertEqual(received.count(b"HTTP/1.1 "), 1, msg=repr(received))
+        self.assertIn(b"405 Method Not Allowed", received)
+
+    def test_a_length_above_the_ceiling_is_refused_rather_than_read(self):
+        """Reading it to be polite is the unbounded read the limit prevents."""
+        received = self._exchange(
+            b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\n\r\n"
+            % (app.MAX_REQUEST_DRAIN_BYTES + 1),
+            b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        self.assertEqual(received.count(b"HTTP/1.1 "), 1, msg=repr(received))
+        self.assertIn(b"405 Method Not Allowed", received)
+
+    def test_a_length_that_is_not_ascii_decimal_retires_the_connection(self):
+        """The same grammar the port uses: a plain non-negative decimal, or no.
+
+        A sign, a radix prefix and a non-ASCII digit are each refused.  The last
+        one matters most: ``int()`` accepts Unicode decimal digits, so the Arabic-
+        Indic three would otherwise be read as a length of three and the two
+        implementations would disagree about where the body ends.
+        """
+        for stated in (b"+3", b"-3", b"0x3", "\u0663".encode("utf-8"), b"3.0", b""):
+            with self.subTest(stated=stated):
+                received = self._exchange(
+                    b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: "
+                    + stated + b"\r\n\r\nxyz",
+                    b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+                )
+                self.assertNotIn(b"200 OK", received, msg=repr(received))
+
+    def test_whitespace_around_the_length_is_not_part_of_the_value(self):
+        """RFC 9110 excludes optional surrounding whitespace from a field value.
+
+        ``Content-Length: 3 `` therefore states three, and the exchange proceeds
+        normally rather than retiring the connection.
+        """
+        received = self._exchange(
+            b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: 3 \r\n\r\nxyz",
+            b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        self.assertEqual(received.count(b"HTTP/1.1 "), 2, msg=repr(received))
+        self.assertIn(b"200 OK", received)
+
+    def test_an_under_delivered_body_gives_up_on_its_own_budget(self):
+        """A client that promises a hundred bytes, sends three and goes quiet.
+
+        The drain is a BLOCKING read, so without a bound of its own it parks a
+        handler thread for the lifetime of the process.  The budget is lowered for
+        the duration of this test so the assertion costs a fraction of a second
+        rather than the production budget, and it is restored on every path.
+        """
+        original = app.REQUEST_DRAIN_TIMEOUT_SECONDS
+        app.REQUEST_DRAIN_TIMEOUT_SECONDS = SHORT_DRAIN_BUDGET_SECONDS
+        try:
+            client = socket.create_connection(
+                (LOOPBACK, self.port), timeout=REQUEST_TIMEOUT_SECONDS
+            )
+            try:
+                client.sendall(
+                    b"POST /health HTTP/1.1\r\nHost: h\r\n"
+                    b"Content-Length: 100\r\n\r\nxyz"
+                )
+                began = time.monotonic()
+                client.settimeout(REQUEST_TIMEOUT_SECONDS)
+                received = read_response(client)
+                elapsed = time.monotonic() - began
+            finally:
+                client.close()
+        finally:
+            app.REQUEST_DRAIN_TIMEOUT_SECONDS = original
+        self.assertIn(b"405 Method Not Allowed", received)
+        self.assertGreaterEqual(elapsed, SHORT_DRAIN_BUDGET_SECONDS * 0.5)
+        self.assertLess(elapsed, REQUEST_TIMEOUT_SECONDS)
+
+    def test_the_drain_budget_is_the_javascript_request_budget(self):
+        """One number governs the same behaviour in both implementations."""
+        self.assertEqual(app.REQUEST_DRAIN_TIMEOUT_SECONDS, 15.0)
+        self.assertEqual(app.MAX_REQUEST_DRAIN_BYTES, 8 * 1024 * 1024)
+
+    def test_serving_a_drained_exchange_writes_no_diagnostic(self):
+        """A slow or sloppy client is not this endpoint's news to report."""
+        with contextlib.redirect_stderr(io.StringIO()) as sink:
+            self._exchange(
+                b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nxyz",
+                b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+            )
+        self.assertEqual(sink.getvalue(), "")
 
 
 class TestServerLifecycle(unittest.TestCase):
@@ -1109,6 +1932,376 @@ class TestServerLifecycle(unittest.TestCase):
             )
 
 
+# --------------------------------------------------------------------------- #
+# Security regressions
+#
+# Every test below reproduces something this endpoint once permitted, and each
+# one fails if the defence is removed.  They are named after what an attacker
+# would have achieved rather than after the function under test, so that a future
+# reader can tell at a glance that they are not stylistic assertions.
+# --------------------------------------------------------------------------- #
+
+
+class TestConfigurationValidation(unittest.TestCase):
+    """An unpublishable configuration is refused, not served.
+
+    The proven defect: ``APP_VERSION=not-a-version`` was served verbatim inside a
+    ``200`` response whose ``status`` field read ``UP``, so the endpoint attested
+    to its own health while describing itself in a form no consumer of the frozen
+    contract could parse.
+    """
+
+    def config(self, **overrides):
+        base = {
+            "app.name": EXPECTED_DEFAULTS["app.name"],
+            "app.version": EXPECTED_DEFAULTS["app.version"],
+            "health.path": EXPECTED_DEFAULTS["health.path"],
+            "app.host": LOOPBACK,
+            "python.port": "0",
+        }
+        base.update(overrides)
+        return base
+
+    def test_the_shipped_configuration_is_accepted(self):
+        """The positive control: this must not become a validator that refuses
+        the very configuration the repository ships."""
+        app.validate_config(self.config())
+        app.validate_config(app.load_config())
+
+    def test_a_malformed_version_is_refused(self):
+        for version in ["not-a-version", "1.2", "1.2.3.4", "v1.2.3", "1.2.3-rc1",
+                        "1..3", "1.2.", "01.02.03a", "\u0661.\u0662.\u0663"]:
+            with self.subTest(version=version):
+                with self.assertRaises(ValueError) as raised:
+                    app.validate_config(self.config(**{"app.version": version}))
+                self.assertIn("app.version", str(raised.exception))
+
+    def test_a_multi_digit_three_part_version_is_accepted(self):
+        app.validate_config(self.config(**{"app.version": "10.20.30"}))
+
+    def test_an_empty_or_control_bearing_name_is_refused(self):
+        for name in ["", "na\nme", "na\x00me", "na\x7fme"]:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError) as raised:
+                    app.validate_config(self.config(**{"app.name": name}))
+                self.assertIn("app.name", str(raised.exception))
+
+    def test_a_route_that_is_not_a_visible_ascii_path_is_refused(self):
+        for path in ["health", "", "/heal th", "/health\r\nX-Injected: 1", "/h\u00e9alth"]:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError) as raised:
+                    app.validate_config(self.config(**{"health.path": path}))
+                self.assertIn("health.path", str(raised.exception))
+
+    def test_a_host_carrying_a_control_character_is_refused(self):
+        with self.assertRaises(ValueError) as raised:
+            app.validate_config(
+                self.config(**{"app.host": "127.0.0.1\n[app.py] forged line"})
+            )
+        self.assertIn("app.host", str(raised.exception))
+
+    def test_a_rejection_message_cannot_forge_a_log_line(self):
+        """CWE-117.  The message quotes a configured value, so a value carrying a
+        CR, an LF or a terminal escape must not survive into it."""
+        with self.assertRaises(ValueError) as raised:
+            app.validate_config(
+                self.config(**{"app.host": "127.0.0.1\r\n[app.py] forged\x1b[2J"})
+            )
+        message = str(raised.exception)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\r", message)
+        self.assertNotIn("\x1b", message)
+
+    def test_create_server_refuses_before_it_binds(self):
+        """Fail closed at creation, not at first request: a server that bound a
+        socket and then served an invalid document would have published it."""
+        with self.assertRaises(ValueError):
+            app.create_server(
+                host=LOOPBACK, port=0, config=self.config(**{"app.version": "1.2"})
+            )
+
+    def test_the_probe_refuses_an_unpublishable_configuration(self):
+        """A probe that accepted a configuration the server refuses would report
+        a process healthy that cannot start - the most misleading verdict there
+        is."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            verdict = app.probe(self.config(**{"app.version": "not-a-version"}))
+        self.assertEqual(verdict, 1)
+        self.assertIn("probe cannot run", stderr.getvalue())
+        self.assertIn("app.version", stderr.getvalue())
+
+
+class TestPortGrammar(unittest.TestCase):
+    """One configured port value, read identically by all three runtimes.
+
+    The proven divergence: ``int()`` honours PEP 515 separators and every Unicode
+    decimal digit, so Python bound port 8001 for ``PORT=8_001`` while Node and
+    Java refused it and exited non-zero.  One deployment, one value, two
+    different ports.
+    """
+
+    def test_a_non_ascii_decimal_port_is_refused(self):
+        for value in ["8_001", "\u0668\u0660\u0660\u0661", "0x50", "8O01",
+                      "8001.0", "eight", "1e3", "", "8 001", "0b11"]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    app._as_port(value)
+
+    def test_an_out_of_range_port_is_refused(self):
+        for value in ["-1", "65536", "99999"]:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    app._as_port(value)
+
+    def test_a_plain_ascii_decimal_port_is_accepted(self):
+        self.assertEqual(app._as_port("8001"), 8001)
+        self.assertEqual(app._as_port("+8001"), 8001)
+        self.assertEqual(app._as_port("  8001  "), 8001)
+        self.assertEqual(app._as_port("0"), 0)
+        self.assertEqual(app._as_port("65535"), 65535)
+
+
+class StubListener:
+    """A one-shot loopback listener that answers with fixed bytes.
+
+    Used to point ``probe`` at a hostile responder without a subprocess and
+    without a network.  It binds an ephemeral port, serves every connection it
+    accepts on a daemon thread, and closes when the context exits.
+    """
+
+    def __init__(self, response):
+        self.response = response
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind((LOOPBACK, 0))
+        self.socket.listen(8)
+        self.port = self.socket.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._running = True
+        self._thread.start()
+
+    def _serve(self):
+        while self._running:
+            try:
+                client, _ = self.socket.accept()
+            except OSError:
+                return
+            with client:
+                try:
+                    client.settimeout(REQUEST_TIMEOUT_SECONDS)
+                    client.recv(65536)
+                    client.sendall(self.response)
+                except OSError:
+                    pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *unused):
+        self._running = False
+        self.socket.close()
+        self._thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+        return False
+
+
+def http_response(body, status=200, content_type="application/json"):
+    """Build a complete, correctly framed HTTP response around a body."""
+    encoded = body if isinstance(body, bytes) else body.encode("utf-8")
+    head = (
+        f"HTTP/1.1 {status} Stub\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {len(encoded)}\r\n"
+        f"Connection: close\r\n\r\n"
+    )
+    return head.encode("iso-8859-1") + encoded
+
+
+class TestProbeHardening(unittest.TestCase):
+    """A self-check must PROVE health, not be talked into reporting it.
+
+    Three separate defects converge here.  The verdict was taken from a substring
+    test, so a truncated body reported healthy.  The whole response was buffered
+    with no ceiling.  And the request went through ``urllib``'s default opener,
+    which reads proxy settings out of the environment - so an injected
+    ``HTTP_PROXY`` could answer on behalf of a process that was not running.
+    """
+
+    HEALTHY = json.dumps(
+        {
+            "name": EXPECTED_DEFAULTS["app.name"],
+            "version": EXPECTED_DEFAULTS["app.version"],
+            "timestamp": "2026-07-28T13:47:08Z",
+            "status": EXPECTED_STATUS,
+        },
+        separators=(",", ":"),
+    )
+
+    def test_a_well_formed_document_is_accepted(self):
+        """The positive control for every rejection below."""
+        self.assertIsNone(app.probe_rejection(200, self.HEALTHY.encode("utf-8")))
+
+    def test_a_truncated_body_quoting_the_healthy_fragment_is_refused(self):
+        """The exact fail-open the substring test allowed: this is not JSON at
+        all, yet ``body.contains('"status":"UP"')`` is true of it."""
+        self.assertIsNotNone(app.probe_rejection(200, b'{"status":"UP"'))
+
+    def test_a_body_that_says_down_while_quoting_up_is_refused(self):
+        document = json.dumps(
+            {
+                "name": '{"status":"UP"}',
+                "version": "1.1.0",
+                "timestamp": "2026-07-28T13:47:08Z",
+                "status": "DOWN",
+            },
+            separators=(",", ":"),
+        )
+        self.assertIsNotNone(app.probe_rejection(200, document.encode("utf-8")))
+
+    def test_a_document_with_the_wrong_key_set_or_order_is_refused(self):
+        extra = '{"name":"n","version":"1.1.0","timestamp":"2026-07-28T13:47:08Z"' \
+                ',"status":"UP","extra":"x"}'
+        reordered = '{"status":"UP","name":"n","version":"1.1.0"' \
+                    ',"timestamp":"2026-07-28T13:47:08Z"}'
+        missing = '{"name":"n","version":"1.1.0","status":"UP"}'
+        for body in (extra, reordered, missing):
+            with self.subTest(body=body):
+                self.assertIsNotNone(app.probe_rejection(200, body.encode("utf-8")))
+
+    def test_the_key_set_reason_is_worded_exactly_as_the_other_two_word_it(self):
+        """The reason strings are part of the shared contract: an operator greps one
+        deployment's logs, not one language's.  This is the easiest reason in the
+        set to drift, because every language has a different natural way to print a
+        list - a Python repr uses apostrophes and spaces, Java's ``List.toString``
+        drops the quotes entirely - so the byte-exact form is pinned here and in the
+        other two harnesses rather than left to whichever renderer is nearest."""
+        body = b'{"name":"n","version":"1.1.0","timestamp":"2026-07-28T13:47:08Z"}'
+        self.assertEqual(
+            app.probe_rejection(200, body),
+            'body does not carry exactly the keys '
+            '["name","version","timestamp","status"] in order',
+        )
+
+    def test_a_repeated_key_is_refused(self):
+        """``json.loads`` keeps the last value silently, which turns a
+        contradictory document into a plausible one.  The Java reader refuses it,
+        so this one must too."""
+        body = ('{"name":"n","version":"1.1.0","timestamp":"2026-07-28T13:47:08Z"'
+                ',"status":"DOWN","status":"UP"}')
+        self.assertIsNotNone(app.probe_rejection(200, body.encode("utf-8")))
+
+    def test_a_malformed_field_value_is_refused(self):
+        for field, value in [("version", "not-a-version"), ("version", "1.2"),
+                             ("timestamp", "2026-07-28 13:47:08"),
+                             ("timestamp", "2026-07-28T13:47:08.123Z"),
+                             ("name", ""), ("status", "DOWN")]:
+            with self.subTest(field=field, value=value):
+                document = json.loads(self.HEALTHY)
+                document[field] = value
+                body = json.dumps(document, separators=(",", ":")).encode("utf-8")
+                self.assertIsNotNone(app.probe_rejection(200, body))
+
+    def test_a_non_object_or_non_string_document_is_refused(self):
+        for body in [b"[]", b'"UP"', b"42", b"null",
+                     b'{"name":{"n":"x"},"version":"1.1.0"'
+                     b',"timestamp":"2026-07-28T13:47:08Z","status":"UP"}',
+                     self.HEALTHY.encode("utf-8") + b"trailing"]:
+            with self.subTest(body=body):
+                self.assertIsNotNone(app.probe_rejection(200, body))
+
+    def test_a_non_200_status_is_refused(self):
+        for status in (204, 302, 404, 500):
+            with self.subTest(status=status):
+                self.assertIsNotNone(
+                    app.probe_rejection(status, self.HEALTHY.encode("utf-8"))
+                )
+
+    def test_a_body_over_the_ceiling_is_refused(self):
+        oversized = b"x" * (app.MAX_PROBE_BODY_BYTES + 1)
+        reason = app.probe_rejection(200, oversized)
+        self.assertIsNotNone(reason)
+        self.assertIn(str(app.MAX_PROBE_BODY_BYTES), reason)
+
+    def test_the_probe_stops_reading_an_endless_response(self):
+        """End to end over a socket: a responder that declares a huge body is
+        refused on size rather than buffered."""
+        padded = json.dumps(
+            {
+                "name": EXPECTED_DEFAULTS["app.name"] + "y" * (
+                    app.MAX_PROBE_BODY_BYTES * 2
+                ),
+                "version": EXPECTED_DEFAULTS["app.version"],
+                "timestamp": "2026-07-28T13:47:08Z",
+                "status": EXPECTED_STATUS,
+            },
+            separators=(",", ":"),
+        )
+        with StubListener(http_response(padded)) as stub:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                verdict = app.probe(self._config_for(stub.port))
+        self.assertEqual(verdict, 1)
+        self.assertIn(str(app.MAX_PROBE_BODY_BYTES), stderr.getvalue())
+
+    def test_the_probe_refuses_a_stub_that_only_looks_healthy(self):
+        with StubListener(http_response('{"status":"UP"')) as stub:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                verdict = app.probe(self._config_for(stub.port))
+        self.assertEqual(verdict, 1)
+        self.assertIn("probe rejected", stderr.getvalue())
+
+    def test_the_probe_accepts_a_stub_that_serves_the_real_contract(self):
+        """The end-to-end positive control: the socket path, the bounded read and
+        the document check all have to work together for this to pass."""
+        with StubListener(http_response(self.HEALTHY)) as stub:
+            self.assertEqual(app.probe(self._config_for(stub.port)), 0)
+
+    def test_an_injected_proxy_cannot_answer_for_the_endpoint(self):
+        """The proven exploit: with a dead target port and a local ``HTTP_PROXY``
+        serving a fabricated healthy document, the probe returned 0 without ever
+        touching the process it was meant to be checking."""
+        dead_port = unused_port()
+        with StubListener(http_response(self.HEALTHY)) as proxy:
+            proxy_url = f"http://{LOOPBACK}:{proxy.port}"
+            injected = {
+                "http_proxy": proxy_url,
+                "HTTP_PROXY": proxy_url,
+                "all_proxy": proxy_url,
+                "ALL_PROXY": proxy_url,
+                "no_proxy": "",
+                "NO_PROXY": "",
+            }
+            stderr = io.StringIO()
+            with mock.patch.dict(os.environ, injected), contextlib.redirect_stderr(
+                stderr
+            ):
+                verdict = app.probe(self._config_for(dead_port))
+        self.assertEqual(verdict, 1)
+        self.assertIn("could not reach", stderr.getvalue())
+
+    def test_a_diagnostic_cannot_be_forged_through_a_configured_value(self):
+        """CWE-117 on the probe path.  Every configured value that reaches the
+        diagnostic is either refused by validation or sanitised, so a single call
+        can never emit two lines."""
+        stderr = io.StringIO()
+        config = self._config_for(unused_port())
+        config["app.host"] = "127.0.0.1\n[app.py] FORGED"
+        with contextlib.redirect_stderr(stderr):
+            verdict = app.probe(config)
+        self.assertEqual(verdict, 1)
+        self.assertEqual(len(stderr.getvalue().strip().splitlines()), 1)
+        self.assertNotIn("FORGED\n", stderr.getvalue())
+
+    def _config_for(self, port):
+        return {
+            "app.name": EXPECTED_DEFAULTS["app.name"],
+            "app.version": EXPECTED_DEFAULTS["app.version"],
+            "health.path": EXPECTED_DEFAULTS["health.path"],
+            "app.host": LOOPBACK,
+            "python.port": str(port),
+        }
+
+
 if __name__ == "__main__":
     unittest.main()
-

@@ -52,6 +52,7 @@ const assert = require("node:assert/strict");
 const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 
@@ -348,6 +349,32 @@ const temporaryDirectories = [];
  * @param {string[]} lines Properties-file lines, written verbatim.
  * @returns {string} Absolute path of the file.
  */
+/**
+ * Runs `work` with stderr captured, returning its result and everything written.
+ *
+ * Several assertions below are about a diagnostic the module writes DELIBERATELY.
+ * Letting those lines through would interleave them with the runner's own TAP
+ * output, and it would also leave the diagnostic unasserted - the interesting part
+ * is usually that exactly one line was written and that it withheld the value.
+ * The original writer is restored on every path.
+ *
+ * @param {Function} work Zero-argument function to run.
+ * @returns {{value: *, written: string}} Its return value and the captured text.
+ */
+function withStderr(work) {
+  const original = process.stderr.write;
+  let written = "";
+  process.stderr.write = (chunk) => {
+    written += chunk;
+    return true;
+  };
+  try {
+    return { value: work(), written };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
 function writePropertiesFile(lines) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "health-config-"));
   temporaryDirectories.push(directory);
@@ -410,6 +437,13 @@ describe("A. preserved legacy behaviour", () => {
       "buildServer",
       "serve",
       "probe",
+      "stripAuthority",
+      "isSingleLineText",
+      "isRequestTarget",
+      "validateConfig",
+      "sanitizeForLog",
+      "probeAuthority",
+      "probeRejection",
     ];
     for (const name of expectedFunctions) {
       assert.equal(typeof app[name], "function", `${name} should be an exported function`);
@@ -421,6 +455,7 @@ describe("A. preserved legacy behaviour", () => {
     assert.equal(typeof app.CACHE_CONTROL, "string");
     assert.equal(typeof app.DEFAULTS, "object");
     assert.equal(typeof app.ENV_KEYS, "object");
+    assert.equal(typeof app.MAX_PROBE_BODY_BYTES, "number");
   });
 
   it("publishes the documented aliases as the very same functions", () => {
@@ -652,6 +687,46 @@ describe("C. path normalisation", () => {
     assert.equal(app.normalizePath(null), "/");
   });
 
+  it("strips an absolute-form authority, which RFC 9112 permits in a request line", () => {
+    // A proxy-aware client emits `GET http://host:8001/health HTTP/1.1`. The Java
+    // implementation reduced this from the beginning; Python and this module did
+    // not, so the same request reached the route on one implementation and 404'd
+    // on the other two.
+    const cases = {
+      "http://host:8001/health": "/health",
+      "http://host:8001/health/": "/health",
+      "http://host/nope": "/nope",
+      "https://host:443/health?probe=1": "/health",
+      "http://host": "/",
+    };
+    for (const [target, expected] of Object.entries(cases)) {
+      assert.equal(app.normalizePath(target), expected, target);
+    }
+  });
+
+  it("strips a fragment, which is a client-side construct and selects no route", () => {
+    assert.equal(app.normalizePath("/health#section"), "/health");
+    assert.equal(app.normalizePath("/health?probe=1#section"), "/health");
+  });
+
+  it("validates the scheme before removing anything, so a query keeps its URL", () => {
+    // `://` inside a QUERY is data. Without the scheme check `/health?next=http://x/`
+    // would be truncated to `/` and the route would be lost.
+    for (const target of [
+      "/health?next=http://elsewhere/",
+      "/health",
+      "/",
+      "//health",
+      "/health%2f",
+      "/9nothing://x",
+      "/-bad://x",
+      "http:/health",
+      "",
+    ]) {
+      assert.equal(app.stripAuthority(target), target, target);
+    }
+  });
+
   it("always returns a path beginning with a slash", () => {
     for (const target of ["/health", "/health/", "", "?x=1", "/nope", undefined]) {
       assert.ok(app.normalizePath(target).startsWith("/"), `${target} should normalise to an absolute path`);
@@ -878,6 +953,399 @@ describe("D2. a server built from non-default configuration", () => {
  * E. Configuration precedence: environment > properties file > default
  * ========================================================================== */
 
+/* -------------------------------------------------------------------------- *
+ * F. Configuration validation and the port grammar
+ *
+ * A configuration that cannot be published truthfully must be refused BEFORE a
+ * socket is bound, so there is no window in which a port is held by a server
+ * that would answer 200 with a payload the contract forbids. All three
+ * implementations raise, and the message wording is byte-identical across them -
+ * an operator greps one deployment's logs, not one language's.
+ * -------------------------------------------------------------------------- */
+
+describe("F. configuration validation", () => {
+  const NAME_REASON = "invalid app.name: it must be non-empty text with no control character";
+  const VERSION_REASON =
+    "invalid app.version: it must be a three-part dotted numeric version";
+  const PATH_REASON = "invalid health.path: it is not a valid request target";
+  const HOST_REASON = "invalid app.host: it must be non-empty text with no control character";
+
+  function base() {
+    return app.loadConfig({ env: {} });
+  }
+
+  function rejectionOf(overrides) {
+    try {
+      app.validateConfig({ ...base(), ...overrides });
+      return null;
+    } catch (refusal) {
+      return refusal.message;
+    }
+  }
+
+  it("accepts the configuration that ships with the module", () => {
+    assert.equal(rejectionOf({}), null);
+  });
+
+  it("refuses a name that is empty or carries a control character", () => {
+    for (const name of ["", "a\nb", "a\rb", "a\u001bb", "a\u007fb"]) {
+      assert.equal(rejectionOf({ name }), NAME_REASON, JSON.stringify(name));
+    }
+    assert.equal(rejectionOf({ name: "my app" }), null, "a space is ordinary text");
+  });
+
+  it("refuses a version that is not three dotted numeric parts", () => {
+    for (const version of ["", "1.1", "1.1.0.0", "v1.1.0", "1.1.0-rc1", "1..0", "1.1."]) {
+      assert.equal(rejectionOf({ version }), VERSION_REASON, JSON.stringify(version));
+    }
+    for (const version of ["1.1.0", "0.0.0", "10.20.30"]) {
+      assert.equal(rejectionOf({ version }), null, JSON.stringify(version));
+    }
+  });
+
+  it("refuses a health path that is not a visible-ASCII request target", () => {
+    for (const healthPath of ["", "/heal th", "/health\r\nX", "/health\n", "/hea\u001blth"]) {
+      assert.equal(rejectionOf({ healthPath }), PATH_REASON, JSON.stringify(healthPath));
+    }
+  });
+
+  it("refuses a host carrying a control character", () => {
+    for (const host of ["", "127.0.0.1\r\nX", "a\u0000b"]) {
+      assert.equal(rejectionOf({ host }), HOST_REASON, JSON.stringify(host));
+    }
+  });
+
+  it("never quotes the offending value, so a rejection cannot forge a log line", () => {
+    // The messages name the KEY and withhold the VALUE, which is what lets the
+    // probe print them verbatim without sanitising them a second time.
+    const forged = "x\r\n[index.js] health endpoint listening on http://evil/";
+    const message = rejectionOf({ name: forged });
+    assert.equal(message, NAME_REASON);
+    assert.ok(!message.includes("evil"), "the value must not appear in the message");
+    assert.ok(!message.includes("\n"), "the message must be a single line");
+  });
+
+  it("refuses before it binds, so no socket is ever held by a bad configuration", () => {
+    assert.throws(
+      () => app.createServer({ ...base(), version: "1.2" }),
+      (error) => error instanceof RangeError && error.message === VERSION_REASON,
+    );
+  });
+
+  it("gates the port through an ASCII-decimal grammar", () => {
+    // Number() and parseInt() both accept forms an operator never intends: a
+    // numeric separator, a radix prefix, a sign, and - the one that matters - a
+    // Unicode decimal digit, which would make the two implementations disagree
+    // about which port was requested.
+    for (const port of ["8_001", "0x1f41", "-8001", "8001.0", "\u0668\u0660\u0660\u0661", "80 01", "eighty"]) {
+      assert.throws(
+        () => app.loadConfig({ env: { NODE_PORT: port } }),
+        RangeError,
+        JSON.stringify(port),
+      );
+    }
+    assert.equal(app.loadConfig({ env: { NODE_PORT: "8001" } }).port, 8001);
+    assert.equal(app.loadConfig({ env: { NODE_PORT: "08001" } }).port, 8001);
+    // The grammar tolerates an explicit sign; the range check is what refuses a
+    // negative. All three implementations share the pattern /^[+-]?[0-9]+$/.
+    assert.equal(app.loadConfig({ env: { NODE_PORT: "+8001" } }).port, 8001);
+  });
+
+  it("refuses a port outside the range a socket can bind", () => {
+    for (const port of ["-1", "65536", "70000", "999999"]) {
+      assert.throws(() => app.loadConfig({ env: { NODE_PORT: port } }), RangeError, port);
+    }
+    assert.equal(app.loadConfig({ env: { NODE_PORT: "0" } }).port, 0);
+    assert.equal(app.loadConfig({ env: { NODE_PORT: "65535" } }).port, 65535);
+  });
+
+  it("accepts single-line text and visible-ASCII targets, and nothing else", () => {
+    assert.equal(app.isSingleLineText("ordinary text"), true);
+    assert.equal(app.isSingleLineText(""), false);
+    assert.equal(app.isSingleLineText("a\nb"), false);
+    assert.equal(app.isRequestTarget("/health"), true);
+    assert.equal(app.isRequestTarget("/heal th"), false, "a space ends the target");
+    assert.equal(app.isRequestTarget("/health\u007f"), false, "DEL is not visible ASCII");
+    assert.equal(app.isRequestTarget("/health\r\nX"), false, "CRLF cannot forge a line");
+    assert.equal(app.isRequestTarget(""), false, "an empty target is not a target");
+    // Rootedness is NOT this predicate's concern: the leading slash is supplied by
+    // the route resolver, so an unrooted value is a valid target here and becomes
+    // "/health" there. Asserted so the division of labour stays deliberate.
+    assert.equal(app.isRequestTarget("health"), true);
+    assert.equal(app.loadConfig({ env: { HEALTH_PATH: "health" } }).healthPath, "/health");
+  });
+
+  it("sanitises a diagnostic to one line of printable characters", () => {
+    assert.equal(app.sanitizeForLog("plain"), "plain");
+    assert.ok(!app.sanitizeForLog("a\r\nb").includes("\n"));
+    assert.ok(!app.sanitizeForLog("a\u001bb").includes("\u001b"));
+    assert.ok(!app.sanitizeForLog("a\u007fb").includes("\u007f"));
+  });
+});
+
+/* -------------------------------------------------------------------------- *
+ * G. Probe target selection and answer validation
+ *
+ * The probe exists to be consumed by a container HEALTHCHECK, so it must fail
+ * CLOSED: every doubt resolves to unhealthy. It dials loopback only, ignores any
+ * ambient proxy, bounds what it will read, and checks the whole document rather
+ * than searching the body for a hopeful substring.
+ * -------------------------------------------------------------------------- */
+
+describe("G. probe target and answer validation", () => {
+  it("honours every loopback spelling exactly and silently", () => {
+    const accepted = {
+      "127.0.0.1": "127.0.0.1",
+      "127.0.0.2": "127.0.0.2",
+      "127.255.255.254": "127.255.255.254",
+      localhost: "127.0.0.1",
+      LOCALHOST: "127.0.0.1",
+      "0.0.0.0": "127.0.0.1",
+      "": "127.0.0.1",
+      // "::" is the IPv6 WILDCARD, not the IPv6 loopback, so it resolves the same
+      // way "0.0.0.0" does. Verified identical in all three implementations.
+      "::": "127.0.0.1",
+      "::1": "[::1]",
+      "[::1]": "[::1]",
+      "0:0:0:0:0:0:0:1": "[::1]",
+      "[0:0:0:0:0:0:0:1]": "[::1]",
+    };
+    for (const [host, expected] of Object.entries(accepted)) {
+      assert.equal(app.probeAuthority(host), expected, host);
+    }
+  });
+
+  it("replaces any other value with loopback rather than dialling it", () => {
+    // A probe that honoured a routable host would report the health of something
+    // other than the process it was asked about.
+    for (const host of ["example.com", "10.0.0.1", "128.0.0.1", "126.255.255.255", "8.8.8.8"]) {
+      const { value, written } = withStderr(() => app.probeAuthority(host));
+      assert.equal(value, "127.0.0.1", host);
+      // Exactly one line, and it never echoes the value it refused: the host came
+      // from configuration, and a configured value reaching a log line verbatim is
+      // how a forged line gets written.
+      assert.equal(written.split("\n").filter(Boolean).length, 1, written);
+      assert.ok(!written.includes(host), `the refused value ${host} must not be echoed`);
+      assert.match(written, /probe target is not loopback; probing loopback instead/);
+    }
+  });
+
+  it("says nothing at all when the configured host is already loopback", () => {
+    for (const host of ["127.0.0.1", "localhost", "::1", "0.0.0.0", ""]) {
+      const { written } = withStderr(() => app.probeAuthority(host));
+      assert.equal(written, "", `${JSON.stringify(host)} must be silent`);
+    }
+  });
+
+  it("accepts a well-formed answer and refuses every departure from it", () => {
+    const document = {
+      name: "n",
+      version: "1.1.0",
+      timestamp: "2026-07-29T08:00:00Z",
+      status: "UP",
+    };
+    const body = (value) => Buffer.from(JSON.stringify(value));
+    assert.equal(app.probeRejection(200, body(document)), null);
+
+    assert.equal(
+      app.probeRejection(500, body(document)),
+      "the endpoint answered status 500",
+    );
+    assert.equal(
+      app.probeRejection(200, body({ ...document, status: "DOWN" })),
+      "the status field is not the expected value",
+    );
+    assert.equal(
+      app.probeRejection(200, body({ ...document, name: "" })),
+      "the name field is not a non-empty string",
+    );
+    assert.equal(
+      app.probeRejection(200, body({ ...document, version: "1.1" })),
+      "the version field is not a three-part dotted numeric version",
+    );
+    assert.equal(
+      app.probeRejection(200, body({ ...document, timestamp: "2026-07-29T08:00:00.500Z" })),
+      "the timestamp field is not a whole-second UTC instant",
+    );
+  });
+
+  it("refuses a truncated body that happens to quote the healthy fragment", () => {
+    // This is the fail-OPEN check the substring test used to pass: the bytes
+    // contain `"status":"UP"` but are not a JSON document at all.
+    const reason = app.probeRejection(200, Buffer.from('{"status":"UP"'));
+    assert.equal(reason, "body is not the expected JSON document");
+  });
+
+  it("refuses a document whose key set or key order departs from the contract", () => {
+    const wrongOrder = '{"version":"1.1.0","name":"n","timestamp":"2026-07-29T08:00:00Z","status":"UP"}';
+    const extraKey = '{"name":"n","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP","extra":"x"}';
+    const expected =
+      'body does not carry exactly the keys ["name","version","timestamp","status"] in order';
+    assert.equal(app.probeRejection(200, Buffer.from(wrongOrder)), expected);
+    assert.equal(app.probeRejection(200, Buffer.from(extraKey)), expected);
+  });
+
+  it("words the key-set reason exactly as the other two implementations word it", () => {
+    // Pinned as a literal because an operator greps one deployment's logs. A
+    // JSON.stringify of an array would print differently in each language.
+    assert.equal(
+      app.probeRejection(200, Buffer.from("{}")),
+      'body does not carry exactly the keys ["name","version","timestamp","status"] in order',
+    );
+  });
+
+  it("refuses a repeated member name instead of letting the last one win", () => {
+    const repeated = '{"name":"n","name":"other","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}';
+    assert.notEqual(app.probeRejection(200, Buffer.from(repeated)), null);
+  });
+
+  it("refuses a body over the ceiling before considering anything else", () => {
+    // Size is checked FIRST: an oversized body is refused on its size and never
+    // parsed, so the ceiling bounds the work as well as the memory.
+    const oversized = Buffer.alloc(app.MAX_PROBE_BODY_BYTES + 1, 0x20);
+    assert.equal(
+      app.probeRejection(200, oversized),
+      `body exceeds the probe limit of ${app.MAX_PROBE_BODY_BYTES} bytes`,
+    );
+    // Size outranks status, which is what makes the ordering observable.
+    assert.match(app.probeRejection(500, oversized), /^body exceeds the probe limit/);
+  });
+
+  it("treats a body exactly at the ceiling as readable", () => {
+    const document = {
+      name: "n",
+      version: "1.1.0",
+      timestamp: "2026-07-29T08:00:00Z",
+      status: "UP",
+    };
+    const rendered = JSON.stringify(document);
+    const padded = Buffer.from(rendered);
+    assert.ok(padded.length <= app.MAX_PROBE_BODY_BYTES);
+    assert.equal(app.probeRejection(200, padded), null);
+  });
+
+  it("refuses a body that is valid JSON but not an object of strings", () => {
+    for (const body of ["[]", '"UP"', "42", "null", 'true', '{"name":1,"version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}']) {
+      assert.notEqual(app.probeRejection(200, Buffer.from(body)), null, body);
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- *
+ * H. Listener budgets and connection reuse
+ *
+ * Node's defaults leave a half-sent request holding a socket for a minute and a
+ * complete one for five, which is far longer than a health endpoint ever needs
+ * and long enough to be worth a peer's while. The budgets below are set
+ * explicitly, and the last group asserts the seam every implementation shares: a
+ * refused request that arrives WITH a body must not corrupt the next request on
+ * the same connection.
+ * -------------------------------------------------------------------------- */
+
+describe("H. listener budgets and connection reuse", () => {
+  let server;
+  let port;
+
+  before(async () => {
+    server = app.createServer(fixedConfig());
+    port = await listen(server);
+  });
+
+  after(async () => {
+    await closeServer(server);
+    assert.equal(server.listening, false, "the test server must not be left listening");
+  });
+
+  it("bounds the headers, the whole request, the socket and the keep-alive wait", () => {
+    // Every one of these is shorter than the Node default it replaces. The request
+    // budget is the number app.py applies to its own body drain, so one value
+    // governs the same behaviour in both implementations.
+    assert.equal(server.headersTimeout, 10000, "headersTimeout");
+    assert.equal(server.requestTimeout, 15000, "requestTimeout");
+    assert.equal(server.timeout, 30000, "socket timeout");
+    assert.equal(server.keepAliveTimeout, 5000, "keepAliveTimeout");
+    assert.ok(
+      server.headersTimeout < server.requestTimeout,
+      "the headers budget must be the tighter of the two, or it never fires",
+    );
+  });
+
+  /**
+   * Sends two requests down ONE connection and resolves with everything received.
+   *
+   * The gap is long enough that the server has certainly answered the first
+   * before the second arrives, so this observes reuse of an idle connection
+   * rather than a pipelined burst.
+   */
+  function reusedConnection(first, second) {
+    return new Promise((resolve, reject) => {
+      const socket = net.connect(port, LOOPBACK, () => {
+        socket.write(first);
+        setTimeout(() => socket.write(second), 300);
+      });
+      const parts = [];
+      socket.on("data", (chunk) => parts.push(chunk));
+      socket.on("end", () => resolve(Buffer.concat(parts).toString("utf8")));
+      socket.on("error", reject);
+      socket.setTimeout(REQUEST_TIMEOUT_MS, () => {
+        socket.destroy();
+        resolve(Buffer.concat(parts).toString("utf8"));
+      });
+    });
+  }
+
+  const REFUSED_WITH_BODY =
+    "POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nxyz";
+  const FOLLOWING_GET =
+    "GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n";
+
+  it("does not let a refused request's body corrupt the next request", async () => {
+    // Left unread, those three bytes are consumed as the start of the next request
+    // line: the method parses as `xyzGET`, and the legitimate request behind it is
+    // never answered. Node dumps an unconsumed request itself once the response
+    // finishes; app.py drains explicitly and User.java installs a request-time
+    // bound. This pins the behaviour all three share.
+    const received = await reusedConnection(REFUSED_WITH_BODY, FOLLOWING_GET);
+    assert.equal(received.split("HTTP/1.1 ").length - 1, 2, received);
+    assert.match(received, /405 Method Not Allowed/);
+    assert.match(received, /200 OK/);
+    assert.match(received, /"status":"UP"/);
+  });
+
+  it("never parses a leftover byte as a request line", async () => {
+    const received = await reusedConnection(REFUSED_WITH_BODY, FOLLOWING_GET);
+    assert.ok(!received.includes("501"), "no unsupported-method answer");
+    assert.ok(!received.toLowerCase().includes("<html"), "no HTML error body");
+    assert.ok(!/^Server:/im.test(received), "no Server header");
+    assert.ok(!/^Date:/im.test(received), "no Date header");
+  });
+
+  it("answers a body on the health route itself and keeps the connection usable", async () => {
+    const received = await reusedConnection(
+      "GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nxyz",
+      FOLLOWING_GET,
+    );
+    assert.equal(received.split("HTTP/1.1 200 OK").length - 1, 2, received);
+  });
+
+  it("writes no diagnostic while serving a drained exchange", async () => {
+    // A slow or sloppy client is routine, not news. A mode of this program that
+    // writes an unexpected diagnostic is a mode that fails a clean-output check.
+    const original = process.stderr.write;
+    let written = "";
+    process.stderr.write = (chunk) => {
+      written += chunk;
+      return true;
+    };
+    try {
+      await reusedConnection(REFUSED_WITH_BODY, FOLLOWING_GET);
+    } finally {
+      process.stderr.write = original;
+    }
+    assert.equal(written, "");
+  });
+});
+
 describe("E. configuration precedence", () => {
   /** A properties file whose every value differs from the built-in defaults. */
   const fileValues = [
@@ -973,13 +1441,55 @@ describe("E. configuration precedence", () => {
     assert.equal(app.loadConfig({ file, env: {} }).port, 19001);
   });
 
-  it("treats a blank environment variable as absent rather than as an override", () => {
-    // The contract requires a non-empty name and a dotted version, so an empty
-    // or whitespace-only variable must fall through to the next source instead
+  it("treats only an empty environment variable as absent, never a supplied one", () => {
+    // The contract requires a non-empty name and a dotted version, so a variable
+    // exported as the empty string must fall through to the next source instead
     // of producing a payload that violates the contract.
-    const config = app.loadConfig({ file, env: { APP_NAME: "", APP_VERSION: "   " } });
-    assert.equal(config.name, "name-from-file");
-    assert.equal(config.version, "9.8.7");
+    const emptied = app.loadConfig({ file, env: { APP_NAME: "", APP_VERSION: "" } });
+    assert.equal(emptied.name, "name-from-file");
+    assert.equal(emptied.version, "9.8.7");
+
+    // A whitespace-only variable, by contrast, WAS supplied, so it wins its rung
+    // and is used exactly as supplied. That is not a nicety: app.py resolves with
+    // `if override:` and User.java with `!fromEnvironment.isEmpty()`, so both of
+    // them treat "   " as a supplied value. Normalising it away here would make
+    // this the one implementation of the three that answers differently for the
+    // same environment, and - because the same helper feeds the port - would let
+    // a supplied but unusable PORT be silently replaced by the default instead of
+    // refused. Empty means absent; anything else means the operator said so.
+    const spaced = app.loadConfig({ file, env: { APP_NAME: "   ", APP_VERSION: " 1.2.3 " } });
+    assert.equal(spaced.name, "   ", "a whitespace-only name is supplied, not absent");
+    assert.equal(spaced.version, " 1.2.3 ", "a supplied value is not trimmed on the way through");
+  });
+
+  it("refuses a supplied whitespace-only port instead of silently defaulting", () => {
+    // The companion of the assertion above, and the reason it matters. A
+    // whitespace-only PORT reaches resolvePort as a supplied value, trims to the
+    // empty string, fails the digit test and is refused - naming the value the
+    // operator actually exported. Falling through to 8001 here would leave a
+    // healthy-looking process listening on a port nobody is watching, which is
+    // exactly what app.py (`int(str(value).strip())` raising ValueError) and
+    // User.java (`Integer.parseInt(raw.trim())` raising NumberFormatException)
+    // refuse to do.
+    assert.throws(
+      () => app.loadConfig({ file, env: { PORT: "   " } }),
+      { name: "RangeError", message: /expected an ASCII decimal integer/ },
+      "a whitespace-only PORT must be refused, not replaced by the default",
+    );
+    assert.throws(
+      () => app.loadConfig({ file: missing, env: { NODE_PORT: "\t" } }),
+      { name: "RangeError", message: /expected an ASCII decimal integer/ },
+      "a whitespace-only NODE_PORT must be refused just as PORT is",
+    );
+
+    // Surrounding whitespace around a real number is still tolerated, because
+    // both siblings trim before parsing. Trimming for the parse and trimming for
+    // the presence test are different decisions, and only the first is correct.
+    assert.equal(
+      app.loadConfig({ file: missing, env: { PORT: " 8080 " } }).port,
+      8080,
+      "a padded numeric port must parse, matching parseInt(raw.trim()) and int(v.strip())",
+    );
   });
 
   it("adds a missing leading slash to a configured health path", () => {
@@ -1112,4 +1622,3 @@ describe("E. configuration precedence", () => {
     }
   });
 });
-

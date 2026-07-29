@@ -30,25 +30,20 @@ default; the universal ``PORT`` variable outranks everything for the listener
 port.  Every value has a working default, so the endpoint still serves when the
 properties file is absent - for example from a partial container copy.
 
-Request parsing is owned by this module rather than delegated to
-:class:`http.server.BaseHTTPRequestHandler`.  That is a correctness requirement,
-not a preference.  The inherited machinery collapses leading slashes in the
-request target before any application code sees it, answers an unknown verb with
-a 501 HTML page that echoes the verb back to the caller, and - when a request
-line cannot be parsed at all - falls back to HTTP/0.9, which suppresses the
-status line and the entire header block and emits a bare HTML body.  All three
-behaviours contradict the frozen contract and diverge from the JavaScript and
-Java implementations, and none of them is reachable from an override of the
-individual ``do_*`` methods.  :meth:`HealthRequestHandler.handle_one_request`
-therefore reads the request line, validates it, reads the header block, drains
-any body and writes the response itself, so that every byte on the wire is
-assembled by code in this file.
+The listener is :class:`http.server.ThreadingHTTPServer` driving a
+:class:`http.server.BaseHTTPRequestHandler` subclass, which is the whole HTTP
+implementation: this module owns routing and the response, and the standard
+library owns the wire.  Nothing here parses a request line, bounds a header
+block or drains a body, because the endpoint answers exactly three responses and
+no more - a 200 on the health route, a 404 on anything else, and a 405 on any
+method other than GET.  Every response is written with
+:meth:`~http.server.BaseHTTPRequestHandler.send_response_only` rather than
+``send_response``, which is what keeps the ``Server`` banner and the ``Date``
+header off a network-reachable surface.
 
 Public surface:
     greet, read_properties, config_value, load_config, normalize_path,
-    strip_authority, health_route, health_timestamp, build_payload,
-    render_payload, is_method_token, is_request_target, parse_request_line,
-    RequestLine, header_value, contains_token, sanitize_for_log,
+    health_route, health_timestamp, build_payload, render_payload,
     HealthRequestHandler, HealthServer, create_server, serve, probe.
 
 The response contract is frozen and identical across all three language
@@ -56,12 +51,13 @@ implementations; see the ``HealthRequestHandler`` docstring for its full text.
 """
 
 import datetime
+import http.client
 import json
 import os
+import re
 import socket
 import sys
-import urllib.error
-import urllib.request
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -112,8 +108,50 @@ UNIVERSAL_PORT_ENV = "PORT"
 
 #: Bind addresses that mean "every interface".  A wildcard-bound listener is not
 #: reachable at its bind address, so ``probe`` substitutes loopback for these.
-WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "*", ""})
+WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*", ""})
 LOOPBACK_HOST = "127.0.0.1"
+
+#: The IPv6 loopback address and the authority form that carries it in a URL.
+#: Brackets are required so the colons cannot be misread as a port separator.
+LOOPBACK_HOST_V6 = "::1"
+LOOPBACK_AUTHORITY_V6 = "[::1]"
+
+#: Every spelling of IPv6 loopback accepted, because a properties file may write
+#: the address either compressed or expanded and both name the same interface.
+IPV6_LOOPBACK_FORMS = frozenset({"::1", "[::1]", "0:0:0:0:0:0:0:1", "[0:0:0:0:0:0:0:1]"})
+
+#: The one host NAME treated as loopback.  RFC 6761 reserves it for exactly that,
+#: and it is MAPPED to the numeric address rather than resolved, so a hosts-file
+#: entry cannot redirect a self-check off this machine.
+LOOPBACK_NAME = "localhost"
+
+#: Every IPv4 address in 127.0.0.0/8 is loopback, so a listener deliberately bound
+#: to, say, 127.0.0.2 is still probed at the address it is actually on.
+IPV4_LOOPBACK_PREFIX = "127."
+
+#: The shared port grammar.  Plain ASCII decimal with an optional sign, written as
+#: an explicit character class rather than ``\d`` because ``\d`` also matches
+#: Arabic-Indic and other Unicode digits that :func:`int` would then accept - a
+#: value the JavaScript and Java implementations both refuse.
+PORT_GRAMMAR = re.compile(r"^[+-]?[0-9]+$")
+
+#: The frozen three-part dotted version contract from the response schema.
+VERSION_GRAMMAR = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+
+#: The frozen timestamp contract: a fixed-width UTC instant truncated to whole
+#: seconds with a ``Z`` designator.  Written as an explicit character class for the
+#: same reason :data:`PORT_GRAMMAR` is, and used only to assert the SHAPE of a
+#: field - never its value, which is the one non-deterministic part of the payload.
+TIMESTAMP_GRAMMAR = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+
+#: The character range a request target may be made of: visible US-ASCII only.
+#: Space (0x20) and every control character are therefore excluded, which is what
+#: stops a configured route from carrying a CR and an LF - a header-injection
+#: primitive the moment such a value reaches a request line or a log line.
+TARGET_MIN_CHAR = 0x21
+TARGET_MAX_CHAR = 0x7E
 
 # --------------------------------------------------------------------------- #
 # Frozen response contract
@@ -148,138 +186,153 @@ METHOD_GET = "GET"
 METHOD_HEAD = "HEAD"
 ALLOWED_METHODS = METHOD_GET
 
+#: The two request header names the drain consults, written once so the lookup
+#: and the documentation cannot disagree.  ``email.message.Message`` - which
+#: backs ``self.headers`` - matches names case-insensitively, so the canonical
+#: spelling here matches a client that sends any casing.
+HEADER_CONTENT_LENGTH = "Content-Length"
+HEADER_TRANSFER_ENCODING = "Transfer-Encoding"
+
 #: Error bodies are deliberately constant.  They never echo the requested path,
 #: the method or any traceback: this endpoint is network-reachable and must
 #: disclose the minimum possible about the deployment behind it.
 NOT_FOUND_BODY = {"error": "Not Found"}
 METHOD_NOT_ALLOWED_BODY = {"error": "Method Not Allowed"}
 
-#: The four transport-level rejections, keyed by status code.  A request that
-#: never became a routable request still gets a contract response: same media
-#: type, same cache directive, same constant-shaped JSON.  These are the only
-#: responses that also carry ``Connection: close``, because once a request line
-#: or a header block could not be framed, nothing after it on that connection
-#: can be framed either.
-TRANSPORT_ERROR_BODIES = {
-    400: {"error": "Bad Request"},
-    414: {"error": "URI Too Long"},
-    431: {"error": "Request Header Fields Too Large"},
-    505: {"error": "HTTP Version Not Supported"},
-}
-
-#: Reason phrases for every status this endpoint can emit.  They are written out
-#: rather than taken from :data:`http.server.BaseHTTPRequestHandler.responses` so
-#: that the status line is byte-identical to the JavaScript and Java
-#: implementations, which hardcode the same phrases.
-REASON_PHRASES = {
-    200: "OK",
-    400: "Bad Request",
-    404: "Not Found",
-    405: "Method Not Allowed",
-    414: "URI Too Long",
-    431: "Request Header Fields Too Large",
-    500: "Internal Server Error",
-    505: "HTTP Version Not Supported",
-}
-
-#: Emitted verbatim as the status line of every response.  The listener speaks
-#: HTTP/1.1 unconditionally, including when it is rejecting an HTTP/1.0 or an
-#: unparseable request: a response must be framed in a version the client can
-#: read, and every HTTP/1.x client can read this one.
+#: The HTTP version the listener speaks, used as the handler's
+#: ``protocol_version``.  HTTP/1.1 is what makes ``Content-Length`` meaningful to
+#: a client that keeps the connection open, and every response this endpoint
+#: writes carries an accurate one.
 HTTP_VERSION = "HTTP/1.1"
-
-#: Line terminator for the status line and every header field.
-CRLF = "\r\n"
-
-#: The interim response to ``Expect: 100-continue``.  Sent before the body is
-#: drained, because a client that is waiting for it will not send the body
-#: otherwise and the exchange would stall until the idle timeout fired.
-CONTINUE_RESPONSE = f"{HTTP_VERSION} 100 Continue{CRLF}{CRLF}"
 
 #: How long ``probe`` waits for the endpoint to answer.  Short enough that a
 #: container HEALTHCHECK timeout fires on the probe's own verdict rather than on
 #: the runtime killing it mid-request.
 PROBE_TIMEOUT_SECONDS = 3.0
 
-#: How long a connection may stay idle before the handler closes it.  Without a
-#: timeout a client that connects and never sends a request line would pin a
-#: worker thread for the lifetime of the process.
-CONNECTION_TIMEOUT_SECONDS = 30
+#: Largest health document ``probe`` will read.  The contract body is 108 bytes, so
+#: this is roughly seventy times the largest legitimate answer and exists only to
+#: bound memory: a local endpoint that streams without end must be refused rather
+#: than accumulated.
+MAX_PROBE_BODY_BYTES = 8192
 
-#: How long a retiring connection is drained for.  See
-#: :meth:`HealthRequestHandler.finish`.
-LINGER_TIMEOUT_SECONDS = 1.0
-
-#: Read/discard buffer size for body and linger draining.
-IO_BUFFER_BYTES = 8192
-
-#: Largest request line this listener will read, in bytes.  A longer one is a
-#: 414: the target cannot be evaluated, so it is refused rather than truncated
-#: and misrouted.
-MAX_REQUEST_LINE_BYTES = 65536
-
-#: Largest single header field line, in bytes.
-MAX_HEADER_LINE_BYTES = 16384
-
-#: Largest total header block, in bytes, and the largest number of fields in it.
-#: Both are 431.  Without a ceiling a client could stream header fields forever
-#: and hold a worker thread and its memory for as long as it liked.
-MAX_HEADER_BLOCK_BYTES = 16384
-MAX_HEADER_FIELDS = 100
-
-#: Largest request body this listener will read and discard.  Nothing this
-#: endpoint answers depends on a body, but a body left unread desynchronises a
-#: persistent connection, and closing a socket with unread data queued makes the
-#: kernel answer with a reset - which is what turns an answered request into
-#: "no response" at the client.  Draining is part of answering correctly.  A body
-#: larger than this is still answered; the connection is simply retired
-#: afterwards rather than drained to the end.
+#: Ceiling on the request body this server will read and discard before it
+#: answers, and the size of the scratch buffer it discards through.  The Java
+#: implementation applies the identical ceiling in ``drainRequestBody``.
+#:
+#: A refused request still ARRIVES with a body, and ``BaseHTTPRequestHandler``
+#: never reads one - it hands the socket to ``do_POST`` with the body still
+#: queued.  Left there on a keep-alive connection, those bytes are consumed as
+#: the START of the next request line: a three-byte body in front of a following
+#: ``GET`` is parsed as the method ``xyzGET``, which answers 501 with an HTML
+#: body carrying ``Server`` and ``Date`` headers - three separate departures from
+#: the frozen contract - and swallows the legitimate request that followed.
+#: Draining first is what keeps the connection honest.
 MAX_REQUEST_DRAIN_BYTES = 8 * 1024 * 1024
-MAX_CHUNKED_BODY_BYTES = MAX_REQUEST_DRAIN_BYTES
+DRAIN_BUFFER_BYTES = 8192
 
-#: Largest number of trailer fields accepted after a chunked body, and how many
-#: bytes a retiring connection is drained for before it is simply closed.
-MAX_TRAILER_FIELDS = MAX_HEADER_FIELDS
-MAX_LINGER_DRAIN_BYTES = 1024 * 1024
+#: Wall-clock budget for the drain, mirroring the JavaScript listener's
+#: ``requestTimeout`` - the sibling budget on the total time to receive one
+#: complete request, body included.
+#:
+#: Draining is a BLOCKING read, so it needs a bound of its own.  A client that
+#: promises a hundred body bytes, sends three and then says nothing would
+#: otherwise park a handler thread for the process's lifetime; the listener is
+#: threaded, so other connections keep being served, but a peer that opens many
+#: such connections retains a thread for each.  The bound is applied to the
+#: socket around the drain read alone and lifted immediately afterwards, so the
+#: idle wait for the next request on a kept-alive connection keeps whatever
+#: behaviour it had - a bound there would surface as a ``Request timed out``
+#: diagnostic from the inherited request loop on a perfectly ordinary idle
+#: connection.
+REQUEST_DRAIN_TIMEOUT_SECONDS = 15.0
 
-#: Base of a chunked-body size line.
-CHUNK_SIZE_RADIX = 16
-
-#: Exactly the three tokens a request line must carry: method, target, version.
-REQUEST_LINE_TOKENS = 3
-
-#: The punctuation RFC 9110 allows in a method token, alongside ALPHA and DIGIT.
-#: This is what makes an unknown or wrongly-cased verb a 405 rather than a parse
-#: failure - ``FOO``, ``GETX``, ``get`` and ``Get`` are all legal tokens.
-METHOD_TOKEN_SPECIALS = "!#$%&'*+-.^_`|~"
-
-#: A request target must be visible US-ASCII, end to end.  That excludes the
-#: space, every control character including CR, LF and TAB, DEL, and every byte
-#: above the ASCII range.  A tab inside a target is therefore a 400 rather than
-#: something the router has to reason about, and a CR or LF can never reach the
-#: router at all - which is what makes response-header injection through the
-#: target structurally impossible.
-TARGET_MIN_CHAR = 0x21
-TARGET_MAX_CHAR = 0x7E
-
-#: Separator between the scheme and the authority of an absolute-form target.
-SCHEME_SEPARATOR = "://"
-
-#: Request header field names this listener reads, already lowercased.
-HEADER_NAME_HOST = "host"
-HEADER_NAME_CONTENT_LENGTH = "content-length"
-HEADER_NAME_TRANSFER_ENCODING = "transfer-encoding"
-HEADER_NAME_CONNECTION = "connection"
-HEADER_NAME_EXPECT = "expect"
-
-#: Header values this listener acts on.
-TRANSFER_ENCODING_CHUNKED = "chunked"
-CONNECTION_CLOSE = "close"
-CONNECTION_KEEP_ALIVE = "keep-alive"
-EXPECT_CONTINUE = "100-continue"
+#: The key set and the key ORDER the probe requires of an answer, and the single
+#: wording all three implementations use when an answer does not carry them.  The
+#: reason string is pinned as a constant because an operator greps one
+#: deployment's logs rather than one language's: a Python ``repr`` of a list would
+#: print apostrophes and spaces and Java's ``List.toString`` would drop the quotes
+#: entirely, so the byte-exact form is written out here instead of rendered.
+PROBE_KEY_ORDER = ("name", "version", "timestamp", "status")
+PROBE_KEY_SET_REASON = (
+    'body does not carry exactly the keys '
+    '["name","version","timestamp","status"] in order'
+)
 
 #: The route every configured health path reduces to when it is empty.
 ROOT_PATH = "/"
+
+#: Marks an absolute-form request target, as in ``GET http://host/health``.
+#:
+#: RFC 9112 section 3.2.2 requires a server to accept this form even though almost
+#: no client emits it, and the three implementations here reduce it to its path so
+#: that the same request reaches the same route in all of them.
+SCHEME_SEPARATOR = "://"
+
+#: The characters a URI fragment is introduced by.
+#:
+#: A real request target never carries one - RFC 9110 section 7.1 has the client
+#: strip it before sending - so this is stripped defensively, and because the same
+#: function normalises the CONFIGURED health path, where one could be written by
+#: hand.
+FRAGMENT_MARKER = "#"
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostics
+#
+# Everything this module says about itself leaves through one function, and it
+# leaves on stderr.  Two guarantees follow from that being a single exit rather
+# than a convention every call site has to remember: standard output stays
+# byte-identical to the legacy contract the backward-compatibility gate hashes,
+# and no configured value can forge a log line.
+# --------------------------------------------------------------------------- #
+
+
+def log_warning(message):
+    """Write one diagnostic line to stderr, and to stderr only.
+
+    Nothing reaches standard output.  Standard output is the legacy contract of
+    this program and is hashed by the backward-compatibility gate, so a stray
+    write there is a build failure rather than a cosmetic slip.
+
+    No caller can forge a log line either.  The text is stripped of control
+    characters by :func:`sanitize_for_log` before the newline is appended, so a
+    configured value carrying a CR and an LF cannot produce a second line in
+    whatever collects this process's stderr, and a terminal escape sequence
+    cannot rewrite what an operator sees.  Callers pass fixed category text plus,
+    at most, an HTTP status code or an exception TYPE name - never a configured
+    value, an exception message or response content - so a line discloses nothing
+    about the deployment even before this stripping runs.
+
+    :param message: the diagnostic, without a trailing newline.
+    :returns: ``None``.
+    """
+    sys.stderr.write(f"[app.py] {sanitize_for_log(message)}\n")
+
+
+def sanitize_for_log(text):
+    """Strip control characters from text before it reaches a log line.
+
+    The defence in depth behind :func:`log_warning`.  Every call site is required
+    to pass fixed category text, so in principle nothing untrusted reaches a log
+    line at all; this function is what makes that a guarantee rather than a
+    convention, because the inherited request machinery also logs through
+    :meth:`HealthRequestHandler.log_message` and its text is request-derived.  A
+    value carrying a CR or an LF would forge additional log lines, and one
+    carrying a terminal escape sequence would rewrite what an operator sees.
+    Every character below ``0x20`` and DEL is therefore dropped rather than
+    escaped: this text exists to be read by a human, and a stripped character
+    reads better than an escape.
+
+    :param text: the value to make safe for a single log line.
+    :returns: the value with every control character removed.
+    """
+    if not text:
+        return ""
+    return "".join(
+        current for current in text if ord(current) >= 0x20 and ord(current) != 0x7F
+    )
 
 
 def read_properties(path=None):
@@ -296,7 +349,11 @@ def read_properties(path=None):
     to the built-in defaults, so the endpoint still serves from an image that
     copied only the application source.  Any other failure is reported on stderr
     - a corrupt configuration file should not be invisible - and also degrades
-    to the defaults rather than taking the process down.
+    to the defaults rather than taking the process down.  What that report does
+    NOT carry is the path or the exception text: a filesystem layout is a
+    deployment detail, and the exception message embeds the very path the line is
+    meant to withhold.  The category is enough to send an operator to the file,
+    and the file is one command away from them.
 
     :param path: file to read; defaults to :data:`CONFIG_PATH`.
     :returns: the parsed keys, or an empty dict when the file cannot be read.
@@ -314,8 +371,8 @@ def read_properties(path=None):
     except FileNotFoundError:
         # Expected and silent: defaults cover every key.
         return {}
-    except (OSError, UnicodeDecodeError) as exc:
-        sys.stderr.write(f"[app.py] cannot read {resolved}: {exc}; using defaults\n")
+    except (OSError, UnicodeDecodeError):
+        log_warning("cannot read the configuration file; using defaults")
         return {}
     return properties
 
@@ -385,6 +442,99 @@ def load_config(path=None, env=None):
     }
 
 
+def is_single_line_text(text):
+    """Return ``True`` when text is non-empty and carries no control character.
+
+    The rule for the two configured values that are neither a route nor a number:
+    a name that appears in the published payload, and a host that appears in a
+    diagnostic.  For both, the only real constraint is that they can be printed on
+    one line - which is also what stops either of them forging a second one.
+    """
+    if not text:
+        return False
+    for current in text:
+        point = ord(current)
+        if point < 0x20 or point == 0x7F:
+            return False
+    return True
+
+
+def is_request_target(candidate):
+    """Report whether a target is made only of characters allowed in one.
+
+    Every character must be visible US-ASCII, :data:`TARGET_MIN_CHAR` through
+    :data:`TARGET_MAX_CHAR`.  Applied to the CONFIGURED route rather than to an
+    inbound request - reading an inbound request is the platform server's job -
+    so that a health path carrying a space, a CR or an LF is refused where it is
+    configured instead of becoming an injected request line in :func:`probe`.
+    """
+    if not candidate:
+        return False
+    for current in candidate:
+        if not TARGET_MIN_CHAR <= ord(current) <= TARGET_MAX_CHAR:
+            return False
+    return True
+
+
+def validate_config(config):
+    """Refuse a configuration this endpoint must not publish.
+
+    Configuration is an input, and every value it carries appears either in the
+    public health document or in the route that serves it.  Without this check a
+    non-empty but malformed value was accepted verbatim: ``APP_VERSION`` of
+    ``not-a-version`` was served inside a ``200`` response whose ``status`` field
+    read ``UP``, so the endpoint attested to its own health while describing
+    itself in a form no consumer of the frozen contract could parse.  A health
+    endpoint that reports success while breaking its own contract is worse than
+    one that refuses to start, because nothing downstream can tell.
+
+    Four rules, identical in all three implementations:
+
+    * ``app.name`` is non-empty and carries no control character.  It is a payload
+      field, and a control character in it would break the single-line
+      diagnostics and the single-line startup banner.
+    * ``app.version`` matches :data:`VERSION_GRAMMAR` exactly.
+    * ``health.path`` begins with ``/`` and is a valid request target.
+    * ``app.host`` is non-empty and carries no control character.
+
+    A key the mapping does not carry at all falls back to its built-in default,
+    which is what :func:`load_config` would have supplied; a key that IS present
+    is validated as it stands, so an explicitly empty value is a fault rather than
+    an invitation to substitute a default.
+
+    No message quotes the offending value.  The key names the setting, which is
+    all an operator needs to find it, and withholding the value is what lets
+    :func:`probe` print this message verbatim without a configured string
+    reaching a log line.  The port is deliberately NOT validated here: it is
+    checked by :func:`_as_port` at the point of use, where the failure can be
+    reported as the transport fault it is.
+
+    :param config: mapping from :func:`load_config`.
+    :raises ValueError: on the first rule that fails.
+    """
+    name = config.get("app.name", DEFAULTS["app.name"])
+    if not is_single_line_text(name):
+        raise ValueError(
+            "invalid app.name: it must be non-empty text with no control character"
+        )
+
+    version = config.get("app.version", DEFAULTS["app.version"])
+    if not isinstance(version, str) or not VERSION_GRAMMAR.match(version):
+        raise ValueError(
+            "invalid app.version: it must be a three-part dotted numeric version"
+        )
+
+    path = config.get("health.path", DEFAULTS["health.path"])
+    if not isinstance(path, str) or not path.startswith(ROOT_PATH) or not is_request_target(path):
+        raise ValueError("invalid health.path: it is not a valid request target")
+
+    host = config.get("app.host", DEFAULTS["app.host"])
+    if not is_single_line_text(host):
+        raise ValueError(
+            "invalid app.host: it must be non-empty text with no control character"
+        )
+
+
 def _as_port(value):
     """Coerce a configured port to a valid TCP port number.
 
@@ -393,12 +543,24 @@ def _as_port(value):
     the socket layer.  Port 0 is permitted: it is how a test binds an ephemeral
     port and then reads the assignment back from the server.
 
-    :raises ValueError: when the value is not an integer in 0-65535.
+    The grammar is checked before the conversion, and it is deliberately narrower
+    than what ``int()`` accepts.  ``int()`` honours PEP 515 digit separators, so
+    it reads ``8_001`` as 8001, and it accepts any Unicode decimal digit, so it
+    reads the Arabic-Indic ``\u0668\u0660\u0660\u0661`` as 8001 as well.  Both
+    were measured: Python bound port 8001 for ``PORT=8_001`` while Node and Java
+    refused the same value and exited non-zero.  One deployment, one configured
+    value, three different outcomes - and the two that refused were the ones
+    behaving correctly.  :data:`PORT_GRAMMAR` is therefore the shared grammar all
+    three implementations now apply: an optional sign, then ASCII digits, and
+    nothing else.
+
+    :raises ValueError: when the value is not an ASCII decimal integer in
+        0-65535.
     """
-    try:
-        port = int(str(value).strip())
-    except (TypeError, ValueError):
-        raise ValueError(f"invalid port {value!r}: expected an integer") from None
+    text = str(value).strip()
+    if not PORT_GRAMMAR.match(text):
+        raise ValueError(f"invalid port {value!r}: expected an ASCII decimal integer")
+    port = int(text)
     if not 0 <= port <= 65535:
         raise ValueError(f"invalid port {port}: outside the range 0-65535")
     return port
@@ -407,64 +569,92 @@ def _as_port(value):
 def normalize_path(target):
     """Reduce a request target to the path this endpoint routes on.
 
-    Four transformations, in this order: an absolute-form target is reduced to
-    its path component, the query string is discarded, the fragment is discarded,
-    and at most ONE trailing slash is removed.  ``/health``, ``/health/``,
-    ``/health?probe=1``, ``/health/?probe=1``, ``/health#frag`` and
-    ``http://host/health`` therefore all resolve to ``/health``, while
-    ``/health//`` deliberately does not - one forgiving slash is a convenience,
-    two is a different path.
+    Two transformations, in this order: the query string is discarded, and at
+    most ONE trailing slash is removed.  ``/health``, ``/health/``,
+    ``/health?probe=1``, ``/health/?probe=1`` and ``/health?`` therefore all
+    resolve to ``/health``, while ``/health//`` deliberately does not - one
+    forgiving slash is a convenience, two describe a different path.
 
-    Three transformations are deliberately NOT performed, and their absence is
-    the contract rather than an omission:
+    Nothing else is rewritten, and that is the contract rather than an omission:
+    no percent-decoding, so ``/health%2f`` is a different path; no dot-segment
+    resolution, so ``/health/../health`` answers 404; no collapsing of leading
+    slashes.  Each of those would let a caller reach the endpoint by a name that
+    is not the configured one, which makes the route ambiguous for anything
+    downstream that matches on a path - a proxy rule, an access log, a rate
+    limiter.  The JavaScript and Java implementations perform exactly the same
+    four reductions on the target they are handed - authority, query, fragment and
+    one trailing slash - in exactly this order.
 
-    * no percent-decoding, so ``/health%2f`` is a different path from
-      ``/health/`` and answers 404;
-    * no dot-segment resolution, so ``/health/../health`` answers 404;
-    * no collapsing of leading slashes, so ``//health`` and ``///health`` answer
-      404.
+    One platform behaviour reaches this function before it runs, and it is worth
+    stating rather than discovering: :meth:`http.server.BaseHTTPRequestHandler
+    .parse_request` rewrites a target that begins with ``//`` down to a single
+    leading slash - a deliberate CPython change (gh-87389) that protects against
+    open redirects, because a client reads ``//path`` as a scheme-less absolute
+    URI.  ``//health`` therefore reaches this endpoint under CPython, while the
+    Node and Java servers answer it 404.  It is not correctable from here: the
+    rewrite happens in the request parser this module is required to delegate
+    to, and a target beginning with ``//`` is not one of the cases the frozen
+    contract describes.  Each of the three implementations answers it the way its
+    platform server does, and each of the three answers every target the contract
+    *does* describe identically.
 
-    Each of those would let a caller reach the endpoint by a name that is not the
-    configured one, which makes the route ambiguous for anything downstream that
-    matches on a path - a proxy rule, an access log, a rate limiter.  The
-    JavaScript and Java implementations perform exactly the same four
-    transformations and refuse exactly the same three, so all three agree on
-    every one of these targets.
-
-    This is written out rather than delegated to :func:`urllib.parse.urlsplit`
-    because that function is a URI parser, not a request-target router: it reads
-    ``//health`` as an authority with an empty path and ``///health`` as an empty
-    authority followed by ``/health``, which would make the second of those match
-    the route.  The stdlib request handler compounds that by rewriting ``//x`` to
-    ``/x`` inside ``parse_request`` before any application code runs, which is
-    why :meth:`HealthRequestHandler.handle_one_request` never calls it.
+    :param target: the request target as it arrived, e.g. ``/health?probe=1``.
+    :returns: the path to match against :func:`health_route`.
     """
     if not target:
         return ROOT_PATH
     path = strip_authority(target)
-    query = path.find("?")
-    if query >= 0:
-        path = path[:query]
-    fragment = path.find("#")
-    if fragment >= 0:
-        path = path[:fragment]
+    path = path.split("?", 1)[0]
+    path = path.split(FRAGMENT_MARKER, 1)[0]
     if len(path) > 1 and path.endswith(ROOT_PATH):
         path = path[:-1]
     return path or ROOT_PATH
 
 
+def _is_ascii_letter(current):
+    """Return ``True`` for A-Z and a-z only, never for a non-ASCII letter.
+
+    :param current: a single character.
+    :returns: ``True`` when the character is an unaccented ASCII letter.
+    """
+    return "a" <= current <= "z" or "A" <= current <= "Z"
+
+
+def _is_scheme(candidate):
+    """Return ``True`` when a string is a URI scheme as RFC 3986 defines one.
+
+    ALPHA followed by any number of ALPHA, DIGIT, ``+``, ``-`` or ``.``.
+
+    :param candidate: the text before ``://`` in a request target.
+    :returns: ``True`` when it could be a scheme.
+    """
+    if not candidate or not _is_ascii_letter(candidate[0]):
+        return False
+    for current in candidate[1:]:
+        if not (_is_ascii_letter(current) or "0" <= current <= "9"
+                or current in "+-."):
+            return False
+    return True
+
+
 def strip_authority(target):
     """Reduce an absolute-form request target to its path component.
 
-    RFC 9112 permits ``GET http://host/health HTTP/1.1`` on any request, not only
-    to a proxy, and an origin server is required to accept it.  The scheme is
-    validated before anything is stripped, so a relative target whose query
-    string happens to contain ``://`` - a redirect parameter, for instance - is
-    left completely alone.
+    ``GET http://host:8000/health HTTP/1.1`` is a request shape RFC 9112 section
+    3.2.2 requires a server to accept, and it is the only shape in which the
+    target carries a scheme and an authority.  Reducing it here is what makes the
+    absolute form reach the same route the origin form reaches - and what makes
+    this module agree with ``index.js`` and ``User.java``, which perform the
+    identical reduction.
 
-    :param target: the raw request target.
-    :returns: the path component of an absolute-form target, or the target
-        unchanged when it is not in absolute form.
+    The scheme is VALIDATED before anything is stripped, and that ordering is the
+    whole safety of this function: a relative target whose query string happens to
+    contain ``://`` - a redirect parameter such as
+    ``/health?next=http://elsewhere/`` - has ``/health?next=http`` before the
+    separator, which is not a scheme, so it is returned completely untouched.
+
+    :param target: the request target as it arrived.
+    :returns: the path component of an absolute-form target, or the target itself.
     """
     separator = target.find(SCHEME_SEPARATOR)
     if separator <= 0 or not _is_scheme(target[:separator]):
@@ -472,33 +662,6 @@ def strip_authority(target):
     authority_start = separator + len(SCHEME_SEPARATOR)
     path_start = target.find("/", authority_start)
     return ROOT_PATH if path_start < 0 else target[path_start:]
-
-
-def _is_scheme(candidate):
-    """Report whether a string is a URI scheme as RFC 3986 defines one.
-
-    ALPHA followed by any number of ALPHA, DIGIT, ``+``, ``-`` or ``.``.  The
-    character classes are spelled out against the ASCII range rather than taken
-    from :meth:`str.isalpha`, which is true for non-ASCII letters and would make
-    a target containing a non-ASCII scheme-like prefix strip differently here
-    than it does in the other two implementations.
-    """
-    if not candidate or not _is_ascii_letter(candidate[0]):
-        return False
-    for current in candidate[1:]:
-        if not (_is_ascii_letter(current) or _is_ascii_digit(current) or current in "+-."):
-            return False
-    return True
-
-
-def _is_ascii_letter(current):
-    """Return ``True`` for A-Z and a-z only, never for a non-ASCII letter."""
-    return ("a" <= current <= "z") or ("A" <= current <= "Z")
-
-
-def _is_ascii_digit(current):
-    """Return ``True`` for 0-9 only, never for a non-ASCII digit."""
-    return "0" <= current <= "9"
 
 
 def health_route(config=None):
@@ -583,199 +746,6 @@ def render_payload(payload):
 
 
 # --------------------------------------------------------------------------- #
-# Request line parsing
-#
-# This section is the reason this module does not use the stdlib request parser.
-# Every rule below is stated identically in the JavaScript and Java
-# implementations, and the three are verified against one shared matrix of
-# request lines, so a divergence here is a defect rather than a dialect.
-# --------------------------------------------------------------------------- #
-
-
-class RequestLine:
-    """One parsed request line, or the status code that rejects it.
-
-    ``failure`` is ``0`` for a line that may be routed and otherwise the status
-    to answer with.  ``method`` and ``target`` are the tokens exactly as sent -
-    never decoded, never normalised - so that routing decisions are made on what
-    the client actually wrote.
-    """
-
-    __slots__ = ("method", "target", "major", "minor", "failure")
-
-    def __init__(self, method="", target="", major=0, minor=0, failure=0):
-        self.method = method
-        self.target = target
-        self.major = major
-        self.minor = minor
-        self.failure = failure
-
-    @property
-    def persistent(self):
-        """Return ``True`` when the client may reuse the connection by default.
-
-        True from HTTP/1.1 onwards.  This also decides whether a missing ``Host``
-        header is fatal: RFC 9112 requires one from 1.1, and permits its absence
-        in 1.0.
-        """
-        return self.major > 1 or (self.major == 1 and self.minor >= 1)
-
-    def __repr__(self):
-        return (
-            f"RequestLine(method={self.method!r}, target={self.target!r}, "
-            f"major={self.major}, minor={self.minor}, failure={self.failure})"
-        )
-
-
-def is_method_token(candidate):
-    """Report whether a string is a method token as RFC 9110 defines one.
-
-    This is what makes an unknown or wrongly-cased verb a 405 rather than a parse
-    failure: ``FOO``, ``GETX``, ``get`` and ``Get`` are all valid tokens, so all
-    four are routed and all four are answered 405 with ``Allow: GET``, exactly as
-    ``TRACE`` and ``PROPFIND`` are.  A first token that is not a token at all -
-    ``<script>alert(1)</script>``, say - is a malformed request line and answers
-    400, because there is no method there to refuse.
-    """
-    if not candidate:
-        return False
-    for current in candidate:
-        if not (
-            _is_ascii_letter(current)
-            or _is_ascii_digit(current)
-            or current in METHOD_TOKEN_SPECIALS
-        ):
-            return False
-    return True
-
-
-def is_request_target(candidate):
-    """Report whether a request target is made only of characters allowed in one.
-
-    Every character must be visible US-ASCII, ``0x21`` through ``0x7E``.  See
-    :data:`TARGET_MIN_CHAR` for why that range and not a wider one.
-    """
-    if not candidate:
-        return False
-    for current in candidate:
-        if not TARGET_MIN_CHAR <= ord(current) <= TARGET_MAX_CHAR:
-            return False
-    return True
-
-
-def parse_request_line(line):
-    """Parse and validate a request line against RFC 9112.
-
-    The line must be exactly three single-space separated tokens; the method must
-    be a token; the target must be non-empty and made only of visible US-ASCII;
-    and the version must be ``HTTP/``, digits, ``.``, digits.  Anything else is a
-    400.  A well-formed version whose major is not 1 is a 505 - the request was
-    understood, it simply cannot be served.
-
-    :param line: the request line with its terminator already removed.
-    :returns: a :class:`RequestLine`, rejected or routable.
-    """
-    tokens = line.split(" ")
-    if len(tokens) != REQUEST_LINE_TOKENS:
-        return RequestLine(failure=400)
-    method, target, version = tokens
-    if not is_method_token(method) or not is_request_target(target):
-        return RequestLine(failure=400)
-    if not version.startswith("HTTP/"):
-        return RequestLine(failure=400)
-    number = version[len("HTTP/"):]
-    dot = number.find(".")
-    if dot <= 0 or dot == len(number) - 1:
-        return RequestLine(failure=400)
-    major_text, minor_text = number[:dot], number[dot + 1:]
-    if not _is_digits(major_text) or not _is_digits(minor_text):
-        return RequestLine(failure=400)
-    major, minor = _bounded_number(major_text), _bounded_number(minor_text)
-    if major != 1:
-        return RequestLine(method, target, major, minor, 505)
-    return RequestLine(method, target, major, minor, 0)
-
-
-def _is_digits(candidate):
-    """Return ``True`` if every character is an ASCII digit and there is one."""
-    if not candidate:
-        return False
-    for current in candidate:
-        if not _is_ascii_digit(current):
-            return False
-    return True
-
-
-def _bounded_number(digits):
-    """Parse a run of ASCII digits without letting an absurd one dominate.
-
-    A version number of a thousand digits is legal input to reject, not a reason
-    to allocate an arbitrary-precision integer, so anything wider than a machine
-    word saturates.  The value is only ever compared against 1.
-    """
-    if len(digits) > 9:
-        return sys.maxsize
-    return int(digits)
-
-
-def header_value(header_lines, name):
-    """Return the first value of a header field, or ``None``.
-
-    ``name`` must already be lowercase.  Field names are case-insensitive per RFC
-    9110, so the comparison is made on a lowercased copy of what arrived.  The
-    FIRST match wins: a request carrying two ``Host`` headers is answered from
-    the first rather than rejected, which is what the JavaScript implementation's
-    parser does, and rejecting here would create a divergence between the two for
-    no gain.
-
-    :param header_lines: the header block, one raw line per field, in order.
-    :param name: lowercase field name to look for.
-    """
-    for field in header_lines:
-        colon = field.find(":")
-        if colon <= 0:
-            # No name, or an obs-fold continuation line: nothing to match on.
-            continue
-        if field[:colon].strip().lower() == name:
-            return field[colon + 1:].strip()
-    return None
-
-
-def contains_token(value, token):
-    """Report whether a comma-separated header value contains a token.
-
-    ``Connection: keep-alive, Upgrade`` contains ``keep-alive``; the substring
-    test that would also be true of ``Connection: no-keep-alive`` is not used.
-    """
-    if not value:
-        return False
-    for part in value.split(","):
-        if part.strip().lower() == token:
-            return True
-    return False
-
-
-def sanitize_for_log(text):
-    """Strip control characters from text before it reaches a log line.
-
-    Configuration is an input, and this module writes configured values - the
-    resolved route, the bind address - to stderr at startup.  A value carrying a
-    CR or an LF would forge additional log lines, and one carrying a terminal
-    escape sequence would rewrite what an operator sees.  Every character below
-    ``0x20`` and DEL is therefore dropped rather than escaped: this text exists
-    to be read by a human, and a stripped character reads better than an escape.
-
-    :param text: the value to make safe for a single log line.
-    :returns: the value with every control character removed.
-    """
-    if not text:
-        return ""
-    return "".join(
-        current for current in text if ord(current) >= 0x20 and ord(current) != 0x7F
-    )
-
-
-# --------------------------------------------------------------------------- #
 # HTTP surface
 # --------------------------------------------------------------------------- #
 
@@ -785,98 +755,49 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
 
     ================  ==========================================================
     Route             the configured health path, default ``/health``; query
-                      string and fragment stripped, one optional trailing slash
-                      accepted, absolute-form accepted
+                      string stripped, one optional trailing slash accepted
     Method            GET only
     Success           ``200`` with the compact four-key JSON document
     Headers           ``Content-Type: application/json``,
                       ``Cache-Control: no-cache, no-store, must-revalidate``,
-                      ``Content-Length``; no ``Server``, no ``Date`` and no
-                      transport header on a contract response
+                      ``Content-Length`` - exactly these three and no others, so
+                      no ``Server`` banner and no ``Date``
     Unknown path      ``404`` with ``{"error":"Not Found"}``
     Other methods     ``405`` with ``{"error":"Method Not Allowed"}`` and
                       ``Allow: GET``
-    Malformed line    ``400`` with ``{"error":"Bad Request"}``
-    Oversized line    ``414`` with ``{"error":"URI Too Long"}``
-    Oversized head    ``431`` with ``{"error":"Request Header Fields Too Large"}``
-    Other version     ``505`` with ``{"error":"HTTP Version Not Supported"}``
     ================  ==========================================================
 
-    Request classification order, applied exactly as written, identically in all
-    three language implementations:
-
-    1. at most ONE leading empty line is skipped, per RFC 9112 - a client that
-       terminated its previous request with a spare CRLF is common and harmless;
-       a second empty line is a malformed request line;
-    2. a request line longer than :data:`MAX_REQUEST_LINE_BYTES` is a 414;
-    3. the line must be ``METHOD SP target SP HTTP/d.d`` with a token method and
-       a visible-US-ASCII target, or it is a 400;
-    4. a well-formed version whose major is not 1 is a 505;
-    5. a header block over :data:`MAX_HEADER_BLOCK_BYTES`, a field line over
-       :data:`MAX_HEADER_LINE_BYTES` or more than :data:`MAX_HEADER_FIELDS`
-       fields is a 431; a stream that ends inside the block is a 400;
-    6. an HTTP/1.1 request with no ``Host`` header is a 400, checked BEFORE the
-       method so that a malformed request is never answered as a routing
-       decision;
-    7. a method other than ``GET`` is a 405 with ``Allow: GET``;
-    8. the target is normalised by :func:`normalize_path` and compared with the
-       configured route: equal is a 200, anything else a 404.
+    Three responses, and no fourth.  Reading the request and framing the
+    connection are :mod:`http.server`'s job; this class only decides which of the
+    three to write.  The method policy is written as one explicit ``do_*`` method
+    per verb rather than as an alias chain or an attribute lookup, so the set of
+    verbs that reach the 405 responder can be read off the class in one glance.
 
     Three design points are worth stating explicitly.
 
-    A health response must never be served from a cache: a cached "healthy" is
-    worse than no answer at all, hence the unconditional no-store directive on
-    every response including the error paths.
+    A health response must never be served from a cache - a cached "healthy" is
+    worse than no answer at all - hence the unconditional no-store directive on
+    every response, the error paths included.
 
-    HEAD is answered with 405 rather than being supported.  RFC 9110 expects
-    HEAD support wherever GET is supported, so this is a deliberate, documented
-    deviation: the contract is frozen identically across three independent
-    language implementations and no identified consumer of this endpoint issues
-    HEAD.  The practical consequence is that response headers must be inspected
-    with a GET that discards the body, never with ``curl -I``.  The 405 answer to
-    HEAD is still a well-formed HEAD response - status and headers only, no body
-    - because refusing a method is no excuse for corrupting the connection.
+    A response to HEAD carries no body (RFC 9110 section 9.3.2), so the body is
+    withheld for that verb while ``Content-Length`` still advertises what the
+    equivalent GET would return.  The specification permits exactly that, and it
+    keeps the header set identical across methods.
 
-    A contract response carries no ``Connection`` header even when the connection
-    is about to be closed.  RFC 9110 makes that a SHOULD rather than a MUST, and
-    the deviation is deliberate: the header-name set of a 200, a 404 and a 405 is
-    asserted to be identical across all three implementations, and the JavaScript
-    runtime cannot be made to emit a ``Connection`` header only on some contract
-    responses.  Holding all three to exactly three header fields is worth more
-    than an advisory hint the client can infer from the FIN that follows.  The
-    four transport rejections do carry it, because there the client genuinely
-    cannot know whether anything it sends next will be read.
+    Nothing this class writes reaches standard output.  Standard output is this
+    program's legacy contract and is hashed by the backward-compatibility gate,
+    so the request log and every diagnostic go to stderr instead.
     """
 
-    #: Keep-alive is required for correctness here, not performance: an accurate
-    #: Content-Length accompanies every response, so a client may reuse the
-    #: connection instead of paying a fresh handshake per poll.
-    protocol_version = "HTTP/1.1"
+    #: HTTP/1.1, so that ``Content-Length`` means to a client what this handler
+    #: intends it to mean.  Every response written here carries an accurate one.
+    protocol_version = HTTP_VERSION
 
-    #: Idle-connection ceiling; see CONNECTION_TIMEOUT_SECONDS.
-    timeout = CONNECTION_TIMEOUT_SECONDS
-
-    #: Set TCP_NODELAY on the accepted connection.  Every response this class
-    #: writes is assembled in full and sent as ONE socket write, so the header
-    #: block and the body can never be split across two segments and the
-    #: delayed-ACK interaction that made a two-write response cost a median
-    #: 41.00 ms against a 0.83 ms floor cannot arise.  The switch is kept
-    #: because it also covers the interim ``100 Continue`` response, which is by
-    #: definition a small write followed by more traffic on the same connection,
-    #: and because a health endpoint exists to be polled: there is no batching
-    #: to gain and a whole round trip to lose.
-    disable_nagle_algorithm = True
-
-    #: Least disclosure.  No response emitted by this class carries a Server
-    #: header at all, but these two attributes feed ``version_string()``, which
-    #: inherited machinery could still reach, so the interpreter version is
-    #: removed at the source as well as at every call site.
-    server_version = "health"
+    #: Keeps the interpreter version out of the ``Server`` header that the
+    #: inherited protocol-error path would otherwise emit.  The three contract
+    #: responses send no ``Server`` header at all - see :meth:`_write` - so this
+    #: only narrows disclosure on a rejection this module never writes itself.
     sys_version = ""
-
-    #: Set by :meth:`_write` when the response could not reach the client.  A
-    #: connection whose response was not delivered is never reused.
-    write_failed = False
 
     def _snapshot(self):
         """Return the configuration snapshot and route this server was built on.
@@ -901,63 +822,108 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             route = health_route(config)
         return config, route
 
-    # ----------------------------------------------------------------------- #
-    # Writing responses
-    # ----------------------------------------------------------------------- #
+    def _drain_request_body(self):
+        """Read and discard the request body, so the connection stays honest.
 
-    def _write(self, status, body, send_allow=False, send_close=False):
-        """Write one complete response as a single socket write.
+        This runs before every response on every path, mirroring the Java
+        implementation, which drains at the top of its exchange handler under the
+        same :data:`MAX_REQUEST_DRAIN_BYTES` ceiling.  Node needs no counterpart:
+        it dumps an unconsumed request itself once the response finishes.
 
-        Every byte this class puts on the wire is assembled here, which is the
-        whole point of owning the socket: the three contract headers appear in a
-        fixed order with fixed casing and nothing is added behind this method's
-        back - no ``Date``, no ``Server``, no transport header on a contract
-        response.  None of the inherited ``send_response``/``send_header``/
-        ``end_headers`` machinery is used, so none of its behaviour - the
-        interpreter version banner, the ``Date`` header, or the HTTP/0.9 fallback
-        that silently suppresses the status line and the whole header block when a
-        request line could not be parsed - can reach a client.
+        Three cases cannot be drained, and each retires the connection instead of
+        guessing at where the body ends:
 
-        ``Content-Length`` is the encoded byte length and never the character
+        * a chunked body, because decoding one needs a chunked reader this
+          server deliberately does not carry;
+        * a ``Content-Length`` that is not a plain non-negative decimal;
+        * a length above the ceiling, which is refused rather than read - reading
+          it to be polite is the unbounded read a limit exists to prevent.
+
+        Retiring the connection is always safe: the response is already complete
+        and self-describing, and a client that wanted another exchange opens
+        another connection.
+        """
+        if self.command == METHOD_GET or self.command == METHOD_HEAD:
+            # Neither verb carries a body in any request this endpoint serves,
+            # and reading zero bytes still costs a syscall on every health poll.
+            if HEADER_CONTENT_LENGTH not in self.headers and \
+                    HEADER_TRANSFER_ENCODING not in self.headers:
+                return
+        if HEADER_TRANSFER_ENCODING in self.headers:
+            self.close_connection = True
+            return
+        raw = self.headers.get(HEADER_CONTENT_LENGTH)
+        if raw is None:
+            # No length and not chunked: HTTP/1.1 says there is no body.
+            return
+        stated = raw.strip()
+        if not stated.isascii() or not stated.isdigit():
+            self.close_connection = True
+            return
+        remaining = int(stated)
+        if remaining > MAX_REQUEST_DRAIN_BYTES:
+            self.close_connection = True
+            return
+        restore = self.connection.gettimeout()
+        self.connection.settimeout(REQUEST_DRAIN_TIMEOUT_SECONDS)
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, DRAIN_BUFFER_BYTES))
+                if not chunk:
+                    # The client promised more than it sent.  Nothing is left to
+                    # misparse, but the framing is broken, so retire the socket.
+                    self.close_connection = True
+                    return
+                remaining -= len(chunk)
+        except OSError:
+            # A timeout arrives here too, TimeoutError being an OSError.  Either
+            # way the body is only partly consumed, so the connection can no
+            # longer be trusted to frame a following request: retire it.  No
+            # diagnostic is written - the response about to be sent is the
+            # answer, and a slow client is not this endpoint's news to report.
+            self.close_connection = True
+        finally:
+            try:
+                self.connection.settimeout(restore)
+            except OSError:
+                self.close_connection = True
+
+    def _write(self, status, body, send_allow=False):
+        """Write one complete response: status line, three headers, body.
+
+        ``send_response_only`` is used rather than ``send_response`` - the
+        obvious call to reach for - because the convenient one appends a
+        ``Server`` header carrying the interpreter version and a ``Date`` header.
+        Neither belongs on a network-reachable surface whose header set is
+        frozen at three, and both would diverge from the JavaScript
+        implementation, which suppresses the same two.
+
+        ``Content-Length`` is the ENCODED byte length rather than the character
         count, so a multi-byte character in a configured value cannot
-        desynchronise the length from the body.  The head is encoded as
-        ISO-8859-1 and every value placed in it is a module constant or a number:
-        no request-supplied text reaches it, which is what makes header injection
-        through the request line structurally impossible.
+        desynchronise the advertised length from the body.
 
-        RFC 9110 section 9.3.2: a response to HEAD carries no message body.
-        ``Content-Length`` still advertises what the equivalent GET would return,
-        which the specification explicitly permits and which keeps the header set
-        identical to the GET response.  This is not a nicety - connections
-        persist, so writing a body here would leave those bytes in the stream for
-        the client to parse as the start of the NEXT response.
+        A client that hangs up mid-response - a monitoring agent whose timeout
+        fired, most often - is routine rather than exceptional: it is noted on
+        stderr and the connection is retired, instead of surfacing as a traceback
+        in whatever collects this process's output.
 
-        :param status: the status code, which must be in :data:`REASON_PHRASES`.
+        :param status: 200, 404 or 405.
         :param body: the complete response body, already compact JSON.
-        :param send_allow: add ``Allow: GET``.
-        :param send_close: add ``Connection: close``.
+        :param send_allow: add ``Allow: GET``, for the 405 path.
         """
         encoded = body.encode("utf-8")
-        head = [
-            f"{HTTP_VERSION} {status} {REASON_PHRASES[status]}",
-            f"Content-Type: {CONTENT_TYPE}",
-            f"Cache-Control: {CACHE_CONTROL}",
-            f"Content-Length: {len(encoded)}",
-        ]
-        if send_allow:
-            head.append(f"Allow: {ALLOWED_METHODS}")
-        if send_close:
-            head.append(f"Connection: {CONNECTION_CLOSE}")
-        response = (CRLF.join(head) + CRLF + CRLF).encode("iso-8859-1")
-        if self.command != METHOD_HEAD:
-            response += encoded
+        self._drain_request_body()
         try:
-            self.wfile.write(response)
+            self.send_response_only(status)
+            self.send_header("Content-Type", CONTENT_TYPE)
+            self.send_header("Cache-Control", CACHE_CONTROL)
+            self.send_header("Content-Length", str(len(encoded)))
+            if send_allow:
+                self.send_header("Allow", ALLOWED_METHODS)
+            self.end_headers()
+            if self.command != METHOD_HEAD:
+                self.wfile.write(encoded)
         except OSError as exc:
-            # A monitoring agent that times out and hangs up mid-response is
-            # routine, not exceptional.  Note it on stderr and retire the
-            # connection rather than letting a traceback reach the log.
-            self.write_failed = True
             self.close_connection = True
             self.log_error("client closed the connection: %r", exc)
 
@@ -969,237 +935,8 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         """
         self._write(code, render_payload(payload), send_allow=send_allow)
 
-    def _transport_error(self, status):
-        """Write one of the four transport rejections and give up the connection.
-
-        These are the only responses that carry ``Connection: close``: once a
-        request line or a header block could not be framed, whatever follows it on
-        the connection cannot be framed either, so continuing to read would be
-        guessing.
-        """
-        self._write(status, render_payload(TRANSPORT_ERROR_BODIES[status]), send_close=True)
-        self.close_connection = True
-
-    # ----------------------------------------------------------------------- #
-    # Reading requests
-    # ----------------------------------------------------------------------- #
-
-    def _read_line(self, limit):
-        """Read one bounded line without decoding it as anything but bytes.
-
-        Bytes are mapped to characters one for one through ISO-8859-1 rather than
-        decoded as UTF-8.  A request line and a header field are ASCII by
-        specification and any byte outside that range is rejected rather than
-        interpreted, so a lossless byte-preserving mapping is exactly what is
-        wanted: no replacement character can silently turn an illegal request into
-        a legal one.
-
-        A bare LF terminator is accepted as well as CRLF, matching what the other
-        two implementations accept.
-
-        :param limit: the largest number of bytes this line may occupy.
-        :returns: ``(text, truncated, end_of_stream)``.  ``truncated`` means the
-            cap was reached before any terminator; ``end_of_stream`` means the
-            client closed the connection without sending a single byte of it.
-        """
-        raw = self.rfile.readline(limit + 1)
-        if not raw:
-            return "", False, True
-        if raw.endswith(b"\n"):
-            raw = raw[:-1]
-            if raw.endswith(b"\r"):
-                raw = raw[:-1]
-            return raw.decode("iso-8859-1"), False, False
-        # No terminator: either the cap was hit, or the client stopped mid-line.
-        return raw.decode("iso-8859-1"), len(raw) > limit, False
-
-    def _read_headers(self):
-        """Read the header block that follows a request line.
-
-        :returns: ``(header_lines, failure)`` where ``failure`` is ``0`` when the
-            whole block arrived, 431 when a size cap was hit, or 400 when the
-            client stopped in the middle of its own header block - that request is
-            incomplete rather than oversized, and the two must not be conflated.
-        """
-        headers = []
-        consumed = 0
-        while True:
-            text, truncated, end_of_stream = self._read_line(MAX_HEADER_LINE_BYTES)
-            if truncated:
-                return headers, 431
-            if end_of_stream:
-                return headers, 400
-            if not text:
-                return headers, 0
-            consumed += len(text) + len(CRLF)
-            if consumed > MAX_HEADER_BLOCK_BYTES or len(headers) >= MAX_HEADER_FIELDS:
-                return headers, 431
-            headers.append(text)
-
-    def _drain_body(self, content_length, transfer_encoding):
-        """Consume a request body so that the connection can be reused.
-
-        See :data:`MAX_REQUEST_DRAIN_BYTES` for why an endpoint that ignores
-        bodies must nevertheless read them.
-
-        :returns: ``True`` when the body was consumed in full and the connection
-            may carry another request, ``False`` when the connection must be
-            retired - an unparseable, negative or oversized length, an encoding
-            this listener will not frame, or a client that stopped early.
-        """
-        if transfer_encoding:
-            return contains_token(transfer_encoding, TRANSFER_ENCODING_CHUNKED) and (
-                self._drain_chunked()
-            )
-        if not content_length:
-            return True
-        try:
-            declared = int(content_length.strip())
-        except ValueError:
-            return False
-        if declared < 0 or declared > MAX_REQUEST_DRAIN_BYTES:
-            return False
-        return self._skip_exactly(declared)
-
-    def _drain_chunked(self):
-        """Discard a chunked request body, including its trailer section."""
-        total = 0
-        while True:
-            text, truncated, end_of_stream = self._read_line(MAX_HEADER_LINE_BYTES)
-            if truncated or end_of_stream:
-                return False
-            extension = text.find(";")
-            if extension >= 0:
-                text = text[:extension]
-            try:
-                chunk = int(text.strip(), CHUNK_SIZE_RADIX)
-            except ValueError:
-                return False
-            if chunk < 0:
-                return False
-            if chunk == 0:
-                return self._skip_trailer()
-            total += chunk
-            if total > MAX_CHUNKED_BODY_BYTES or not self._skip_exactly(chunk):
-                return False
-            terminator, truncated, end_of_stream = self._read_line(MAX_HEADER_LINE_BYTES)
-            if terminator or truncated or end_of_stream:
-                return False
-
-    def _skip_trailer(self):
-        """Discard the trailer section that closes a chunked body."""
-        for _ in range(MAX_TRAILER_FIELDS + 1):
-            text, truncated, end_of_stream = self._read_line(MAX_HEADER_LINE_BYTES)
-            if truncated or end_of_stream:
-                return False
-            if not text:
-                return True
-        return False
-
-    def _skip_exactly(self, count):
-        """Read and discard an exact number of bytes.
-
-        :returns: ``True`` if every byte arrived, ``False`` if the stream ended
-            first.
-        """
-        remaining = count
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, IO_BUFFER_BYTES))
-            if not chunk:
-                return False
-            remaining -= len(chunk)
-        return True
-
-    # ----------------------------------------------------------------------- #
-    # Dispatch
-    # ----------------------------------------------------------------------- #
-
-    def handle_one_request(self):
-        """Read one request, classify it and write exactly one response.
-
-        This replaces the inherited implementation rather than extending it.  See
-        the module docstring for why: the inherited ``parse_request`` rewrites the
-        request target, answers an unknown verb with an HTML page that echoes the
-        verb, and degrades to HTTP/0.9 - no status line, no headers - for a
-        request line it cannot parse.  Those are not behaviours an override of a
-        ``do_*`` method can reach.
-
-        The classification order is the numbered list on this class and is
-        deliberately identical, step for step, to the JavaScript and Java
-        implementations.  Nothing about the request - not the target, not the
-        method, not an exception message - is ever placed in a response.
-        """
-        self.close_connection = True
-        self.write_failed = False
-        self.requestline = ""
-        self.request_version = ""
-        self.command = ""
-        self.path = ""
-        try:
-            text, truncated, end_of_stream = self._read_line(MAX_REQUEST_LINE_BYTES)
-            if end_of_stream:
-                return
-            if not truncated and not text:
-                # RFC 9112 asks a server to tolerate one empty line before a
-                # request line.  Exactly one is skipped; a second is a 400.
-                text, truncated, end_of_stream = self._read_line(MAX_REQUEST_LINE_BYTES)
-                if end_of_stream:
-                    return
-            if truncated:
-                self._transport_error(414)
-                return
-            self.requestline = text
-            request = parse_request_line(text)
-            if request.failure:
-                self._transport_error(request.failure)
-                return
-            self.command = request.method
-            self.path = request.target
-            self.request_version = f"HTTP/{request.major}.{request.minor}"
-
-            headers, failure = self._read_headers()
-            if failure:
-                self._transport_error(failure)
-                return
-            if request.persistent and header_value(headers, HEADER_NAME_HOST) is None:
-                # RFC 9112 requires exactly this: an HTTP/1.1 request without a
-                # Host header is malformed and must be rejected, not guessed at.
-                self._transport_error(400)
-                return
-
-            if contains_token(header_value(headers, HEADER_NAME_EXPECT), EXPECT_CONTINUE):
-                self.wfile.write(CONTINUE_RESPONSE.encode("iso-8859-1"))
-            drained = self._drain_body(
-                header_value(headers, HEADER_NAME_CONTENT_LENGTH),
-                header_value(headers, HEADER_NAME_TRANSFER_ENCODING),
-            )
-            connection = header_value(headers, HEADER_NAME_CONNECTION)
-            wants_close = contains_token(connection, CONNECTION_CLOSE) or (
-                not request.persistent and not contains_token(connection, CONNECTION_KEEP_ALIVE)
-            )
-
-            if request.method == METHOD_GET:
-                self.do_GET()
-            else:
-                self._method_not_allowed()
-            self.close_connection = not (drained and not wants_close and not self.write_failed)
-        except TimeoutError:
-            # A client that connected and then stopped sending.  Its connection
-            # is simply reclaimed; nothing is owed to it and nothing is logged.
-            return
-        except OSError:
-            # A client that vanished.  Normal traffic on a public port, and not
-            # worth a line of output.
-            return
-
     def do_GET(self):
-        """Answer the health route; anything else is a 404.
-
-        ``self.path`` is the request target exactly as it arrived on the wire,
-        placed there by :meth:`handle_one_request` rather than by the inherited
-        parser, so the leading-slash rewrite that parser performs cannot make
-        ``//health`` reach this route.
-        """
+        """Answer the health route; anything else is a 404."""
         config, route = self._snapshot()
         if normalize_path(self.path) == route:
             self._respond(200, build_payload(config))
@@ -1209,86 +946,61 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     def _method_not_allowed(self):
         """Reject a non-GET request, advertising what is allowed.
 
-        Reached for EVERY method that is not exactly ``GET`` - the ones the
-        inherited dispatcher knows about, the ones it does not, a wrongly-cased
-        ``get``, and ``CONNECT`` - because the dispatch in
-        :meth:`handle_one_request` is a single comparison rather than a lookup for
-        a ``do_<VERB>`` attribute.  That is what makes the method policy total:
-        there is no verb for which a 501 HTML page, or an echo of the verb itself,
-        can be produced.
+        The body is constant: it echoes neither the method nor the path, because
+        this endpoint is network-reachable and discloses the minimum possible
+        about the deployment behind it.
         """
         self._respond(405, METHOD_NOT_ALLOWED_BODY, send_allow=True)
 
-    def finish(self):
-        """Retire the connection politely, then let the base class close it.
+    def do_HEAD(self):
+        """HEAD is refused like every other non-GET verb.
 
-        The write side is shut down first and whatever the client is still sending
-        is drained briefly.  Both halves matter: closing a socket that still has
-        unread data queued makes the kernel answer with a reset, which a client
-        reports as "no response" for a request that was in fact answered - and
-        without the shutdown first, the drain would wait for a client that is
-        itself waiting for an answer it has already received.  Together they turn
-        a would-be reset into a readable response, which is what lets a 405 be
-        delivered for a POST carrying megabytes this endpoint refuses to read.
+        RFC 9110 expects HEAD wherever GET is supported, so this is a deliberate,
+        documented deviation rather than an oversight: it keeps the contract at
+        one method across all three language implementations, and no consumer
+        identified in the requirements issues a HEAD.  The response carries the
+        headers and no body, as a HEAD response must.
         """
-        try:
-            self.connection.shutdown(socket.SHUT_WR)
-            self.connection.settimeout(LINGER_TIMEOUT_SECONDS)
-            discarded = 0
-            while discarded < MAX_LINGER_DRAIN_BYTES:
-                chunk = self.connection.recv(
-                    min(IO_BUFFER_BYTES, MAX_LINGER_DRAIN_BYTES - discarded)
-                )
-                if not chunk:
-                    break
-                discarded += len(chunk)
-        except OSError:
-            # Already gone, or never established.  The socket is closed either
-            # way by the base class below.
-            pass
-        super().finish()
+        self._method_not_allowed()
 
-    def send_error(self, code, message=None, explain=None):
-        """Answer with the contract instead of the stdlib HTML error page.
+    def do_POST(self):
+        """POST is refused: this endpoint reads nothing and changes nothing."""
+        self._method_not_allowed()
 
-        Nothing in this class routes here - :meth:`handle_one_request` owns every
-        response - but the inherited machinery does, and this override is what
-        makes the guarantee total rather than dependent on this module being the
-        only writer.  The base implementation would emit a ``text/html`` page
-        carrying ``message`` and ``explain``, both of which are built from
-        request-supplied text, and would emit it through ``send_response``, which
-        suppresses the status line and the entire header block whenever the
-        request version could not be parsed.
+    def do_PUT(self):
+        """PUT is refused: the health document is computed, never stored."""
+        self._method_not_allowed()
 
-        ``message`` and ``explain`` are accepted for signature compatibility and
-        then discarded, deliberately and without being logged: they exist to
-        describe a request back to its sender, and this endpoint does not do that.
+    def do_DELETE(self):
+        """DELETE is refused: there is no resource here to remove."""
+        self._method_not_allowed()
+
+    def do_PATCH(self):
+        """PATCH is refused: the payload is derived from configuration."""
+        self._method_not_allowed()
+
+    def do_OPTIONS(self):
+        """OPTIONS is refused, with ``Allow: GET`` stating the policy anyway.
+
+        A 405 carrying ``Allow`` conveys the same fact a 204 with ``Allow``
+        would, and keeps every non-GET verb on one code path.
         """
-        status = code if code in TRANSPORT_ERROR_BODIES else 500
-        self._write(
-            status,
-            render_payload(TRANSPORT_ERROR_BODIES.get(status, {"error": REASON_PHRASES[500]})),
-            send_close=True,
-        )
-        self.close_connection = True
-
-    def send_response(self, code, message=None):
-        """Emit a status line without the ``Server`` and ``Date`` headers.
-
-        Like :meth:`send_error`, nothing in this class calls this; it is overridden
-        so that the interpreter version cannot leak from a path this module does
-        not write, and least disclosure holds for every response the process is
-        capable of producing.
-        """
-        self.send_response_only(code, message)
+        self._method_not_allowed()
 
     def log_message(self, fmt, *args):
-        """Send every server log line to stderr.
+        """Send every server log line to stderr, through the one safe emitter.
 
         Standard output is the legacy contract of this program and is hashed by
         the backward-compatibility gate, so nothing the server says may go there.
+
+        The text reaching this method is REQUEST-derived - the inherited machinery
+        logs the request line it was sent - which makes it the one log path in this
+        module carrying a value an outside caller chose.  It is therefore routed
+        through :func:`log_warning` rather than written directly, so a request line
+        carrying a CR and an LF cannot forge a second entry in whatever collects
+        this process's stderr.
         """
-        sys.stderr.write("[app.py] %s\n" % (fmt % args))
+        log_warning(fmt % args)
 
 
 class HealthServer(ThreadingHTTPServer):
@@ -1338,14 +1050,23 @@ def create_server(host=None, port=None, config=None):
     drive ``serve_forever`` on its own thread, none of which is possible if the
     only entry point blocks forever.
 
+    The configuration is validated BEFORE the socket is bound, so an
+    unpublishable document can never be served: a server that bound a port and
+    then answered ``200``/``UP`` with a malformed version would have published the
+    very thing the validation exists to refuse, and would have looked healthy
+    while doing it.  Failing here also means the caller's ``except`` block, rather
+    than a monitoring system three layers away, is what learns about the typo.
+
     :param host: bind address; the configured ``app.host`` when omitted.
     :param port: bind port; the configured ``python.port`` when omitted. 0 binds
         an ephemeral port.
     :param config: mapping from :func:`load_config`; loaded when omitted.
-    :raises ValueError: when the resolved port is not a valid port number.
+    :raises ValueError: when the configuration cannot be published, or when the
+        resolved port is not a valid port number.
     :raises OSError: when the address cannot be bound.
     """
     resolved = load_config() if config is None else config
+    validate_config(resolved)
     if host is None:
         host = resolved.get("app.host") or DEFAULTS["app.host"]
     if port is None:
@@ -1382,7 +1103,11 @@ def serve(host=None, port=None, config=None):
     try:
         server = create_server(host, port, resolved)
     except (OSError, ValueError) as exc:
-        sys.stderr.write(f"[app.py] cannot start the health server: {exc}\n")
+        # Routed through log_warning rather than written directly, so that the one
+        # diagnostic that can carry an exception message is sanitised like every
+        # other.  The bytes are unchanged - log_warning writes the same prefix - and
+        # the property becomes structural instead of a convention.
+        log_warning(f"cannot start the health server: {exc}")
         raise SystemExit(1) from None
 
     # Configured values reach this line, so control characters are stripped from
@@ -1398,69 +1123,346 @@ def serve(host=None, port=None, config=None):
         server.serve_forever()
     except KeyboardInterrupt:
         # An operator pressing Ctrl-C is a clean shutdown, not a failure.
-        sys.stderr.write("[app.py] interrupted; shutting down\n")
+        log_warning("interrupted; shutting down")
     finally:
         server.shutdown()
         server.server_close()
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Self-check
+#
+# The container HEALTHCHECK, written in-process precisely so that the image needs
+# no HTTP client of its own: neither the slim Python image nor the JRE image ships
+# curl or wget, and adding one would enlarge the image, widen its attack surface
+# and hand a post-exploitation attacker a download-and-run helper.
+#
+# A probe is a CLIENT, and a client is only as safe as its behaviour against a
+# peer that does not cooperate.  Three properties are therefore built in rather
+# than assumed: the destination is selected from a loopback allowlist and never
+# derived from configuration, the exchange is bounded in time AND in bytes, and
+# the verdict comes from parsing the document against the frozen contract rather
+# than from looking for a fragment inside it.
+# --------------------------------------------------------------------------- #
+
+
+def _is_digits(candidate):
+    """Return ``True`` when every character is an ASCII digit and there is one.
+
+    ASCII only, deliberately: :meth:`str.isdigit` admits Arabic-Indic and other
+    Unicode decimal digits, and a near-miss address spelled with one of them must
+    not reach :func:`int` and be graded loopback.
+    """
+    if not candidate:
+        return False
+    for current in candidate:
+        if not "0" <= current <= "9":
+            return False
+    return True
+
+
+def _is_ipv4_loopback(candidate):
+    """Report whether a string is a dotted-quad IPv4 address in 127.0.0.0/8.
+
+    Written out rather than delegated to :mod:`ipaddress` for the same reason
+    :func:`normalize_path` is written out rather than delegated to
+    :mod:`urllib.parse`: a general address parser accepts spellings this module
+    has no reason to accept - ``127.1``, ``0x7f.0.0.1``, a bare decimal integer -
+    and each of them is a different way to write a destination the allowlist would
+    then have to reason about.  Four decimal octets or nothing.
+
+    :param candidate: the configured host, already stripped of surrounding space.
+    :returns: ``True`` only for ``127.b.c.d`` with four octets in 0-255.
+    """
+    if not candidate.startswith(IPV4_LOOPBACK_PREFIX):
+        return False
+    octets = candidate.split(".")
+    if len(octets) != 4:
+        return False
+    for octet in octets:
+        if not _is_digits(octet) or len(octet) > 3 or int(octet) > 255:
+            return False
+    return True
+
+
+def probe_authority(host=None):
+    """Return the loopback authority :func:`probe` is permitted to connect to.
+
+    This is an ALLOWLIST, and that is the whole point.  ``app.host`` is an input:
+    it comes from a properties file and from ``APP_HOST`` in the environment, both
+    of which an operator, an orchestrator or a compromised sidecar can set.
+    Rewriting only the wildcard spellings and using everything else verbatim would
+    make the container HEALTHCHECK a general-purpose outbound HTTP client aimed
+    wherever that input pointed - a probe that reports healthy because some other
+    machine is healthy, and an egress request the deployment never asked for.  So
+    the destination is not derived from the configured value at all; it is
+    SELECTED from a fixed set of loopback forms, and a value outside that set is
+    replaced rather than honoured.
+
+    ==========================  ==========================================
+    Configured ``app.host``     Probe destination
+    ==========================  ==========================================
+    unset, empty, ``0.0.0.0``,  ``127.0.0.1`` - a wildcard names every
+    ``::``, ``[::]``, ``*``     interface and is not itself a destination
+    ``localhost``               ``127.0.0.1`` - mapped, never resolved, so
+                                a hosts-file entry cannot redirect a
+                                self-check off this machine (RFC 6761)
+    ``127.0.0.1`` .. any        itself - a listener deliberately bound to
+    address in 127.0.0.0/8      127.0.0.2 is probed where it actually is
+    ``::1``, ``[::1]``, the     ``[::1]`` - bracketed so its colons cannot
+    expanded IPv6 form          be misread as a port separator
+    anything else               ``127.0.0.1``, with one fixed-category
+                                warning; the configured value is neither
+                                used nor logged
+    ==========================  ==========================================
+
+    Replacing rather than refusing is deliberate.  A refusal would report the
+    application unhealthy because its BIND address is unusual, which is a
+    misdiagnosis: the listener may well be serving perfectly on an interface this
+    probe is not allowed to dial.  Probing loopback answers the question the probe
+    is actually asking - is the process in this container serving? - and the
+    warning is what tells an operator the configured value was not used.  The
+    JavaScript and Java probes apply the identical table, so all three dial the
+    same destination for any given configuration.
+
+    :param host: the configured bind address; ``None``, the empty string and
+        whitespace are all treated as a wildcard bind.
+    :returns: ``127.0.0.1``, ``[::1]``, or a 127.0.0.0/8 address as configured.
+    """
+    candidate = (host or "").strip()
+    lowered = candidate.lower()
+    if lowered in WILDCARD_HOSTS or lowered == LOOPBACK_NAME:
+        return LOOPBACK_HOST
+    if lowered in IPV6_LOOPBACK_FORMS:
+        return LOOPBACK_AUTHORITY_V6
+    if _is_ipv4_loopback(candidate):
+        return candidate
+    log_warning("probe target is not loopback; probing loopback instead")
+    return LOOPBACK_HOST
+
+
+def _unique_pairs(pairs):
+    """Build an object from JSON member pairs, refusing a repeated key.
+
+    :func:`json.loads` keeps the LAST value for a duplicated key and says nothing,
+    which silently turns a contradictory document into a plausible one: a body
+    carrying ``"status":"DOWN","status":"UP"`` would be graded healthy.  RFC 8259
+    calls such an object's behaviour unpredictable, so the probe refuses it rather
+    than picking a member for the endpoint.  The Java reader refuses it too, which
+    is what keeps the three verdicts identical.
+
+    :raises ValueError: when any key appears more than once.
+    """
+    document = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError("the body repeats a key")
+        document[key] = value
+    return document
+
+
+def probe_rejection(status, body):
+    """Return why an answer fails to prove health, or ``None`` when it proves it.
+
+    Separated from the transport so that every rule below is reachable by a direct
+    call, and so that all three implementations can be held to the same wording:
+    an operator greps one deployment's logs, not one language's.
+
+    The rules, in the order they are applied.  The order matters and is part of the
+    contract: the CHEAPEST and most fundamental checks come first, and the status
+    field is examined before the three descriptive fields so that an endpoint
+    reporting itself down is reported as down rather than as whichever of its other
+    fields happened also to be wrong.
+
+    #. the body fits inside :data:`MAX_PROBE_BODY_BYTES`;
+    #. the response code is exactly 200 - the IETF health-check draft couples a
+       passing status to a 2xx code, and this contract narrows that to one code;
+    #. the body is JSON, decodes as UTF-8, carries no repeated key and has nothing
+       trailing it;
+    #. the body is a JSON OBJECT;
+    #. it carries exactly :data:`PROBE_KEY_ORDER`, in that order;
+    #. ``status`` equals :data:`HEALTH_STATUS`;
+    #. ``name`` is a non-empty string, ``version`` matches
+       :data:`VERSION_GRAMMAR`, and ``timestamp`` matches
+       :data:`TIMESTAMP_GRAMMAR` - the timestamp by FORMAT, never by value.
+
+    A parse is what makes this fail closed.  The defect this replaces tested the
+    raw body for the fragment ``"status":"UP"``, so a truncated, unparseable body
+    that happened to contain those bytes was graded healthy; every rule here is
+    stated against a parsed document instead.
+
+    :param status: the HTTP status code the endpoint answered with.
+    :param body: the response body as received, already bounded by the caller.
+    :returns: a fixed-category reason string, or ``None`` when the answer is good.
+    """
+    if len(body) > MAX_PROBE_BODY_BYTES:
+        return f"body exceeds the probe limit of {MAX_PROBE_BODY_BYTES} bytes"
+    if status != 200:
+        return f"the endpoint answered status {int(status)}"
+    try:
+        document = json.loads(body.decode("utf-8"), object_pairs_hook=_unique_pairs)
+    except (UnicodeDecodeError, ValueError):
+        # json.JSONDecodeError (a ValueError) covers malformed JSON, trailing
+        # content and a repeated key; UnicodeDecodeError covers a body that is not
+        # UTF-8 at all.  All of them mean the same thing to a probe.
+        return "body is not the expected JSON document"
+    if not isinstance(document, dict):
+        return "body is not a JSON object and carries no status field"
+    if list(document) != list(PROBE_KEY_ORDER):
+        return PROBE_KEY_SET_REASON
+    if document["status"] != HEALTH_STATUS:
+        return "the status field is not the expected value"
+    name = document["name"]
+    if not isinstance(name, str) or not name:
+        return "the name field is not a non-empty string"
+    version = document["version"]
+    if not isinstance(version, str) or not VERSION_GRAMMAR.match(version):
+        return "the version field is not a three-part dotted numeric version"
+    timestamp = document["timestamp"]
+    if not isinstance(timestamp, str) or not TIMESTAMP_GRAMMAR.match(timestamp):
+        return "the timestamp field is not a whole-second UTC instant"
+    return None
+
+
+def _probe_answer(host, port, route, target):
+    """GET the health answer from a loopback endpoint, bounded twice.
+
+    Two independent limits apply, because either one alone can be defeated:
+
+    * an ABSOLUTE deadline of :data:`PROBE_TIMEOUT_SECONDS`, armed before the
+      connection is attempted and covering connect, response headers and response
+      body together.  A per-read timeout cannot do this - a peer that sends one
+      byte just inside every timeout satisfies all of them and keeps the probe
+      alive for as long as it likes - so the deadline is enforced once, across the
+      whole exchange, by a timer that shuts the socket down under the read in
+      progress;
+    * a ceiling of :data:`MAX_PROBE_BODY_BYTES` on the body.  One byte more than
+      the ceiling is requested, so an endpoint that streams without end is bounded
+      in MEMORY as well as in time and :func:`probe_rejection` can still see that
+      the limit was passed.
+
+    :class:`http.client.HTTPConnection` is used rather than
+    :func:`urllib.request.urlopen` for two independent reasons.  It exposes the
+    socket, and the socket is what the deadline has to act on - ``urlopen`` owns
+    its transport privately and offers no way to interrupt a read already under
+    way.  And it consults no proxy configuration: ``urlopen``'s default opener
+    reads ``HTTP_PROXY`` out of the environment, which was demonstrated to let an
+    injected variable answer a self-check on behalf of a process that was not
+    running at all.  A loopback self-check must never be proxied.
+
+    Every failure resolves to ``None`` with exactly one line logged, and every
+    diagnostic is a fixed category.  The only variable content permitted in a line
+    is the probe TARGET, which this process constructed and sanitised, and an
+    exception TYPE name - never an exception message, which can carry
+    resolver-derived or response-derived text.
+
+    :param host: a loopback authority from :func:`probe_authority`.
+    :param port: a validated port number.
+    :param route: a validated request target.
+    :param target: the sanitised URL, for the one diagnostic that names it.
+    :returns: ``(status, body)``, or ``None`` when no answer could be obtained.
+    """
+    expired = threading.Event()
+    connection = http.client.HTTPConnection(host, port, timeout=PROBE_TIMEOUT_SECONDS)
+
+    def expire():
+        """Fire the absolute deadline: mark it, then interrupt the transfer."""
+        expired.set()
+        active = connection.sock
+        if active is not None:
+            # Shutting the socket down makes the read in progress return or fail
+            # immediately.  Closing it here instead would race the owning thread,
+            # which is still using the object; shutdown only retires the channel.
+            try:
+                active.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    watchdog = threading.Timer(PROBE_TIMEOUT_SECONDS, expire)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        connection.request(METHOD_GET, route, headers={"Accept": CONTENT_TYPE})
+        response = connection.getresponse()
+        return response.status, response.read(MAX_PROBE_BODY_BYTES + 1)
+    except http.client.InvalidURL:
+        # A route reaching this point carries a character the client layer refuses
+        # to place in a request line.  Listed before the catch-all, which it would
+        # otherwise fall into, so it is reported as the configuration fault it is.
+        log_warning("probe cannot run: the configured health path is not a valid request target")
+        return None
+    except Exception as exc:  # fail closed on every transport outcome
+        if expired.is_set():
+            log_warning("probe rejected: no response within the probe deadline")
+        else:
+            log_warning(f"probe could not reach {target}: {type(exc).__name__}")
+        return None
+    finally:
+        # Cancelling a timer that has already fired is a no-op, so this is correct
+        # on every path, and closing the connection releases the descriptor whether
+        # the exchange completed, expired or never started.
+        watchdog.cancel()
+        connection.close()
+
+
 def probe(config=None):
     """Check this application's own health endpoint.
 
-    This is the container HEALTHCHECK, and it is written in-process precisely so
-    that the image needs no HTTP client of its own.  It is deliberately strict:
-    the verdict is healthy only when the endpoint answers ``200`` AND the parsed
-    body reports the expected status.  Every failure mode - connection refused,
-    timeout, wrong status code, unparseable body, anything unforeseen - resolves
-    to unhealthy, because a probe that cannot prove health must not report it.
+    Deliberately strict: the verdict is healthy only when the endpoint answers
+    ``200`` AND the body is a JSON object satisfying the frozen contract.  Every
+    other outcome - refused connection, expired deadline, wrong status code,
+    oversized body, unparseable body, a document that merely looks right, anything
+    unforeseen - is unhealthy, because a probe that cannot PROVE health must not
+    report it.
 
-    Loopback is substituted for a wildcard bind address, since ``0.0.0.0`` names
-    every interface and is not itself a routable destination.
+    The order of the four steps is what makes the diagnostics safe.  The
+    configuration is validated first, so a value carrying a CR and an LF is
+    refused before it can be interpolated into anything; the destination is then
+    selected from the loopback allowlist rather than derived; the port and the
+    route are checked; and only then is a request made.
 
     :param config: mapping from :func:`load_config`; loaded when omitted.
     :returns: 0 when healthy, 1 when not. Suitable for :func:`sys.exit`.
     """
     resolved = load_config() if config is None else config
-    host = resolved.get("app.host") or DEFAULTS["app.host"]
-    if host in WILDCARD_HOSTS:
-        host = LOOPBACK_HOST
-    # The port is validated rather than interpolated as text.  A misconfigured
-    # value would otherwise produce an unparseable URL and be reported as
-    # "unreachable", which sends an operator looking for a network fault instead
-    # of at the typo; and the JavaScript and Java probes both fail closed here
-    # with the offending value named, so this one does too.
+    # The same validation the server applies, applied here too.  A probe that
+    # accepted a configuration the server refuses would report a process healthy
+    # that cannot start, which is the most misleading verdict available.  The
+    # message names the offending KEY and never quotes its value, so this line is
+    # safe to print verbatim.
     try:
-        port = _as_port(resolved.get("python.port") or DEFAULTS["python.port"])
+        validate_config(resolved)
     except ValueError as exc:
-        sys.stderr.write(f"[app.py] probe cannot run: {exc}\n")
+        log_warning(f"probe cannot run: {exc}")
         return 1
-    url = f"http://{host}:{port}{health_route(resolved)}"
 
+    host = probe_authority(resolved.get("app.host") or DEFAULTS["app.host"])
+    # The port is validated rather than interpolated as text.  A misconfigured
+    # value would otherwise be reported as "unreachable", which sends an operator
+    # looking for a network fault instead of at the typo.  The offending value is
+    # not named: the category says which setting is wrong, and the setting itself
+    # is one command away from the operator reading the line.
     try:
-        with urllib.request.urlopen(url, timeout=PROBE_TIMEOUT_SECONDS) as response:
-            if response.status != 200:
-                sys.stderr.write(f"[app.py] probe: {url} answered {response.status}\n")
-                return 1
-            document = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        # HTTPError is itself a response object holding an open socket, and
-        # urlopen raises it instead of returning it, so the ``with`` above never
-        # sees it.  Close it explicitly rather than leaving the descriptor to the
-        # garbage collector.
-        exc.close()
-        sys.stderr.write(f"[app.py] probe: {url} answered {exc.code}\n")
+        port = _as_port(resolved.get(PORT_KEY) or DEFAULTS[PORT_KEY])
+    except ValueError:
+        log_warning("probe cannot run: the configured port is unusable")
         return 1
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        sys.stderr.write(f"[app.py] probe: {url} unreachable or unreadable: {exc}\n")
-        return 1
-    except Exception as exc:  # fail closed on anything unforeseen
-        sys.stderr.write(f"[app.py] probe: {url} failed: {exc!r}\n")
+    # The route is checked against the same predicate validate_config applies, and
+    # for the same reason: the value reaching this line has been normalised, so it
+    # is not the string validation already saw.
+    route = health_route(resolved)
+    if not is_request_target(route):
+        log_warning("probe cannot run: the configured health path is not a valid request target")
         return 1
 
-    status = document.get("status") if isinstance(document, dict) else None
-    if status != HEALTH_STATUS:
-        sys.stderr.write(f"[app.py] probe: status is {status!r}, expected {HEALTH_STATUS!r}\n")
+    target = sanitize_for_log(f"http://{host}:{port}{route}")
+    answer = _probe_answer(host, port, route, target)
+    if answer is None:
+        return 1
+    reason = probe_rejection(answer[0], answer[1])
+    if reason is not None:
+        log_warning(f"probe rejected: {reason}")
         return 1
     return 0
 
