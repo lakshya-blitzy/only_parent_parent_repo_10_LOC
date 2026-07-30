@@ -266,6 +266,31 @@ def json_head(length, status=b"HTTP/1.1 200 OK"):
     )
 
 
+#: The version and instant :func:`padded_document` writes, and the fixed bytes it
+#: puts either side of its ``name`` field.  Named rather than inlined because the
+#: probe grades IDENTITY as well as shape, so a test that serves a padded document
+#: must also configure the matching name and version; deriving the document and the
+#: configuration from these is what keeps the two equal by construction.
+PADDED_DOCUMENT_VERSION = "1.1.0"
+PADDED_DOCUMENT_PREFIX = b'{"name":"'
+PADDED_DOCUMENT_SUFFIX = (
+    '","version":"'
+    + PADDED_DOCUMENT_VERSION
+    + '","timestamp":"2026-01-01T00:00:00Z","status":"UP"}'
+).encode("ascii")
+
+
+def padded_name(length):
+    """Return the ``name`` value :func:`padded_document` carries at ``length`` bytes.
+
+    Exposed separately so a test can configure the identity it is about to serve.
+    """
+    padding = length - len(PADDED_DOCUMENT_PREFIX) - len(PADDED_DOCUMENT_SUFFIX)
+    if padding < 0:
+        raise ValueError(f"{length} is shorter than the smallest valid document")
+    return "a" * padding
+
+
 def padded_document(length):
     """Return a VALID healthy health document padded to exactly ``length`` bytes.
 
@@ -273,12 +298,11 @@ def padded_document(length):
     ``name`` field, so the document stays a well-formed JSON object reporting the
     healthy status and the only thing under test is its length.
     """
-    prefix = b'{"name":"'
-    suffix = b'","version":"1.1.0","timestamp":"2026-01-01T00:00:00Z","status":"UP"}'
-    padding = length - len(prefix) - len(suffix)
-    if padding < 0:
-        raise ValueError(f"{length} is shorter than the smallest valid document")
-    return prefix + b"a" * padding + suffix
+    return (
+        PADDED_DOCUMENT_PREFIX
+        + padded_name(length).encode("ascii")
+        + PADDED_DOCUMENT_SUFFIX
+    )
 
 
 class HostileEndpoint:
@@ -483,6 +507,30 @@ def raw_exchange(port, request, timeout=REQUEST_TIMEOUT_SECONDS):
         client.close()
 
 
+def raw_exchange_with_eof(port, request, timeout=REQUEST_TIMEOUT_SECONDS):
+    """Send ``request``, then END the stream, and read the whole reply.
+
+    The difference from :func:`raw_exchange` is the half-close, and it is the whole
+    point of the helper: a request that stops mid-block is indistinguishable from a
+    slow client until the writing half closes, so without the shutdown the server
+    correctly waits for the rest and the test would measure the pre-parse deadline
+    instead of the framing decision.  With it, the server sees end of stream where a
+    header block should have continued, which is the case being asserted.
+    """
+    client = socket.create_connection((LOOPBACK, port), timeout=REQUEST_TIMEOUT_SECONDS)
+    try:
+        send_in_chunks(client, request)
+        try:
+            client.shutdown(socket.SHUT_WR)
+        except OSError:
+            # Already retired by the peer, which is one of the outcomes under test.
+            pass
+        client.settimeout(timeout)
+        return read_response(client)
+    finally:
+        client.close()
+
+
 def await_settled(predicate):
     """Poll ``predicate`` until it is true or :data:`SETTLE_TIMEOUT_SECONDS` passes.
 
@@ -639,6 +687,8 @@ class TestLegacyInvocation(unittest.TestCase):
             "sanitize_for_log",
             "probe_authority",
             "probe_rejection",
+            "sole_media_type",
+            "identity_rejection",
             "HealthRequestHandler",
             "HealthServer",
             "create_server",
@@ -1224,8 +1274,11 @@ class TestRouteResolution(unittest.TestCase):
 
         ``GET http://host:8002/health HTTP/1.1`` is the absolute form, and a
         proxy-aware client emits it.  The Java implementation reduced it from the
-        beginning; these two did not, so the same request reached the route on one
-        implementation and returned 404 on the other two.
+        beginning; these two did not, so before this reduction existed the same
+        request reached the route on one implementation and returned 404 on the other
+        two.  It is uniform now: measured on the wire, all three answer 200 for the
+        configured path and 404 for any other, in either scheme and whatever
+        authority the line names.
         """
         cases = {
             "http://host:8002/health": "/health",
@@ -2031,13 +2084,24 @@ class TestProbeAuthority(unittest.TestCase):
 class TestProbeBounds(unittest.TestCase):
     """Bounded in time, bounded in bytes, and strict about the document."""
 
-    def _probe(self, port, path="/health", host=LOOPBACK):
-        """Probe ``port`` and return ``(verdict, stderr)``."""
+    def _probe(self, port, path="/health", host=LOOPBACK, name=None, version=None):
+        """Probe ``port`` and return ``(verdict, stderr)``.
+
+        ``name`` and ``version`` state the identity the probe is to expect.  They
+        matter because the probe grades identity as well as shape: a document is
+        only proof of THIS application's health if it names this application, so a
+        test serving a padded document has to configure the padded name it serves.
+        Left unset, the committed defaults apply, which is what every hostile case
+        below wants - the answer is meant to be refused.
+        """
+        config = {"app.host": host, "python.port": str(port), "health.path": path}
+        if name is not None:
+            config["app.name"] = name
+        if version is not None:
+            config["app.version"] = version
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            verdict = app.probe(
-                {"app.host": host, "python.port": str(port), "health.path": path}
-            )
+            verdict = app.probe(config)
         return verdict, stderr.getvalue()
 
     def test_an_endpoint_that_streams_without_end_cannot_outlive_the_deadline(self):
@@ -2072,12 +2136,23 @@ class TestProbeBounds(unittest.TestCase):
         self.assertIn("exceeds the probe limit", written)
 
     def test_the_ceiling_is_inclusive_and_one_byte_past_it_is_refused(self):
-        """Both sides of the limit, so an off-by-one cannot hide in either."""
+        """Both sides of the limit, so an off-by-one cannot hide in either.
+
+        The accepted side configures the padded name it serves, because the probe
+        grades identity too.  That is not a workaround: it is the F-15 hazard stated
+        as a test.  A document at exactly the ceiling is one an ``app.name`` of
+        ``PROBE_BODY_CEILING - 78`` bytes produces, so this pair also pins the
+        largest name whose own healthy answer the probe can still read.
+        """
         at_limit = padded_document(PROBE_BODY_CEILING)
         accepted = hostile_endpoint(
             self, head=json_head(len(at_limit)), body=at_limit
         )
-        verdict, written = self._probe(accepted.port)
+        verdict, written = self._probe(
+            accepted.port,
+            name=padded_name(PROBE_BODY_CEILING),
+            version=PADDED_DOCUMENT_VERSION,
+        )
         self.assertEqual(verdict, 0, msg=written)
 
         past_limit = padded_document(PROBE_BODY_CEILING + 1)
@@ -2134,7 +2209,11 @@ class TestProbeBounds(unittest.TestCase):
         """The positive control: these bounds must not reject a correct answer."""
         body = padded_document(120)
         endpoint = hostile_endpoint(self, head=json_head(len(body)), body=body)
-        verdict, written = self._probe(endpoint.port)
+        verdict, written = self._probe(
+            endpoint.port,
+            name=padded_name(120),
+            version=PADDED_DOCUMENT_VERSION,
+        )
         self.assertEqual(verdict, 0, msg=written)
         self.assertEqual(written, "")
 
@@ -2723,12 +2802,14 @@ class TestTransportRejection(HealthServerTestCase):
         self.assertEqual(remainder, b"", msg="the connection must be closed, not idle")
 
     def test_a_transport_refusal_is_logged_as_exactly_one_line(self):
-        """The operator keeps the diagnostic; the network gets none of it.
+        """One line per refusal, and nothing in it the caller chose.
 
-        The request line reaches this log path, so it is the one refusal whose
-        diagnostic carries caller-chosen text.  It goes through the sanitising
-        emitter, so a control character in the request line cannot open a second
-        entry in whatever collects this process's stderr.
+        The inherited parser passes its own wording to ``send_error``, and every one of
+        those wordings quotes the request line - ``Bad request syntax ('GARBAGE')``.  The
+        override discards it and logs the status code alone, so the request line reaches
+        neither the network nor the operator's log.  The sanitising emitter is the second
+        line of defence: even if a value did arrive, a control character in it could not
+        open a second entry in whatever collects this process's stderr.
         """
         with contextlib.redirect_stderr(io.StringIO()) as sink:
             raw_exchange(self.port, b"GAR\x07BAGE\x1b[31m\r\n\r\n")
@@ -2737,6 +2818,420 @@ class TestTransportRejection(HealthServerTestCase):
         self.assertIn("refusing a malformed request with 400", written)
         self.assertNotIn("\x07", written)
         self.assertNotIn("\x1b", written)
+        self.assertNotIn("GAR", written)
+        self.assertNotIn("BAGE", written)
+        self.assertNotIn("[31m", written)
+
+    def test_no_refusal_diagnostic_carries_the_request_that_caused_it(self):
+        """Every case above, asserted on the LOG rather than on the wire.
+
+        ``test_no_refusal_echoes_the_request_that_caused_it`` covers the response; this
+        covers the diagnostic, which is the other place the inherited wordings would put
+        request-derived text.  Both matter, and they are separate paths: one is written to
+        the socket and one to stderr.
+        """
+        for label, request, expected_status, forbidden in self.REJECTION_CASES:
+            with self.subTest(case=label):
+                with contextlib.redirect_stderr(io.StringIO()) as sink:
+                    raw_exchange(self.port, request)
+                written = sink.getvalue()
+                self.assertEqual(written.count("\n"), 1, msg=repr(written))
+                self.assertNotIn(
+                    forbidden.decode("latin-1"),
+                    written,
+                    msg="the inherited wording would quote this",
+                )
+                code = expected_status.split()[1].decode("latin-1")
+                self.assertIn(f"refusing a malformed request with {code}", written)
+
+
+class TestRequestFraming(HealthServerTestCase):
+    """The request grammar, held to on the bytes that arrived.
+
+    ``BaseHTTPRequestHandler`` is lenient in ways the JavaScript and Java listeners are
+    not, and every one of them was reachable from a socket: a TAB read as a delimiter, a
+    bare LF read as a terminator, a leading ``//`` folded to one slash so ``//health``
+    answered the health document, a two-field HTTP/0.9 line answered with a bare body and
+    no status line, an empty line before the request answered with nothing at all, and a
+    field line whose name is not a token ending the header block so that ``Content-Length``
+    vanished and the body was read as the next request.
+
+    Every case here was measured against all three implementations before it was fixed, so
+    each one states what the other two do as well.  The pre-parse validation is what brings
+    this implementation into line on every shape where the three CAN agree, and agreement
+    is the contract: an operator polling one language must not get a different answer from
+    another.
+
+    Agreement is not total, and the exceptions are named per case rather than smoothed
+    over, because a claim of uniformity that does not hold is worse than none.  Measured on
+    the wire, four shapes still divide the three: ``GET  /health`` with two spaces and the
+    two-field HTTP/0.9 form are answered 200 and 404 respectively by index.js and User.java
+    where this implementation answers 400; a bare-LF terminator and a fourth token in the
+    request line are answered 200 by User.java.  Each is conformant - RFC 9112 section 3
+    permits a recipient to refuse a malformed line without requiring it - and refusing is
+    the stricter reading, which is the reading taken here.
+    """
+
+    #: ``(label, request bytes)`` - each is a name for the SAME route, made out of the
+    #: leniency being removed.  RFC 3986 section 4.2 reads a leading ``//`` as an
+    #: authority rather than a path, and CPython gh-87389 folds it to one slash before any
+    #: handler sees it, so each of these reached ``do_GET`` as ``/health``.
+    ROUTE_ALIASES = (
+        ("two leading slashes", b"//health"),
+        ("three leading slashes", b"///health"),
+        ("a hundred leading slashes", b"/" * 100 + b"health"),
+        ("two leading slashes and a trailing one", b"//health/"),
+        ("two leading slashes and two trailing", b"//health//"),
+    )
+
+    #: ``(label, request line)`` - a line that is not
+    #: ``method SP request-target SP HTTP-version CRLF``.  ``str.split()`` treats every
+    #: one of the whitespace forms as a delimiter and ``rstrip('\r\n')`` accepts either
+    #: terminator, so all of these parsed before the pre-parse validation was added.
+    #:
+    #: The other two implementations refuse MOST but not all of them, and the
+    #: exceptions were measured rather than assumed, because a comment claiming
+    #: uniformity that does not hold is worse than no comment: index.js answers the
+    #: frozen 200 to ``GET  /health`` (two spaces) and to the two-field HTTP/0.9 form,
+    #: and User.java answers 200 to a bare-LF terminator and to a fourth field and 404
+    #: to the two-space form.  Refusing all of them here is the stricter reading of
+    #: RFC 9112 section 3, and it is the reading this implementation takes; where the
+    #: three differ, the divergence is recorded in the implementation that diverges
+    #: rather than smoothed over by loosening an assertion.
+    MALFORMED_REQUEST_LINES = (
+        ("a TAB after the target", b"GET /health\tHTTP/1.1\r\n"),
+        ("a TAB before the target", b"GET\t/health HTTP/1.1\r\n"),
+        ("a VERTICAL TAB delimiter", b"GET\x0b/health HTTP/1.1\r\n"),
+        ("a FORM FEED delimiter", b"GET\x0c/health HTTP/1.1\r\n"),
+        ("two spaces between the fields", b"GET  /health HTTP/1.1\r\n"),
+        ("a bare LF terminator", b"GET /health HTTP/1.1\n"),
+        ("the two-field HTTP/0.9 form", b"GET /health\r\n"),
+        ("a fourth field", b"GET /health and more HTTP/1.1\r\n"),
+        ("an embedded LF in the target", b"GET /hea\nlth HTTP/1.1\r\n"),
+        ("an embedded CR in the target", b"GET /hea\rlth HTTP/1.1\r\n"),
+        ("a version that is not HTTP/n.n", b"GET /health HTTP/1\r\n"),
+        ("a version with no digits", b"GET /health HTTP/x.y\r\n"),
+        ("a non-ASCII byte in the target", b"GET /health\xc3\xa9 HTTP/1.1\r\n"),
+    )
+
+    #: ``(label, header block)`` - a block the inherited parser would either truncate at
+    #: the offending line or read as complete.  ``X-A : 1`` and ``X A: 1`` are not field
+    #: lines, and a continuation cannot be the first line of a block.
+    MALFORMED_HEADER_BLOCKS = (
+        ("a space before the colon", b"Host: h\r\nX-A : 1\r\n\r\n"),
+        ("a TAB before the colon", b"Host: h\r\nX-A\t: 1\r\n\r\n"),
+        ("a space inside the field name", b"Host: h\r\nX A: 1\r\n\r\n"),
+        ("a field line with no colon", b"Host: h\r\nX-A 1\r\n\r\n"),
+        ("an empty field name", b"Host: h\r\n: 1\r\n\r\n"),
+        ("a leading continuation line", b" continued\r\nHost: h\r\n\r\n"),
+        ("a non-ASCII byte in the field name", b"Host: h\r\nX-\xc3\xa9: 1\r\n\r\n"),
+    )
+
+    REFUSAL = b"HTTP/1.1 400 Bad Request"
+
+    def _quietly(self, exchange, *arguments):
+        """Run one raw exchange with stderr captured, and return the reply.
+
+        Every refusal writes exactly one operator diagnostic.  Capturing it keeps this
+        suite's own output clean and turns "exactly one line" into an assertion.
+        """
+        with contextlib.redirect_stderr(io.StringIO()) as sink:
+            received = exchange(self.port, *arguments)
+        self.written = sink.getvalue()
+        return received
+
+    def _assert_frozen_refusal(self, received):
+        """Assert the reply is the refusal shape, byte for byte.
+
+        A status line, a length of zero, a close, and nothing else - the same shape
+        ``TestTransportRejection`` asserts, because a malformed framing and a malformed
+        request line are the same class of answer.
+        """
+        status_line, headers, body = parse_raw_response(received)
+        self.assertEqual(status_line, self.REFUSAL)
+        self.assertEqual(header_names(headers), {"content-length", "connection"})
+        self.assertEqual(headers["content-length"], "0")
+        self.assertEqual(headers["connection"].lower(), "close")
+        self.assertEqual(body, b"")
+
+    def test_a_leading_slash_alias_is_not_the_health_route(self):
+        """The finding this class exists for: ``//health`` answered ``200``."""
+        for label, target in self.ROUTE_ALIASES:
+            with self.subTest(case=label):
+                received = raw_exchange(
+                    self.port,
+                    b"GET " + target + b" HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+                )
+                status_line, _, body = parse_raw_response(received)
+                self.assertEqual(
+                    status_line,
+                    b"HTTP/1.1 404 Not Found",
+                    msg="a folded target must not reach the health route",
+                )
+                self.assertEqual(body, app.render_payload(app.NOT_FOUND_BODY).encode())
+
+    def test_an_alias_refusal_still_carries_the_frozen_error_contract(self):
+        """A 404 here is the SAME 404 as any other unknown path, headers included."""
+        received = raw_exchange(
+            self.port, b"GET //health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n"
+        )
+        _, headers, _ = parse_raw_response(received)
+        self.assertEqual(
+            header_names(headers), {"content-type", "cache-control", "content-length"}
+        )
+        self.assertEqual(headers["content-type"], app.CONTENT_TYPE)
+        self.assertEqual(headers["cache-control"], app.CACHE_CONTROL)
+
+    def test_the_configured_route_itself_is_untouched_by_the_validation(self):
+        """The whole point is that a well-formed request still gets its document."""
+        received = raw_exchange(
+            self.port,
+            b"GET "
+            + self.route.encode()
+            + b" HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        status_line, _, body = parse_raw_response(received)
+        self.assertEqual(status_line, b"HTTP/1.1 200 OK")
+        self.assertEqual(json.loads(body)["status"], app.HEALTH_STATUS)
+
+    def test_a_malformed_request_line_is_refused_in_the_frozen_shape(self):
+        for label, line in self.MALFORMED_REQUEST_LINES:
+            with self.subTest(case=label):
+                received = self._quietly(
+                    raw_exchange, line + b"Host: h\r\nConnection: close\r\n\r\n"
+                )
+                self._assert_frozen_refusal(received)
+                self.assertEqual(self.written.count("\n"), 1, msg=repr(self.written))
+
+    def test_a_malformed_request_line_never_receives_a_document(self):
+        """Not the health document, and not a document of any other kind either.
+
+        The two-field form is the one that mattered most: the inherited writer emits no
+        status line for it, so the reply used to be the 108-byte payload on its own -
+        a health document that no HTTP client would recognise as a response.
+        """
+        for label, line in self.MALFORMED_REQUEST_LINES:
+            with self.subTest(case=label):
+                received = self._quietly(
+                    raw_exchange, line + b"Host: h\r\nConnection: close\r\n\r\n"
+                )
+                self.assertTrue(received.startswith(b"HTTP/1.1 "), msg=repr(received[:80]))
+                self.assertNotIn(b'"status"', received)
+                self.assertNotIn(app.HEALTH_STATUS.encode(), received)
+                self.assertNotIn(b"<html", received.lower())
+
+    def test_a_shaped_but_unsupported_version_is_still_a_505(self):
+        """Shape is validated here; MEANING stays with the transport.
+
+        ``HTTP/9.9`` is a well-formed version this server does not support, and the
+        distinction is worth an assertion: a validator that rejected it as malformed would
+        turn a 505 into a 400 and lose the reason the caller needs.
+        """
+        received = self._quietly(
+            raw_exchange, b"GET /health HTTP/9.9\r\nHost: h\r\nConnection: close\r\n\r\n"
+        )
+        status_line, _, _ = parse_raw_response(received)
+        self.assertEqual(status_line, b"HTTP/1.1 505 HTTP Version Not Supported")
+
+    def test_an_unimplemented_method_is_still_a_405_and_not_a_400(self):
+        """Validating the request LINE must not narrow the method policy.
+
+        Dispatch is total by design: any token a request line can carry reaches the 405
+        responder.  A validator that only admitted known verbs would answer 400 here and
+        break that.
+        """
+        received = raw_exchange(
+            self.port,
+            b"FROBNICATE /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        status_line, headers, _ = parse_raw_response(received)
+        self.assertEqual(status_line, b"HTTP/1.1 405 Method Not Allowed")
+        self.assertEqual(headers["allow"], app.ALLOWED_METHODS)
+
+    def test_an_empty_line_before_the_request_is_ignored(self):
+        """RFC 9112 section 2.2, and the finding: the reply used to be nothing at all."""
+        for count in (1, 2, app.MAX_LEADING_EMPTY_LINES):
+            with self.subTest(empty_lines=count):
+                received = raw_exchange(
+                    self.port,
+                    b"\r\n" * count
+                    + b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+                )
+                status_line, _, body = parse_raw_response(received)
+                self.assertEqual(
+                    status_line,
+                    b"HTTP/1.1 200 OK",
+                    msg="an ignorable empty line must not suppress the answer",
+                )
+                self.assertEqual(json.loads(body)["status"], app.HEALTH_STATUS)
+
+    def test_a_bare_LF_empty_line_before_the_request_is_ignored_too(self):
+        """Both spellings of an empty line, since the transport accepts both."""
+        received = raw_exchange(
+            self.port,
+            b"\n\r\n\n"
+            + b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        status_line, _, _ = parse_raw_response(received)
+        self.assertEqual(status_line, b"HTTP/1.1 200 OK")
+
+    def test_an_endless_run_of_empty_lines_is_refused_rather_than_absorbed(self):
+        """The bound is what stops an empty-line run being a way to hold a thread."""
+        received = self._quietly(
+            raw_exchange,
+            b"\r\n" * (app.MAX_LEADING_EMPTY_LINES + 1)
+            + b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        self._assert_frozen_refusal(received)
+
+    def test_empty_lines_and_then_a_hang_up_are_answered_with_silence(self):
+        """Nothing was requested, so there is nothing to refuse and nothing to log."""
+        received = self._quietly(raw_exchange_with_eof, b"\r\n\r\n")
+        self.assertEqual(received, b"", msg=repr(received[:80]))
+        self.assertEqual(self.written, "", msg=repr(self.written))
+
+    def test_a_malformed_header_block_is_refused_in_the_frozen_shape(self):
+        for label, block in self.MALFORMED_HEADER_BLOCKS:
+            with self.subTest(case=label):
+                received = self._quietly(
+                    raw_exchange, b"GET /health HTTP/1.1\r\n" + block
+                )
+                self._assert_frozen_refusal(received)
+                self.assertEqual(self.written.count("\n"), 1, msg=repr(self.written))
+
+    def test_a_malformed_field_line_is_answered_once_and_never_twice(self):
+        """The framing finding, stated as the count that proves it.
+
+        ``X-A : 1`` used to end the header block, so ``Content-Length`` disappeared, the
+        drain read nothing, and the body was parsed as a second request line - two
+        responses on one connection, which is the desynchronisation a front end and this
+        server would resolve differently (CWE-444).  Refusing the block makes the count
+        one, whichever order the fields arrive in.
+        """
+        orderings = (
+            b"GET /health HTTP/1.1\r\nHost: h\r\nX-A : 1\r\nContent-Length: 13\r\n\r\n"
+            b"GET /nope HTTP/1.1\r\n\r\n",
+            b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 13\r\nX-A : 1\r\n\r\n"
+            b"GET /nope HTTP/1.1\r\n\r\n",
+        )
+        for index, request in enumerate(orderings):
+            with self.subTest(ordering=index):
+                received = self._quietly(raw_exchange, request)
+                self.assertEqual(
+                    received.count(b"HTTP/1.1 "),
+                    1,
+                    msg=f"exactly one response, got {received[:200]!r}",
+                )
+                self._assert_frozen_refusal(received)
+
+    def test_a_continuation_line_after_a_field_line_is_still_accepted(self):
+        """Deprecated, and left working, matching User.java rather than index.js.
+
+        Refusing an obs-fold outright is permitted by RFC 9112 section 5.2, but it is a
+        behaviour change no finding asked for.  Measured across the three: User.java
+        accepts a continuation line and answers the frozen 200, and index.js refuses it
+        with the minimal 400 its parser writes for any framing fault.  Accepting is
+        therefore the majority behaviour and the conservative one, and index.js records
+        its own divergence.  Only the illegal position - first line of the block,
+        continuing nothing - is refused here, and all three refuse that.
+        """
+        received = raw_exchange(
+            self.port,
+            b"GET /health HTTP/1.1\r\nHost: h\r\nX-A: 1\r\n\tstill-one"
+            b"\r\nConnection: close\r\n\r\n",
+        )
+        status_line, _, _ = parse_raw_response(received)
+        self.assertEqual(status_line, b"HTTP/1.1 200 OK")
+
+    def test_a_header_block_that_never_ends_is_refused(self):
+        """End of stream is not the end of a header block.
+
+        The inherited parser reads it as one and serves the request, so a request that was
+        never finished used to be answered as though it had been.  The JavaScript listener
+        refuses it; so does this one now.
+        """
+        for label, request in (
+            ("a request line and one field", b"GET /health HTTP/1.1\r\nHost: h\r\n"),
+            ("a request line alone", b"GET /health HTTP/1.1\r\n"),
+        ):
+            with self.subTest(case=label):
+                received = self._quietly(raw_exchange_with_eof, request)
+                self._assert_frozen_refusal(received)
+
+    def test_the_transport_header_ceilings_are_unchanged(self):
+        """The pre-parse validation must apply the transport's own limits, not new ones.
+
+        A field line one byte past ``_MAXLINE`` and a block one line past ``_MAXHEADERS``
+        are both 431, at the same counts as before, because those statuses are part of the
+        refusal contract and moving either would move a documented answer.
+        """
+        oversize = (
+            b"GET /health HTTP/1.1\r\nHost: h\r\nX-Filler: "
+            + b"b" * app.MAX_HEADER_LINE_BYTES
+            + b"\r\n\r\n"
+        )
+        received = self._quietly(raw_exchange, oversize)
+        status_line, _, _ = parse_raw_response(received)
+        self.assertEqual(status_line, b"HTTP/1.1 431 Request Header Fields Too Large")
+
+        too_many = (
+            b"GET /health HTTP/1.1\r\n"
+            + b"".join(
+                b"X-Filler-%d: v\r\n" % index for index in range(app.MAX_HEADER_LINES)
+            )
+            + b"\r\n"
+        )
+        received = self._quietly(raw_exchange, too_many)
+        status_line, _, _ = parse_raw_response(received)
+        self.assertEqual(status_line, b"HTTP/1.1 431 Request Header Fields Too Large")
+
+    def test_a_field_block_at_the_ceiling_is_still_served(self):
+        """The line one short of the limit must still be a normal request."""
+        block = b"".join(
+            b"X-Filler-%d: v\r\n" % index for index in range(app.MAX_HEADER_LINES - 2)
+        )
+        received = raw_exchange(
+            self.port,
+            b"GET /health HTTP/1.1\r\nConnection: close\r\n" + block + b"\r\n",
+        )
+        status_line, _, _ = parse_raw_response(received)
+        self.assertEqual(status_line, b"HTTP/1.1 200 OK")
+
+    def test_the_raw_target_is_recorded_before_any_rewriting(self):
+        """The attribute the route decision now reads, asserted directly.
+
+        A handler that stopped populating it would fall back to ``self.path`` and the
+        alias would come back, so the mechanism is worth pinning and not only its effect.
+        """
+        self.assertEqual(app.HealthRequestHandler.raw_target, "")
+        handler = object.__new__(app.HealthRequestHandler)
+        handler.raw_requestline = b"GET //health HTTP/1.1\r\n"
+        self.assertTrue(handler._accept_request_line(handler.raw_requestline))
+        self.assertEqual(handler.raw_target, "//health")
+        self.assertNotEqual(app.normalize_path(handler.raw_target), self.route)
+
+    def test_a_validated_request_still_drains_its_body(self):
+        """The delegation must leave the socket at the first BODY byte, not past it.
+
+        This is the regression the buffer swap could introduce: if the validated block
+        were handed over and the socket left where it was, the drain would re-read the
+        header block as a body; if the socket were consumed past the block, the body would
+        be lost and read as the next request line.  Both requests go out in ONE write, so
+        the body and the following request line are in the same segment - the arrangement
+        that makes a mis-positioned stream fail rather than merely be able to.
+        """
+        received = raw_exchange(
+            self.port,
+            b"POST /health HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello"
+            b"GET /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+        )
+        self.assertEqual(received.count(b"HTTP/1.1 "), 2, msg=repr(received[:240]))
+        refusal, _, document = received.partition(b"HTTP/1.1 200 OK")
+        self.assertIn(b"405 Method Not Allowed", refusal)
+        self.assertIn(b'"status":"UP"', document)
+        self.assertNotIn(b"400 Bad Request", received)
+        self.assertNotIn(b"hello", received)
+
 
 
 class TestPreParseDeadline(HealthServerTestCase):
@@ -3383,6 +3878,311 @@ class TestProbeHardening(unittest.TestCase):
             "app.host": LOOPBACK,
             "python.port": str(port),
         }
+
+
+# Probe identity.  ``probe_rejection`` proves an answer satisfies the frozen
+# contract - which is exactly what ANY conforming implementation would serve.  On its
+# own it therefore grades a different application holding this loopback port healthy
+# and reports this one up while it is down, and because --probe is the container
+# health check, that verdict keeps a dead container in service.
+# ``identity_rejection`` is the step that closes it: the media type must be ours and
+# the two identity fields must be ours.  Every rule is asserted directly AND end to
+# end over a socket, because a rule that holds only in a unit call is a rule the
+# transport can still fail to apply.
+
+
+class TestProbeIdentity(unittest.TestCase):
+    """An answer proves THIS application's health, or it proves nothing."""
+
+    NAME = EXPECTED_DEFAULTS["app.name"]
+    VERSION = EXPECTED_DEFAULTS["app.version"]
+
+    #: The three reasons, written out rather than read from the module, so this is a
+    #: gate on the shared wording and not a mirror of it.  All three
+    #: implementations emit these bytes after their own log prefix.
+    MEDIA_TYPE_REASON = "the answer is not served as application/json"
+    NAME_REASON = "the name field is not this application's name"
+    VERSION_REASON = "the version field is not this application's version"
+
+    def _document(self, name=None, version=None):
+        """Render a conforming health document carrying a stated identity."""
+        return json.dumps(
+            {
+                "name": self.NAME if name is None else name,
+                "version": self.VERSION if version is None else version,
+                "timestamp": "2026-07-28T13:47:08Z",
+                "status": EXPECTED_STATUS,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def _config_for(self, port, name=None, version=None):
+        return {
+            "app.name": self.NAME if name is None else name,
+            "app.version": self.VERSION if version is None else version,
+            "health.path": EXPECTED_DEFAULTS["health.path"],
+            "app.host": LOOPBACK,
+            "python.port": str(port),
+        }
+
+    def _reject(self, content_types, body=None):
+        """Grade an answer against the default identity."""
+        return app.identity_rejection(
+            content_types,
+            self._document() if body is None else body,
+            self.NAME,
+            self.VERSION,
+        )
+
+    def test_the_sole_media_type_of_one_value_strips_parameters_and_folds_case(self):
+        """RFC 9110 sections 8.3, 8.3.1 and 5.6.2, one row each."""
+        accepted = {
+            "application/json": "application/json",
+            "application/json; charset=utf-8": "application/json",
+            "application/json;charset=UTF-8": "application/json",
+            "APPLICATION/JSON": "application/json",
+            "  application/json  ": "application/json",
+            "text/html": "text/html",
+        }
+        for value, expected in accepted.items():
+            with self.subTest(value=value):
+                self.assertEqual(app.sole_media_type([value]), expected)
+
+    def test_no_media_type_and_more_than_one_both_reduce_to_nothing(self):
+        """The rule that keeps the three implementations in step.
+
+        Their clients disagree about a REPEATED ``Content-Type``: this one joins the
+        values with ``", "``, Node keeps the first and discards the rest, and the
+        JDK exposes every one.  Grading whichever value a client surfaced would let
+        one implementation accept a duplicate the other two refused, so every
+        answer that does not name exactly one media type reduces to ``""``.
+        """
+        for values in (
+            (),
+            None,
+            ["application/json", "text/html"],
+            ["text/html", "application/json"],
+            ["application/json", "application/json"],
+            [None],
+            [42],
+        ):
+            with self.subTest(values=values):
+                self.assertEqual(app.sole_media_type(values), "")
+
+    def test_our_own_document_served_as_json_is_accepted(self):
+        """The positive control for every rejection below."""
+        self.assertIsNone(self._reject(["application/json"]))
+        self.assertIsNone(self._reject(["application/json; charset=utf-8"]))
+
+    def test_a_conforming_document_served_as_another_media_type_is_refused(self):
+        for value in ("text/html", "text/plain", "application/health+json", ""):
+            with self.subTest(value=value):
+                self.assertEqual(self._reject([value]), self.MEDIA_TYPE_REASON)
+
+    def test_a_conforming_document_with_no_media_type_at_all_is_refused(self):
+        self.assertEqual(self._reject([]), self.MEDIA_TYPE_REASON)
+        self.assertEqual(self._reject(None), self.MEDIA_TYPE_REASON)
+
+    def test_another_application_s_name_is_refused(self):
+        for name in ("IMPOSTOR", "", self.NAME + "x", self.NAME.upper(), " " + self.NAME):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._reject(["application/json"], self._document(name=name)),
+                    self.NAME_REASON,
+                )
+
+    def test_another_version_of_this_application_is_refused(self):
+        """A rolling deployment is the case that matters: the answer is a valid
+        health document from the same codebase at a different version, so only an
+        exact comparison can tell it apart from this process's own answer."""
+        for version in ("9.9.9", "1.1.1", "1.2.0", "0.1.1"):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    self._reject(["application/json"], self._document(version=version)),
+                    self.VERSION_REASON,
+                )
+
+    def test_the_media_type_is_graded_before_the_identity(self):
+        """The order is part of the contract, so it is asserted rather than
+        assumed: with the framing and both identity fields wrong at once, the
+        framing is what gets reported."""
+        wrong = self._document(name="IMPOSTOR", version="9.9.9")
+        self.assertEqual(self._reject(["text/html"], wrong), self.MEDIA_TYPE_REASON)
+        self.assertEqual(self._reject(["application/json"], wrong), self.NAME_REASON)
+
+    def test_the_name_is_graded_before_the_version(self):
+        wrong = self._document(name="IMPOSTOR", version="9.9.9")
+        self.assertEqual(self._reject(["application/json"], wrong), self.NAME_REASON)
+
+    def test_no_reason_echoes_a_value_the_answer_supplied(self):
+        """A response body is an input, and an input reaching a log line verbatim
+        is how a forged entry gets written."""
+        planted = "QaW002IdentityMarker"
+        bodies = (
+            self._document(name=planted),
+            self._document(version=planted),
+        )
+        for body in bodies:
+            for values in (["application/json"], [planted]):
+                with self.subTest(values=values):
+                    reason = self._reject(values, body)
+                    self.assertIsNotNone(reason)
+                    self.assertNotIn(planted, reason)
+
+    def test_a_body_that_is_not_a_document_fails_closed_on_a_direct_call(self):
+        """Unreachable through ``probe``, which grades shape first, and asserted
+        anyway: this function is exported, so it has to be total."""
+        self.assertIsNotNone(self._reject(["application/json"], b'{"status":"UP"'))
+        self.assertIsNotNone(self._reject(["application/json"], b"[]"))
+        self.assertIsNotNone(self._reject(["application/json"], b"null"))
+        self.assertIsNotNone(self._reject(["application/json"], b""))
+        self.assertIsNotNone(
+            self._reject(["application/json"], b'{"name":' + b"\xc3\x28" + b"}")
+        )
+
+    def test_a_decoy_serving_a_conforming_document_is_refused_end_to_end(self):
+        """The finding itself, over a real socket: a well-formed health document
+        from something that is not this application, on this application's port."""
+        cases = (
+            (self._document(name="IMPOSTOR"), "application/json", self.NAME_REASON),
+            (self._document(version="9.9.9"), "application/json", self.VERSION_REASON),
+            (self._document(), "text/html", self.MEDIA_TYPE_REASON),
+        )
+        for body, content_type, expected in cases:
+            with self.subTest(content_type=content_type):
+                response = http_response(body, content_type=content_type)
+                with StubListener(response) as stub:
+                    stderr = io.StringIO()
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(
+                        stdout
+                    ):
+                        verdict = app.probe(self._config_for(stub.port))
+                written = stderr.getvalue()
+                self.assertEqual(verdict, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(written, f"[app.py] probe rejected: {expected}\n")
+
+    def test_the_real_contract_is_still_healthy_and_silent_end_to_end(self):
+        """The end-to-end positive control: the decoys above must fail because of
+        what they served, not because the identity step refuses everything."""
+        with StubListener(http_response(self._document())) as stub:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                verdict = app.probe(self._config_for(stub.port))
+        self.assertEqual(verdict, 0, msg=stderr.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_a_deployment_that_renames_itself_still_probes_itself_healthy(self):
+        """Identity is compared against the CONFIGURATION, not against a literal,
+        so an overridden name and version are what the probe then requires."""
+        renamed = self._document(name="renamed-service", version="4.5.6")
+        with StubListener(http_response(renamed)) as stub:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                verdict = app.probe(
+                    self._config_for(
+                        stub.port, name="renamed-service", version="4.5.6"
+                    )
+                )
+        self.assertEqual(verdict, 0, msg=stderr.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
+
+
+# The probe body ceiling, from the operator's side.  F-15: the ceiling is what stops
+# an endless stream, so it is deliberately not raised - which means a long enough
+# app.name makes this application's OWN healthy answer too large to read and the
+# probe fail closed on a working process.  The budget is documented in
+# app.config.properties and .env.example, and these tests are what keep the
+# documented arithmetic true.
+
+
+class TestProbeCeilingBudget(unittest.TestCase):
+    """The documented app.name budget is the measured one."""
+
+    #: Bytes of the rendered document that are neither the name nor the version:
+    #: the four keys, the punctuation, the 20-character instant and the status.
+    FIXED_OVERHEAD_BYTES = 73
+
+    def _rendered(self, name, version):
+        """The bytes this application would put on the wire for that identity."""
+        payload = app.build_payload({"app.name": name, "app.version": version})
+        return app.render_payload(payload).encode("utf-8")
+
+    def _rendered_length(self, name, version):
+        return len(self._rendered(name, version))
+
+    def test_the_documented_overhead_is_the_measured_overhead(self):
+        name = EXPECTED_DEFAULTS["app.name"]
+        version = EXPECTED_DEFAULTS["app.version"]
+        self.assertEqual(
+            self._rendered_length(name, version) - len(name) - len(version),
+            self.FIXED_OVERHEAD_BYTES,
+        )
+        self.assertEqual(self._rendered_length(name, version), REFERENCE_BODY_LENGTH)
+
+    def test_the_budget_is_exact_on_both_sides(self):
+        """The largest name whose own answer the probe can still read, and the
+        first one it cannot."""
+        version = EXPECTED_DEFAULTS["app.version"]
+        budget = PROBE_BODY_CEILING - self.FIXED_OVERHEAD_BYTES - len(version)
+        self.assertEqual(self._rendered_length("a" * budget, version), PROBE_BODY_CEILING)
+        self.assertEqual(
+            self._rendered_length("a" * (budget + 1), version), PROBE_BODY_CEILING + 1
+        )
+        self.assertIsNone(
+            app.probe_rejection(200, app.render_payload(
+                app.build_payload({"app.name": "a" * budget, "app.version": version})
+            ).encode("utf-8"))
+        )
+        over = app.render_payload(
+            app.build_payload({"app.name": "a" * (budget + 1), "app.version": version})
+        ).encode("utf-8")
+        self.assertIn("exceeds the probe limit", app.probe_rejection(200, over))
+
+    def test_the_budget_counts_bytes_and_not_characters(self):
+        """An operator setting a name in an astral script spends four bytes per
+        character, which is the part of the budget a character count would miss."""
+        version = EXPECTED_DEFAULTS["app.version"]
+        budget = PROBE_BODY_CEILING - self.FIXED_OVERHEAD_BYTES - len(version)
+        fitting = "\U0001f600" * (budget // 4)
+        # One astral character is four bytes of UTF-8, so the largest whole-character
+        # name that fits is 2028 characters and 8112 bytes, not 8114 of either.
+        self.assertEqual(len(fitting), budget // 4)
+        self.assertEqual(len(fitting.encode("utf-8")), 4 * len(fitting))
+        rendered = self._rendered_length(fitting, version)
+        self.assertLessEqual(rendered, PROBE_BODY_CEILING)
+        self.assertGreater(rendered, PROBE_BODY_CEILING - 4)
+        self.assertIsNone(app.probe_rejection(200, self._rendered(fitting, version)))
+        # One character more crosses the ceiling four bytes at a time.
+        over = fitting + "\U0001f600"
+        self.assertGreater(self._rendered_length(over, version), PROBE_BODY_CEILING)
+        self.assertIn(
+            "exceeds the probe limit",
+            app.probe_rejection(200, self._rendered(over, version)),
+        )
+        # The same character count in ASCII is nowhere near the ceiling, which is
+        # exactly the difference a character-counted budget would hide.
+        self.assertLess(self._rendered_length("a" * len(fitting), version), 4000)
+
+    def test_the_operator_documentation_states_the_measured_numbers(self):
+        """The drift detector.  Two files tell an operator what the budget is; if
+        the arithmetic above changes, they must change with it."""
+        version = EXPECTED_DEFAULTS["app.version"]
+        name_budget = PROBE_BODY_CEILING - self.FIXED_OVERHEAD_BYTES - len(version)
+        pair_budget = PROBE_BODY_CEILING - self.FIXED_OVERHEAD_BYTES
+        here = os.path.dirname(os.path.abspath(__file__))
+        for filename in ("app.config.properties", ".env.example"):
+            with self.subTest(filename=filename):
+                with open(os.path.join(here, filename), encoding="utf-8") as handle:
+                    text = handle.read()
+                for number in (
+                    str(PROBE_BODY_CEILING),
+                    str(self.FIXED_OVERHEAD_BYTES),
+                    str(name_budget),
+                    str(pair_budget),
+                ):
+                    self.assertIn(number, text, msg=f"{filename} omits {number}")
 
 
 if __name__ == "__main__":

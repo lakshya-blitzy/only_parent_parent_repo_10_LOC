@@ -835,8 +835,10 @@ describe("C. path normalisation", () => {
   it("strips an absolute-form authority, which RFC 9112 permits in a request line", () => {
     // A proxy-aware client emits `GET http://host:8001/health HTTP/1.1`. The Java
     // implementation reduced this from the beginning; Python and this module did
-    // not, so the same request reached the route on one implementation and 404'd
-    // on the other two.
+    // not, so before this reduction existed the same request reached the route on
+    // one implementation and 404'd on the other two. It is uniform now: measured
+    // on the wire, all three answer 200 for the configured path and 404 for any
+    // other, in either scheme and whatever authority the line names.
     const cases = {
       "http://host:8001/health": "/health",
       "http://host:8001/health/": "/health",
@@ -1127,9 +1129,11 @@ describe("D2. a server built from non-default configuration", () => {
 // F. Configuration validation and the port grammar. A configuration that cannot be
 // published truthfully is refused BEFORE a socket is bound, so there is no window
 // in which a port is held by a server that would answer 200 with a payload the
-// contract forbids. All three implementations raise, and the message wording is
-// byte-identical across them - an operator greps one deployment's logs, not one
-// language's.
+// contract forbids. All three implementations raise, and the REASON text is
+// byte-identical across them once the per-implementation log prefix is set aside -
+// `[app.py] `, `index.js: ` and `[User] ` differ, and everything after them does
+// not, which is what lets an operator grep one deployment's logs rather than one
+// language's. Measured on all three rather than assumed.
 
 describe("F. configuration validation", () => {
   const NAME_REASON = "invalid app.name: it must be non-empty text with no control character";
@@ -1629,6 +1633,326 @@ describe("G. probe target and answer validation", () => {
   });
 });
 
+// G2. Probe identity and media-type verification. probeRejection above grades the
+// SHAPE of an answer, and a document satisfying that shape is what any conforming
+// implementation serves - so on its own it lets a different application holding
+// this loopback port vouch for this one. Verified before the fix: a decoy serving
+// `"name":"IMPOSTOR"`, one serving `"version":"9.9.9"` and one serving a correct
+// document as text/html all made --probe exit 0 in all three implementations. The
+// identity step closes that, and every assertion below is worded and ordered
+// identically in test_app.py (TestProbeIdentity) and UserTest.java, because the
+// three implementations answer the same container HEALTHCHECK contract.
+
+describe("G2. probe identity and media-type verification", () => {
+  const NAME = app.DEFAULTS["app.name"];
+  const VERSION = app.DEFAULTS["app.version"];
+
+  // The three reasons, written out rather than read from the module, so this is a
+  // gate on the shared wording and not a mirror of it. All three implementations
+  // emit these bytes after their own log prefix.
+  const MEDIA_TYPE_REASON = "the answer is not served as application/json";
+  const NAME_REASON = "the name field is not this application's name";
+  const VERSION_REASON = "the version field is not this application's version";
+
+  const decoys = [];
+
+  after(async () => {
+    await Promise.all(decoys.map((server) => closeServer(server)));
+  });
+
+  /** A conforming health document carrying a stated identity. */
+  function document({ name = NAME, version = VERSION } = {}) {
+    return Buffer.from(
+      JSON.stringify({
+        name,
+        version,
+        timestamp: "2026-07-28T13:47:08Z",
+        status: EXPECTED_STATUS,
+      }),
+      "utf8",
+    );
+  }
+
+  /** Grades an answer against the default identity. */
+  function reject(contentTypes, body = document()) {
+    return app.identityRejection(contentTypes, body, NAME, VERSION);
+  }
+
+  /**
+   * Binds a raw listener that answers with exactly these bytes and header lines.
+   *
+   * net rather than http, because two of the cases below are about the header
+   * block itself - no Content-Type at all, and the field repeated - which the
+   * http server would normalise out of reach.
+   */
+  function decoy({ body, contentTypes = [EXPECTED_CONTENT_TYPE] }) {
+    const lines = [`Content-Length: ${body.length}`];
+    for (const value of contentTypes) {
+      lines.push(`Content-Type: ${value}`);
+    }
+    lines.push("Connection: close");
+    const head = Buffer.from(`HTTP/1.1 200 OK\r\n${lines.join("\r\n")}\r\n\r\n`, "utf8");
+    return new Promise((resolve) => {
+      const server = net.createServer((socket) => {
+        socket.on("error", () => {});
+        socket.on("data", () => socket.end(Buffer.concat([head, body])));
+      });
+      decoys.push(server);
+      server.listen(0, LOOPBACK, () => resolve(server.address().port));
+    });
+  }
+
+  /**
+   * Awaits `work` with stderr captured, returning its result and the text.
+   *
+   * withStderr cannot be used here: probe is asynchronous, so the writer has to
+   * stay swapped across an await. Safe on the same terms - node:test runs the
+   * tests in a file one at a time, and the original writer is restored on every
+   * path including a thrown assertion.
+   */
+  async function withStderrAsync(work) {
+    const original = process.stderr.write;
+    let written = "";
+    process.stderr.write = (chunk) => {
+      written += chunk;
+      return true;
+    };
+    try {
+      const value = await work();
+      return { value, written };
+    } finally {
+      process.stderr.write = original;
+    }
+  }
+
+  /** Probes a decoy port while claiming the given identity. */
+  function probeDecoy(port, { name = NAME, version = VERSION } = {}) {
+    const config = { ...fixedConfig(), name, version };
+    return withStderrAsync(() =>
+      app.probe({ config, host: LOOPBACK, port, timeout: REQUEST_TIMEOUT_MS }),
+    );
+  }
+
+  it("reduces one media type by stripping parameters and folding case", () => {
+    // RFC 9110 sections 8.3, 8.3.1 and 5.6.2, one row each.
+    const rows = {
+      "application/json": "application/json",
+      "application/json; charset=utf-8": "application/json",
+      "application/json;charset=UTF-8": "application/json",
+      "APPLICATION/JSON": "application/json",
+      "  application/json  ": "application/json",
+      "text/html": "text/html",
+    };
+    for (const [value, expected] of Object.entries(rows)) {
+      assert.equal(app.soleMediaType([value]), expected, value);
+    }
+  });
+
+  it("reduces no media type and more than one alike to nothing", () => {
+    // The rule that keeps the three implementations in step. Their clients
+    // disagree about a REPEATED Content-Type: app.py's joins the values with
+    // ", ", res.headers here keeps the first and discards the rest, and the JDK
+    // exposes every one. Grading whichever value a client surfaced would let one
+    // implementation accept a duplicate the other two refused, so every answer
+    // that does not name exactly one media type reduces to "".
+    const rows = [
+      [],
+      undefined,
+      null,
+      ["application/json", "text/html"],
+      ["text/html", "application/json"],
+      ["application/json", "application/json"],
+      [null],
+      [42],
+    ];
+    for (const values of rows) {
+      assert.equal(app.soleMediaType(values), "", JSON.stringify(values ?? null));
+    }
+  });
+
+  it("accepts our own document served as JSON", () => {
+    // The positive control for every rejection below.
+    assert.equal(reject([EXPECTED_CONTENT_TYPE]), null);
+    assert.equal(reject(["application/json; charset=utf-8"]), null);
+  });
+
+  it("refuses a conforming document served as another media type", () => {
+    for (const value of ["text/html", "text/plain", "application/health+json", ""]) {
+      assert.equal(reject([value]), MEDIA_TYPE_REASON, value);
+    }
+  });
+
+  it("refuses a conforming document with no media type at all", () => {
+    assert.equal(reject([]), MEDIA_TYPE_REASON);
+    assert.equal(reject(undefined), MEDIA_TYPE_REASON);
+  });
+
+  it("refuses another application's name", () => {
+    for (const name of ["IMPOSTOR", "", `${NAME}x`, NAME.toUpperCase(), ` ${NAME}`]) {
+      assert.equal(
+        reject([EXPECTED_CONTENT_TYPE], document({ name })),
+        NAME_REASON,
+        JSON.stringify(name),
+      );
+    }
+  });
+
+  it("refuses another version of this application", () => {
+    // A rolling deployment is the case that matters: the answer is a valid health
+    // document from the same codebase at a different version, so only an exact
+    // comparison can tell it apart from this process's own answer.
+    for (const version of ["9.9.9", "1.1.1", "1.2.0", "0.1.1"]) {
+      assert.equal(reject([EXPECTED_CONTENT_TYPE], document({ version })), VERSION_REASON, version);
+    }
+  });
+
+  it("grades the media type before the identity", () => {
+    // The order is part of the contract, so it is asserted rather than assumed:
+    // with the framing and both identity fields wrong at once, the framing is
+    // what gets reported.
+    const wrong = document({ name: "IMPOSTOR", version: "9.9.9" });
+    assert.equal(reject(["text/html"], wrong), MEDIA_TYPE_REASON);
+    assert.equal(reject([EXPECTED_CONTENT_TYPE], wrong), NAME_REASON);
+  });
+
+  it("grades the name before the version", () => {
+    const wrong = document({ name: "IMPOSTOR", version: "9.9.9" });
+    assert.equal(reject([EXPECTED_CONTENT_TYPE], wrong), NAME_REASON);
+  });
+
+  it("never echoes a value the answer supplied", () => {
+    // A response body is an input, and an input reaching a log line verbatim is
+    // how a forged entry gets written.
+    const planted = "QaW002IdentityMarker";
+    for (const body of [document({ name: planted }), document({ version: planted })]) {
+      for (const values of [[EXPECTED_CONTENT_TYPE], [planted]]) {
+        const reason = reject(values, body);
+        assert.notEqual(reason, null);
+        assert.ok(!reason.includes(planted), `${reason} must not echo the supplied value`);
+      }
+    }
+  });
+
+  it("fails closed on a body that is not a document, on a direct call", () => {
+    // Unreachable through probe, which grades shape first, and asserted anyway:
+    // this function is exported, so it has to be total.
+    const shapes = ['{"status":"UP"', "[]", "null", "", Buffer.from([0x7b, 0xc3, 0x28, 0x7d])];
+    for (const shape of shapes) {
+      const body = Buffer.isBuffer(shape) ? shape : Buffer.from(shape, "utf8");
+      assert.notEqual(reject([EXPECTED_CONTENT_TYPE], body), null, String(shape));
+    }
+  });
+
+  it("refuses a decoy serving a conforming document, end to end", async () => {
+    // The finding itself, over a real socket: a well-formed health document from
+    // something that is not this application, on this application's port.
+    const cases = [
+      [document({ name: "IMPOSTOR" }), [EXPECTED_CONTENT_TYPE], NAME_REASON],
+      [document({ version: "9.9.9" }), [EXPECTED_CONTENT_TYPE], VERSION_REASON],
+      [document(), ["text/html"], MEDIA_TYPE_REASON],
+      [document(), [], MEDIA_TYPE_REASON],
+      [document(), [EXPECTED_CONTENT_TYPE, EXPECTED_CONTENT_TYPE], MEDIA_TYPE_REASON],
+    ];
+    for (const [body, contentTypes, expected] of cases) {
+      const port = await decoy({ body, contentTypes });
+      const { value, written } = await probeDecoy(port);
+      assert.equal(value, 1, `${expected}: ${written}`);
+      assert.equal(written, `index.js: probe rejected: ${expected}\n`);
+    }
+  });
+
+  it("still reports the real contract healthy and silent, end to end", async () => {
+    // The end-to-end positive control: the decoys above must fail because of what
+    // they served, not because the identity step refuses everything.
+    const port = await decoy({ body: document() });
+    const { value, written } = await probeDecoy(port);
+    assert.equal(value, 0, written);
+    assert.equal(written, "");
+  });
+
+  it("still probes healthy for a deployment that renames itself", async () => {
+    // Identity is compared against the CONFIGURATION, not against a literal, so
+    // an overridden name and version are what the probe then requires.
+    const renamed = { name: "renamed-service", version: "4.5.6" };
+    const port = await decoy({ body: document(renamed) });
+    const { value, written } = await probeDecoy(port, renamed);
+    assert.equal(value, 0, written);
+    assert.equal(written, "");
+  });
+
+  // The probe body ceiling, from the operator's side. F-15: the ceiling is what
+  // stops an endless stream, so it is deliberately not raised - which means a long
+  // enough app.name makes this application's OWN healthy answer too large to read
+  // and the probe fail closed on a working process. The budget is documented in
+  // app.config.properties and .env.example, and the assertions below are what keep
+  // the documented arithmetic true.
+
+  //  Bytes of the rendered document that are neither the name nor the version: the
+  //  four keys, the punctuation, the 20-character instant and the status.
+  const FIXED_OVERHEAD_BYTES = 73;
+
+  function renderedFor(name, version) {
+    return Buffer.byteLength(
+      app.renderPayload(app.buildPayload({ ...fixedConfig(), name, version })),
+      "utf8",
+    );
+  }
+
+  it("renders the documented overhead, measured rather than asserted", () => {
+    assert.equal(renderedFor(NAME, VERSION) - NAME.length - VERSION.length, FIXED_OVERHEAD_BYTES);
+    assert.equal(renderedFor(NAME, VERSION), DEFAULT_BODY_BYTE_LENGTH);
+  });
+
+  it("puts the app.name budget exactly where the documentation puts it", () => {
+    const budget = app.MAX_PROBE_BODY_BYTES - FIXED_OVERHEAD_BYTES - VERSION.length;
+    assert.equal(renderedFor("a".repeat(budget), VERSION), app.MAX_PROBE_BODY_BYTES);
+    assert.equal(renderedFor("a".repeat(budget + 1), VERSION), app.MAX_PROBE_BODY_BYTES + 1);
+    const fitting = Buffer.from(
+      app.renderPayload(app.buildPayload({ ...fixedConfig(), name: "a".repeat(budget) })),
+      "utf8",
+    );
+    assert.equal(app.probeRejection(200, fitting), null);
+    const over = Buffer.from(
+      app.renderPayload(app.buildPayload({ ...fixedConfig(), name: "a".repeat(budget + 1) })),
+      "utf8",
+    );
+    assert.match(app.probeRejection(200, over), /^body exceeds the probe limit/);
+  });
+
+  it("counts the budget in bytes and not in characters", () => {
+    // An operator setting a name in an astral script spends four bytes per
+    // character, which is the part of the budget a character count would miss.
+    const budget = app.MAX_PROBE_BODY_BYTES - FIXED_OVERHEAD_BYTES - VERSION.length;
+    const fitting = "\u{1f600}".repeat(Math.floor(budget / 4));
+    assert.equal(Buffer.byteLength(fitting, "utf8"), 4 * [...fitting].length);
+    const rendered = renderedFor(fitting, VERSION);
+    assert.ok(rendered <= app.MAX_PROBE_BODY_BYTES, String(rendered));
+    assert.ok(rendered > app.MAX_PROBE_BODY_BYTES - 4, String(rendered));
+    assert.ok(renderedFor(`${fitting}\u{1f600}`, VERSION) > app.MAX_PROBE_BODY_BYTES);
+    // The same character count in ASCII is nowhere near the ceiling, which is
+    // exactly the difference a character-counted budget would hide.
+    assert.ok(renderedFor("a".repeat([...fitting].length), VERSION) < 4000);
+  });
+
+  it("states the measured numbers in the two files an operator reads", () => {
+    // The drift detector. If the arithmetic above changes, the documentation an
+    // operator sets app.name from must change with it.
+    const version = VERSION.length;
+    const numbers = [
+      String(app.MAX_PROBE_BODY_BYTES),
+      String(FIXED_OVERHEAD_BYTES),
+      String(app.MAX_PROBE_BODY_BYTES - FIXED_OVERHEAD_BYTES - version),
+      String(app.MAX_PROBE_BODY_BYTES - FIXED_OVERHEAD_BYTES),
+    ];
+    for (const filename of ["app.config.properties", ".env.example"]) {
+      const text = fs.readFileSync(path.join(__dirname, filename), "utf8");
+      for (const number of numbers) {
+        assert.ok(text.includes(number), `${filename} omits ${number}`);
+      }
+    }
+  });
+});
+
 // H. Listener budgets and connection reuse. Node's defaults leave a half-sent
 // request holding a socket for a minute and a complete one for five, far longer
 // than a health endpoint needs and long enough to be worth a peer's while, so the
@@ -1733,6 +2057,305 @@ describe("H. listener budgets and connection reuse", () => {
     };
     try {
       await reusedConnection(REFUSED_WITH_BODY, FOLLOWING_GET);
+    } finally {
+      process.stderr.write = original;
+    }
+    assert.equal(written, "");
+  });
+});
+
+describe("H2. transport-level refusals the handler never sees", () => {
+  // `node:http` frames a request and validates its method token in its own parser
+  // before any listener this file installs is consulted, so several request
+  // shapes are decided by the transport and never reach the handler at all. The
+  // module docblock enumerates them as four numbered items and states that this
+  // suite pins them - so these tests are what make that record a checked claim
+  // rather than a comment. Every item is covered here, including the one where
+  // this runtime is LOOSER than the other two rather than stricter.
+  //
+  // The values below were established by execution against a server built
+  // exactly the way the server here is built. They are pinned for the same
+  // reason UserTest.java pins the JDK's own rejection bodies: a behaviour that
+  // no line of this file composes, that a monitor can nonetheless observe, is
+  // one whose description has to be held by a test or it silently rots. A
+  // runtime upgrade that widens or narrows the parser's method table will fail
+  // these assertions, which is the point - it is a fact to re-record, not a
+  // regression in this file.
+
+  let server;
+  let port;
+
+  before(async () => {
+    server = app.createServer(fixedConfig());
+    port = await listen(server);
+  });
+
+  after(async () => {
+    await closeServer(server);
+    assert.equal(server.listening, false, "the test server must not be left listening");
+  });
+
+  /**
+   * The COMPLETE transport-level refusal, as bytes on the wire.
+   *
+   * Asserted whole rather than piecewise: one equality pins the status line, the
+   * single header field, the absence of every other field and the empty body at
+   * once, and cannot be satisfied by a response that merely contains the right
+   * status. Note what is absent - no Allow, no Content-Length, no media type, no
+   * Server banner, no Date, and nothing at all taken from the request.
+   */
+  const PARSER_REFUSAL_WIRE = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+
+  /** A token the parser rejects, spelled so a leak of it would be unmistakable. */
+  const ECHO_MARKER = "QaW002TransportMarker";
+
+  /**
+   * Writes one request down a fresh connection and resolves everything observed.
+   *
+   * Resolution is on `close` rather than on `end`, because one of the shapes
+   * under test is answered by destroying the socket: waiting for a graceful end
+   * would hang on exactly the case worth measuring. The timeout flag is carried
+   * out separately from the byte count so that "the peer closed promptly" and
+   * "nothing happened for four seconds" cannot be confused - a destroyed
+   * connection and a hung one both yield zero bytes, and only one of them is
+   * the documented behaviour.
+   *
+   * @param {string} wire Raw request bytes, terminators included.
+   * @returns {Promise<{received: Buffer, timedOut: boolean}>} What came back.
+   */
+  function rawExchange(wire) {
+    return new Promise((resolve) => {
+      const parts = [];
+      let timedOut = false;
+      const socket = net.connect(port, LOOPBACK, () => socket.write(wire));
+      socket.on("data", (chunk) => parts.push(chunk));
+      // A destroyed connection surfaces as ECONNRESET on some platforms and as a
+      // clean close on others; both are the same observation here, so the error
+      // is absorbed and the assertion is made on the bytes.
+      socket.on("error", () => {});
+      socket.on("close", () => resolve({ received: Buffer.concat(parts), timedOut }));
+      socket.setTimeout(REQUEST_TIMEOUT_MS, () => {
+        timedOut = true;
+        socket.destroy();
+      });
+    });
+  }
+
+  /** Asserts that a request was refused by the parser, byte for byte. */
+  async function assertParserRefusal(wire, label) {
+    const { received, timedOut } = await rawExchange(wire);
+    const text = received.toString("latin1");
+    assert.equal(timedOut, false, `${label}: the refusal must be immediate`);
+    assert.equal(text, PARSER_REFUSAL_WIRE, label);
+    assert.equal(received.length, 47, `${label}: byte count`);
+    assert.ok(!text.includes(ECHO_MARKER), `${label}: nothing from the request is echoed`);
+  }
+
+  /** Asserts that a request reached the handler and got the frozen 405. */
+  async function assertFrozenRefusal(wire, label) {
+    const { received, timedOut } = await rawExchange(wire);
+    const text = received.toString("latin1");
+    assert.equal(timedOut, false, `${label}: the answer must be immediate`);
+    assert.match(text, /^HTTP\/1\.1 405 Method Not Allowed\r\n/, label);
+    assert.ok(text.endsWith(METHOD_NOT_ALLOWED_BODY), `${label}: exact frozen body`);
+    assert.match(text, /^Allow: GET\r?$/im, `${label}: Allow: GET`);
+    const headEnd = text.indexOf("\r\n\r\n");
+    const names = text
+      .slice(0, headEnd)
+      .split("\r\n")
+      .slice(1)
+      .map((line) => line.slice(0, line.indexOf(":")).toLowerCase())
+      .sort();
+    assert.deepEqual(names, REFUSAL_HEADER_NAMES.slice().sort(), `${label}: header names`);
+  }
+
+  it("registers no parser hook, so neither behaviour is application-reachable", () => {
+    // The claim in the docblock is that these outcomes cannot be intercepted
+    // from here. That is only true while nothing is listening for them, so the
+    // absence of a listener is asserted rather than assumed - installing one
+    // later would change the wire and must break a test, not pass quietly.
+    assert.equal(server.listenerCount("connect"), 0, "no connect listener");
+    assert.equal(server.listenerCount("clientError"), 0, "no clientError listener");
+    assert.equal(server.listenerCount("checkContinue"), 0, "no checkContinue listener");
+  });
+
+  it("refuses a method token outside the parser's table with an empty 400", async () => {
+    await assertParserRefusal(
+      `${ECHO_MARKER} /health HTTP/1.1\r\nHost: h\r\n\r\n`,
+      "an invented method token",
+    );
+    await assertParserRefusal(
+      "FROBNICATE /health HTTP/1.1\r\nHost: h\r\n\r\n",
+      "the token named in the report",
+    );
+  });
+
+  it("refuses a lower- or mixed-case spelling of a token it otherwise knows", async () => {
+    // The table is case-sensitive: `get` is not GET. app.py and User.java treat
+    // the token as opaque, find it is not GET, and answer the frozen 405, so
+    // this is a real cross-language divergence and is recorded as one.
+    for (const token of ["get", "Get", "gET", "post"]) {
+      await assertParserRefusal(
+        `${token} /health HTTP/1.1\r\nHost: h\r\n\r\n`,
+        `the token ${token}`,
+      );
+    }
+  });
+
+  it("refuses it identically on the health route and on an unknown target", async () => {
+    // Method is decided before route on all three implementations. Here that is
+    // the parser's doing rather than the handler's, and the consequence is the
+    // same: the target cannot influence the answer, so a scanner learns nothing
+    // about which routes exist by varying the verb.
+    await assertParserRefusal(
+      `${ECHO_MARKER} / HTTP/1.1\r\nHost: h\r\n\r\n`,
+      "an invented token on the root",
+    );
+    await assertParserRefusal(
+      `${ECHO_MARKER} /nothing-here HTTP/1.1\r\nHost: h\r\n\r\n`,
+      "an invented token on an unknown target",
+    );
+  });
+
+  it("still answers the frozen 405 for every unusual token that IS in the table", async () => {
+    // The boundary is the table, not novelty. If these ever started drawing the
+    // empty 400 the docblock's example list would be wrong, and the endpoint
+    // would have quietly stopped answering the contract for six methods.
+    for (const token of ["LOCK", "PURGE", "M-SEARCH", "PATCH", "TRACE", "OPTIONS", "DELETE"]) {
+      await assertFrozenRefusal(
+        `${token} /health HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n`,
+        `the in-table token ${token}`,
+      );
+    }
+  });
+
+  it("destroys the connection for CONNECT in either request form", async () => {
+    // CONNECT asks a listener to proxy traffic. With no `connect` listener the
+    // runtime destroys the socket instead of answering, which is the strictest
+    // outcome available and the one this endpoint wants: it cannot be talked
+    // into becoming a tunnel. Zero bytes AND a prompt close are both asserted,
+    // so a future runtime that merely stalled would fail here.
+    for (const [label, wire] of [
+      ["authority form", "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"],
+      ["origin form", "CONNECT /health HTTP/1.1\r\nHost: h\r\n\r\n"],
+    ]) {
+      const { received, timedOut } = await rawExchange(wire);
+      assert.equal(received.length, 0, `CONNECT ${label}: no response at all`);
+      assert.equal(timedOut, false, `CONNECT ${label}: the connection is closed, not left open`);
+    }
+  });
+
+  it("gives every other framing fault that same minimal shape", async () => {
+    // Docblock item 3. The empty 400 is not specific to a method token: it is the
+    // shape the parser uses for every framing fault it decides. Pinning the set
+    // together is what makes that a statement about the shape rather than a
+    // coincidence about one input, and it is why the docblock can describe the
+    // refusal once instead of per case.
+    const HOST = "Host: h\r\n";
+    for (const [label, wire] of [
+      ["a bare-LF terminator", "GET /health HTTP/1.1\nHost: h\n\n"],
+      ["a four-token request line", `GET /health HTTP/1.1 extra\r\n${HOST}\r\n`],
+      ["a TAB delimiter", `GET\t/health\tHTTP/1.1\r\n${HOST}\r\n`],
+      ["a VERTICAL TAB delimiter", `GET\x0b/health HTTP/1.1\r\n${HOST}\r\n`],
+      ["an unparsable HTTP version", `GET /health HTTP/9.9\r\n${HOST}\r\n`],
+      ["whitespace before a field colon", `GET /health HTTP/1.1\r\n${HOST}X-A : 1\r\n\r\n`],
+      ["an obs-fold as the first field line", `GET /health HTTP/1.1\r\n\tfold\r\n${HOST}\r\n`],
+    ]) {
+      await assertParserRefusal(wire, label);
+    }
+  });
+
+  it("refuses header bytes past its own ceiling with the same shape and 431", async () => {
+    // Also docblock item 3. The ceiling is a byte budget, not a field count, and
+    // the distinction is worth pinning because it is where the three
+    // implementations disagree most: app.py refuses at 100 header lines,
+    // User.java at 200 distinct field names, and this one at http.maxHeaderSize.
+    const oversized = `GET /health HTTP/1.1\r\nHost: h\r\nX-A: ${"z".repeat(20000)}\r\n\r\n`;
+    const { received } = await rawExchange(oversized);
+    assert.equal(
+      received.toString("latin1"),
+      "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n",
+      "an oversized header block draws the minimal 431",
+    );
+
+    // Many small fields are NOT refused: the budget is on bytes seen, and the
+    // count alone is not a fault. A change here would make the docblock's
+    // "no ceiling on the NUMBER of fields" wrong.
+    const many = `GET /health HTTP/1.1\r\nHost: h\r\n${"X-A: 1\r\n".repeat(300)}Connection: close\r\n\r\n`;
+    const crowded = await rawExchange(many);
+    assert.match(crowded.received.toString("latin1"), /^HTTP\/1\.1 200 OK\r\n/, "300 fields are served");
+  });
+
+  it("accepts the two-token HTTP/0.9 request line the other two refuse", async () => {
+    // Docblock item 4, and the ONE place this runtime is looser rather than
+    // stricter. It is asserted rather than left unstated so that the divergence
+    // is a recorded, checked fact: app.py and User.java both answer 400 here.
+    // What matters for the contract is that the answer is still the frozen 200
+    // and still discloses nothing more than the health document.
+    const { received, timedOut } = await rawExchange("GET /health\r\n\r\n");
+    const text = received.toString("latin1");
+    assert.equal(timedOut, false, "the answer is immediate");
+    assert.match(text, /^HTTP\/1\.1 200 OK\r\n/, "the frozen 200, not a refusal");
+    const body = text.slice(text.indexOf("\r\n\r\n") + 4);
+    assert.equal(Buffer.byteLength(body), DEFAULT_BODY_BYTE_LENGTH, "the frozen body length");
+    assert.equal(JSON.parse(body).status, EXPECTED_STATUS);
+    assert.deepEqual(Object.keys(JSON.parse(body)), EXPECTED_KEYS, "the frozen key set");
+  });
+
+  it("refuses a hostless HTTP/1.1 request, and that one refusal carries a Date", async () => {
+    // Docblock item 5, and the exception to item 3's shape: the host requirement
+    // is enforced on the normal response path, so this 400 is chunked and dated
+    // where the parser's own refusals are neither. It is pinned precisely because
+    // it is the ONLY response this program emits that carries a Date - writeJson
+    // suppresses that field, and this response does not come from writeJson.
+    const { received, timedOut } = await rawExchange("GET /health HTTP/1.1\r\n\r\n");
+    const text = received.toString("latin1");
+    assert.equal(timedOut, false, "the refusal is immediate");
+    assert.match(text, /^HTTP\/1\.1 400 Bad Request\r\n/, "a hostless 1.1 request is refused");
+    const headEnd = text.indexOf("\r\n\r\n");
+    const names = text
+      .slice(0, headEnd)
+      .split("\r\n")
+      .slice(1)
+      .map((line) => line.slice(0, line.indexOf(":")).toLowerCase())
+      .sort();
+    assert.deepEqual(names, ["connection", "date", "transfer-encoding"], "the refusal's fields");
+    assert.equal(text.slice(headEnd + 4), "0\r\n\r\n", "an empty chunked body");
+    assert.ok(!/"status"/.test(text), "no health document is disclosed");
+
+    // HTTP/1.0 needs no Host, and is served rather than refused. Without this the
+    // assertion above could be satisfied by a server that refused every request.
+    // The status line reads 1.1 even to a 1.0 client - measured identical in all
+    // three implementations, so it is asserted rather than assumed to echo.
+    const legacy = await rawExchange("GET /health HTTP/1.0\r\n\r\n");
+    const legacyText = legacy.received.toString("latin1");
+    assert.match(legacyText, /^HTTP\/1\.1 200 OK\r\n/, "a hostless 1.0 request is served");
+    assert.ok(legacyText.endsWith('"status":"UP"}'), "and served the frozen document");
+  });
+
+  it("leaves the listener healthy and the contract intact after every refusal", async () => {
+    // A refusal that poisoned the listener would be worse than the request it
+    // refused, so the frozen 200 is re-checked on a fresh connection afterwards.
+    const response = await request({ port, path: "/health" });
+    assert.equal(response.status, 200);
+    assert.equal(Buffer.byteLength(response.body), DEFAULT_BODY_BYTE_LENGTH);
+    assert.equal(JSON.parse(response.body).status, EXPECTED_STATUS);
+    assert.deepEqual(response.headerNames.map((n) => n.toLowerCase()).sort(), CONTRACT_HEADER_NAMES.slice().sort());
+  });
+
+  it("writes no diagnostic while the transport refuses a request", async () => {
+    // These refusals are the runtime's, not this program's. A line on stderr for
+    // each one would make a port scan a log flood and would fail a clean-output
+    // check, so the absence of one is asserted rather than hoped for.
+    const original = process.stderr.write;
+    let written = "";
+    process.stderr.write = (chunk) => {
+      written += chunk;
+      return true;
+    };
+    try {
+      await rawExchange(`${ECHO_MARKER} /health HTTP/1.1\r\nHost: h\r\n\r\n`);
+      await rawExchange("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
     } finally {
       process.stderr.write = original;
     }
@@ -2384,6 +3007,11 @@ describe("I. mode dispatch through the real entry point", () => {
   it("the --probe flag exits 0 against a well-formed answer from the same harness", async () => {
     // The control for the two rows above: the hostile harness itself is not what
     // makes them fail. Same server, same code path, a well-formed body, exit 0.
+    //
+    // APP_NAME and APP_VERSION are set to the identity this body carries, because
+    // the probe grades identity as well as shape - a conforming document naming a
+    // DIFFERENT application proves nothing about this one. Without them this control
+    // would fail for the right reason and hide the fact it is a control.
     const wellFormed = Buffer.from(
       '{"name":"n","version":"1.1.0","timestamp":"2026-07-29T08:00:00Z","status":"UP"}',
       "utf8",
@@ -2391,7 +3019,12 @@ describe("I. mode dispatch through the real entry point", () => {
     const { server, port } = await serveExactBody(wellFormed);
     const probed = await runChild(
       ["index.js", "--probe"],
-      childEnv({ APP_HOST: LOOPBACK, PORT: String(port) }),
+      childEnv({
+        APP_HOST: LOOPBACK,
+        PORT: String(port),
+        APP_NAME: "n",
+        APP_VERSION: "1.1.0",
+      }),
     );
     await new Promise((resolve) => server.close(() => resolve()));
 

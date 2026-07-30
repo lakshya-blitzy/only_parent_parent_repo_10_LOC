@@ -5,8 +5,10 @@
 # PURPOSE
 #   This is acceptance gate G9. It starts one application at a time in --serve
 #   mode, polls until the listener answers, asserts the complete frozen response
-#   contract, asserts the unknown-path and wrong-method behaviours, and shuts the
-#   server down on every exit path.
+#   contract, asserts that no alternative spelling of the route reaches it, asserts
+#   that the absolute-form target reaches the route its path names while the
+#   authority it carries changes nothing, asserts the unknown-path and wrong-method
+#   behaviours, and shuts the server down on every exit path.
 #
 #   It is deliberately ONE file rather than three. A single shared assertion set
 #   is what guarantees the Python, JavaScript and Java implementations cannot
@@ -32,7 +34,15 @@
 #   Route          the RESOLVED health path (default /health); the query string
 #                  is stripped before matching and exactly ONE trailing slash is
 #                  accepted, so <path>, <path>/ and <path>?x=1 all answer 200
-#                  while <path>// answers 404
+#                  while <path>// answers 404. A LEADING extra slash is not the
+#                  route either: //<path>, ///<path> and //<path>/ all answer
+#                  404, because RFC 3986 section 4.2 reads a leading // as an
+#                  authority rather than a path
+#   Absolute form  RFC 9112 section 3.2.2's GET http://host/<path> reaches the
+#                  same route the origin form reaches, and the authority is
+#                  DISCARDED rather than inspected: a foreign host, userinfo, an
+#                  unbound port and a foreign scheme all still answer 200, while
+#                  an unknown path under a foreign authority still answers 404
 #   Method         GET only; any other method answers 405 with an Allow header
 #   Success        200
 #   Headers        Content-Type: application/json
@@ -59,11 +69,15 @@
 # EXIT CODES
 #   0  every selected language satisfied every assertion
 #   1  an assertion failed, or an operational error occurred (a runtime is
-#      missing, a server did not become ready, no JSON reader is available).
-#      The first failure exits immediately: no gate here is advisory, and no
-#      failed assertion is ever retried.
+#      missing, a server did not become ready, the server this script launched
+#      stopped running, the endpoint kept answering after that server was stopped,
+#      no JSON reader is available). The first failure exits
+#      immediately: no gate here is advisory, and no failed assertion is ever
+#      retried.
 #   2  a usage or configuration error - the arguments or the environment cannot
-#      produce a meaningful run, and nothing was started.
+#      produce a meaningful run, and nothing was started. This includes a target
+#      port that is already in use (see ATTRIBUTION below) and a health path the
+#      frozen contract cannot be asserted against (see ROUTE REDUCTION below).
 #
 # ENVIRONMENT VARIABLES HONOURED
 #   Precedence for every value is: environment variable > app.config.properties >
@@ -134,6 +148,69 @@
 #   writing a body on a HEAD response, so asserting HEAD would risk this gate
 #   failing for a runtime quirk rather than for a contract violation. Gates must
 #   fail only for real reasons.
+#
+# ATTRIBUTION - A PASS MUST BELONG TO THIS REPOSITORY'S SERVER
+#   A gate that certifies an implementation it never exercised is worse than no
+#   gate, and a shared runner makes that failure mode ordinary rather than
+#   exotic: a previous job, a sidecar, a developer's stray process or a parallel
+#   checkout can already hold the port this script is about to use. Every runtime
+#   here refuses to start in that situation - measured, one per language:
+#     [app.py] cannot start the health server: [Errno 98] Address already in use
+#     index.js: cannot start the health server: could not bind 127.0.0.1:8001 (EADDRINUSE)
+#     [User] could not bind 127.0.0.1:8002: BindException
+#   while the foreign listener happily answers every assertion. Three checks make
+#   that impossible, and ALL THREE are required:
+#
+#   1. PRE-FLIGHT (preflight_authority, the load-bearing half). Before a child is
+#      launched, one GET is sent to the exact URL the assertions will use and
+#      curl's own %{num_connects} counter is read. A count of zero means nothing
+#      accepted a connection, so the port is free; one or more means something
+#      already owns it and this run would prove nothing, so the script exits 2
+#      before starting anything. The counter - not the HTTP status, and not
+#      curl's exit code - is the signal, because it is the only one that is true
+#      for every kind of squatter: measured with curl 8.14.1, a live HTTP server
+#      gives 1 (exit 0), a peer that accepts and never replies gives 1 (exit 28),
+#      a peer that closes immediately gives 1 (exit 56), while a refused
+#      connection and an unresolvable host both give 0 (exits 7 and 6), which is
+#      exactly where this script must stay out of the way and let the child's own
+#      bind failure produce the diagnosis.
+#   2. LIVENESS (assert_child_alive). The child is re-checked immediately after
+#      readiness succeeds and again after every assertion has passed, before any
+#      PASS line is printed. A dead child means the endpoint that answered was
+#      not the one this script started, so the verdict is withheld, and the
+#      child's own stderr - which names the bind refusal verbatim - is dumped
+#      alongside the failure so the cause is never left to guesswork.
+#   3. RELEASE (assert_endpoint_released). After the child has been stopped and
+#      reaped, and before the PASS line is printed, the same URL is probed once
+#      more: it MUST have gone quiet. The only process this script started is
+#      gone, so anything still answering served the assertions above and is not
+#      this repository.
+#
+#   None of the three can be dropped. The pre-flight cannot be replaced by the
+#   liveness check, because `java User.java --serve` compiles before it binds and
+#   is therefore still alive at the moment a foreign listener satisfies readiness.
+#   The liveness check cannot be replaced by the pre-flight, because it is what
+#   names a child that died - EADDRINUSE included - with the child's own words.
+#   And neither of the first two can be replaced by, or replace, the release
+#   check: they observe the tracked pid, whereas only the release check observes
+#   the socket, which is what a listener detached from that pid - or a squatter
+#   that bound in the window between the pre-flight and the child's own bind -
+#   would still be holding. Being observed after the child is gone is proof;
+#   the first two layers are inference (standard S7).
+#
+# ROUTE REDUCTION - THE ASSERTED ROUTE IS THE ROUTE THAT IS SERVED
+#   A CONFIGURED health path is reduced here exactly as config_route() in app.py,
+#   configRoute() in index.js and configRoute() in User.java reduce it: at most
+#   ONE trailing slash is removed. That is what keeps `--path /health/` meaning
+#   the same route to this script as it means to all three applications.
+#   Three configured forms are refused outright with exit 2, because the frozen
+#   probe pair below - <path>/ must answer 200 and <path>// must answer 404 -
+#   cannot be satisfied by any route that itself ends in a slash, and a gate must
+#   never report a configuration fault as an application fault:
+#     a path of only slashes (/ or //)   the site root; no named route
+#     a path still ending in / after the single reduction (e.g. /health//)
+#     a path beginning with //           all three refuse a network-path
+#                                        reference (RFC 3986) outright
 #
 # STANDARDS
 #   The asserted contract follows draft-inadarei-api-health-check-06: a JSON
@@ -250,6 +327,13 @@ readonly READINESS_POLL_INTERVAL="0.25"       # 4 attempts per second
 # its own timeout expires, so without a short cap here one attempt could swallow
 # the entire readiness budget and --timeout would stop meaning what it says.
 readonly READINESS_PROBE_MAX_TIME="2"
+# Bounds the single pre-flight exchange. It has to be short because it is paid on
+# every language of every run, and it can be short because the answer arrives in
+# microseconds either way: a free port refuses the connection immediately and an
+# occupied one accepts it immediately. Only a peer that accepts and then says
+# nothing costs the full window, and that peer is precisely the squatter this
+# check exists to catch.
+readonly PREFLIGHT_MAX_TIME="2"
 readonly SHUTDOWN_POLL_ATTEMPTS="8"           # 8 x 0.25s = ~2s before SIGKILL
 readonly CURL_MAX_TIME="10"                   # bounds every exchange
 readonly LOG_TAIL_LINES="20"
@@ -287,6 +371,9 @@ TIMEOUT_SECONDS=""
 HTTP_CODE=""             # set by http_request
 HTTP_CURL_RC="0"         # curl's own exit status, for precise diagnostics
 
+PROBE_CONNECTS="0"       # set by probe_authority: TCP connections established
+PROBE_CURL_RC="0"        # and curl's own exit status for that probe
+
 # =============================================================================
 # Reporting
 # =============================================================================
@@ -312,10 +399,18 @@ Options:
                     (default: app.host, currently $DEFAULT_APP_HOST; a wildcard bind is
                     connected to on 127.0.0.1)
   --port PORT       port for the server under test. Legal only when EXACTLY ONE
-                    language is selected: three servers cannot share one port
+                    language is selected: three servers cannot share one port.
+                    A port that something else already holds is refused (exit 2)
+                    before any server is started, because a result obtained from
+                    a foreign listener would not belong to this repository
   --path PATH       health route to serve and to assert (default: health.path,
                     currently $DEFAULT_HEALTH_PATH). The value is exported to the server, so
-                    the route asserted is the route served
+                    the route asserted is the route served. One trailing slash is
+                    removed, exactly as all three applications reduce a
+                    configured path; '/', '//', a path still ending in '/' after
+                    that reduction, and a path beginning with '//' are refused
+                    (exit 2), because no such route can satisfy the frozen
+                    trailing-slash probe pair
   --timeout SEC     readiness budget per language, in seconds (default $DEFAULT_TIMEOUT_SECONDS).
                     This bounds how long the listener may take to answer; it
                     never retries a failed assertion
@@ -439,6 +534,34 @@ stop_server() {
   # not an assertion outcome. Nothing else in this file suppresses a status.
   wait "$pid" 2>/dev/null || true
   return 0
+}
+
+# assert_child_alive: the server that answered is the server this script started.
+#
+# This is the attribution half of the fail-closed guarantee described in the
+# header. `kill -0` asks the kernel whether the pid can be signalled without
+# sending anything, which is the cheapest possible liveness test and needs no
+# tool at all. A `--serve` process runs until it is terminated, so a child that
+# has exited on its own has failed to start - a bind refusal is by far the most
+# common reason - and any answer that arrived came from somewhere else. The
+# verdict is therefore withheld rather than reported.
+#
+#   $1 label (the language), $2 the stage, phrased to complete the sentence
+#      "the server ... is no longer running <stage>"
+assert_child_alive() {
+  local label="$1" stage="$2"
+
+  # No managed child means nothing to attribute: stop_server clears the pid once
+  # the language is finished, and this must not turn that into a failure.
+  if [ -z "$SERVER_PID" ]; then
+    return 0
+  fi
+  if kill -0 "$SERVER_PID" 2>/dev/null; then
+    return 0
+  fi
+
+  dump_server_log "$label"
+  fail "$label: the server this script started is no longer running $stage, so whatever answered is not this repository's server and a PASS would not be attributable to it - a bind refusal (EADDRINUSE) looks exactly like this; the server's own message above says which it was"
 }
 
 # cleanup: the EXIT trap. Runs on success, on a failed assertion, on an
@@ -620,6 +743,65 @@ resolve_configuration() {
       usage_error "the resolved health path '$RESOLVED_PATH' must not contain whitespace, '?' or '#'"
       ;;
   esac
+
+  # ------------------------------------------------------------------------- #
+  # Route reduction and the three forms that cannot be asserted at all.
+  #
+  # The reduction is not a convenience: this script EXPORTS the resolved path to
+  # the server it starts, so a path it did not reduce the way the applications
+  # reduce it would mean asserting one route while the server serves another. See
+  # ROUTE REDUCTION in the header.
+  #
+  # The refusals exist because the frozen contract asserts a PAIR - <path>/ must
+  # answer 200 and <path>// must answer 404 - and no route that itself ends in a
+  # slash can satisfy both, since the applications' single-slash reduction maps
+  # the two probes onto the same route. Left unvalidated, that configuration
+  # fault surfaces as an application failure ("expected 404 ... returned 200"),
+  # which blames the code for something the caller chose. Exit 2, not 1: nothing
+  # has been started, and the remedy is to change the argument.
+  # ------------------------------------------------------------------------- #
+  local requested="$RESOLVED_PATH" reduced suggestion
+
+  case "$requested" in
+    *[!/]*) ;;
+    *)
+      usage_error "the resolved health path '$requested' is nothing but slashes, so it names no route to assert - it is the site root, and the frozen contract has no assertion for the site root. Give a named route such as '$DEFAULT_HEALTH_PATH'."
+      ;;
+  esac
+
+  case "$requested" in
+    //*)
+      # RFC 3986 section 4.2: a reference beginning '//' is a network-path
+      # reference, where what follows is an authority rather than a path. All
+      # three applications refuse it, so accepting it here would guarantee a
+      # server that never starts.
+      usage_error "the resolved health path '$requested' begins with '//', which RFC 3986 reads as a network-path reference rather than a path; all three applications refuse it outright, so no server would start. Use a single leading slash."
+      ;;
+  esac
+
+  # Exactly one trailing slash, matching the applications. The result is validated
+  # BEFORE it is announced, so a reduction that is about to be refused is never
+  # reported as though it had been accepted.
+  reduced="${requested%/}"
+
+  case "$reduced" in
+    */)
+      suggestion="$reduced"
+      while [ "${suggestion%/}" != "$suggestion" ]; do
+        suggestion="${suggestion%/}"
+      done
+      usage_error "the resolved health path '$requested' still ends in '/' after the single trailing-slash reduction every application applies, so the frozen contract cannot be asserted against it: that same reduction makes '$reduced' and '$reduced/' the same route, yet the contract requires one to answer 200 and the other 404. This is a fault in the requested path, not in any application. Use '$suggestion' instead."
+      ;;
+  esac
+
+  if [ "$reduced" != "$requested" ]; then
+    RESOLVED_PATH="$reduced"
+    # stderr, never stdout: stdout carries verdict lines only, and a caller
+    # parsing PASS lines must not have to filter notes out of them.
+    printf '%s: note: the health path %s was reduced to %s, which is the route all three applications derive from it\n' \
+      "$SCRIPT_NAME" "$requested" "$RESOLVED_PATH" >&2
+  fi
+
   if [ -z "$RESOLVED_NAME" ]; then
     usage_error "the resolved application name is empty; set APP_NAME or app.name"
   fi
@@ -923,6 +1105,24 @@ expect_status() {
   fi
 }
 
+# expect_target_status: the same assertion for a request whose TARGET is not the
+# URL's path - the absolute form of RFC 9112 section 3.2.2.
+#
+# curl always writes the origin form for a normal request, so the target has to be
+# stated explicitly with --request-target while the URL still supplies the address to
+# connect to. The connection therefore goes to this host while the request line names
+# some other authority entirely, which is exactly the shape being asserted.
+expect_target_status() {
+  local label="$1" connect_url="$2" target="$3" expected="$4"
+  local code rc="0"
+
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time "$CURL_MAX_TIME" \
+    --request-target "$target" -- "$connect_url")" || rc="$?"
+  if [ "$code" != "$expected" ]; then
+    fail "$label: GET with request-target '$target' returned HTTP '${code:-none}' (curl exit $rc), expected $expected"
+  fi
+}
+
 # lowered_headers: the captured header block with carriage returns removed and
 # every byte folded to lower case.
 #
@@ -958,6 +1158,50 @@ header_value() {
   awk -v key="$name:" '$1 == key { sub(/^[^:]*:[ \t]*/, "", $0); print; exit }' < "$lowered"
 }
 
+# now_ms / format_ms: a millisecond clock built from a bash builtin, so that the
+# readiness budget below is a FLOOR rather than a one-second-granular ceiling and
+# so that a timeout diagnostic can state the time it actually measured.
+#
+# EPOCHREALTIME is "<seconds><radix><microseconds>" and is a bash builtin, so
+# reading it costs no external process - which is what lets the loop consult the
+# clock on every attempt without adding `date` to a tool surface that is
+# deliberately curl plus one JSON reader. Its radix character follows LC_NUMERIC,
+# so both '.' and ',' are accepted rather than assuming a C locale this script
+# never imposes.
+#
+# The SECONDS fallback keeps a shell without EPOCHREALTIME working. It is coarser,
+# but it is consistent: availability cannot change during a run, so both ends of
+# an interval are always read from the same clock and their difference is never a
+# mixture of the two.
+now_ms() {
+  local raw="${EPOCHREALTIME:-}" whole frac
+
+  if [ -n "$raw" ]; then
+    whole="${raw%%[.,]*}"
+    if [ "$whole" != "$raw" ]; then
+      # Padded before slicing so that a microsecond field shorter than three
+      # digits cannot silently produce a shorter, and therefore smaller, number.
+      frac="${raw#*[.,]}000"
+      printf '%s%s' "$whole" "${frac:0:3}"
+      return 0
+    fi
+  fi
+
+  printf '%s000' "$SECONDS"
+}
+
+format_ms() {
+  local ms="$1"
+
+  # A wall clock can step backwards under an NTP correction. Reporting 0.000s is
+  # honest about the measurement being unusable; a negative duration would not be.
+  if [ "$ms" -lt 0 ]; then
+    ms=0
+  fi
+
+  printf '%s.%03ds' "$((ms / 1000))" "$((ms % 1000))"
+}
+
 # wait_until_ready: bounded readiness polling.
 #
 # This is readiness, NOT a retry: it runs before the first assertion, and no
@@ -975,16 +1219,24 @@ wait_until_ready() {
   # The budget is enforced as WALL CLOCK, not as an attempt count. An attempt
   # count would be a false promise: each attempt can block until curl's own
   # timeout, so "40 attempts" could run far past the seconds the caller asked
-  # for. Bash's SECONDS builtin gives a true deadline and costs no external
-  # process, keeping the script's tool surface at curl plus a JSON reader.
+  # for.
   local probe_max_time="$READINESS_PROBE_MAX_TIME"
   if [ "$probe_max_time" -gt "$TIMEOUT_SECONDS" ]; then
     probe_max_time="$TIMEOUT_SECONDS"   # a 1s budget must not wait 2s
   fi
 
-  local started="$SECONDS"
+  # The deadline is a MILLISECOND deadline, which makes the requested budget a
+  # floor. A whole-second clock cannot express one: with `--timeout 1` it reads 1
+  # after as little as ~0.8s of real time, so the loop would abandon a server
+  # that still had a fifth of its budget left and would then report "over 1s" for
+  # a wait that never reached one second. Both halves of that - giving up early
+  # and misreporting the wait - are fixed by measuring in milliseconds; the only
+  # remaining overshoot is the bounded duration of the final attempt.
+  local started_ms deadline_ms now elapsed_ms
+  started_ms="$(now_ms)"
+  deadline_ms=$((started_ms + TIMEOUT_SECONDS * 1000))
   local attempt=0
-  local elapsed=0
+  elapsed_ms=0
 
   while :; do
     # Checked FIRST and every iteration: a child that has already exited will
@@ -1000,19 +1252,38 @@ wait_until_ready() {
     # curl exit 22). This bounded polling is readiness, NEVER a retry of a
     # failed assertion - assertions themselves are never retried (S6).
     if curl -fsS -o /dev/null --max-time "$probe_max_time" -- "$url" 2>>"$READINESS_LOG"; then
+      # Something answered - but readiness only proves that SOMETHING is there.
+      # Re-checking the child here is what turns "the endpoint answered" into
+      # "this repository's endpoint answered", and it is checked again after the
+      # assertions for the same reason.
+      assert_child_alive "$label" 'although the endpoint answered the readiness probe'
       return 0
     fi
 
     attempt=$((attempt + 1))
-    elapsed=$((SECONDS - started))
-    if [ "$elapsed" -ge "$TIMEOUT_SECONDS" ]; then
+    now="$(now_ms)"
+    elapsed_ms=$((now - started_ms))
+    if [ "$now" -ge "$deadline_ms" ]; then
       break
     fi
     sleep "$READINESS_POLL_INTERVAL"
   done
 
   dump_server_log "$label"
-  fail "$label: $url did not answer within the ${TIMEOUT_SECONDS}s readiness budget ($attempt attempts over ${elapsed}s)"
+
+  # A body shorter than the Content-Length that describes it never completes a
+  # transfer, so it presents here as a readiness timeout rather than as the length
+  # assertion it really is. curl says so in its own words - "108 out of 113 bytes
+  # received", or a closed transfer with bytes remaining - and repeating that
+  # verdict in the headline is the difference between "the server never answered"
+  # and "the server answered badly, every time".
+  local truncation_note=''
+  if [ -n "$READINESS_LOG" ] && [ -s "$READINESS_LOG" ] &&
+     grep -qE 'out of [0-9]+ bytes received|bytes remaining to read' -- "$READINESS_LOG"; then
+    truncation_note=' - and at least one attempt was cut short mid-body (curl reported an incomplete transfer above), which is exactly how a Content-Length larger than the body it describes presents to a client; the body and length assertions never ran, because readiness never completed'
+  fi
+
+  fail "$label: $url did not answer within the ${TIMEOUT_SECONDS}s readiness budget ($attempt attempts over $(format_ms "$elapsed_ms"))$truncation_note"
 }
 
 
@@ -1249,6 +1520,66 @@ assert_path_variants() {
     "$base$RESOLVED_PATH//" 'GET' '404'
 }
 
+# assert_route_aliases: the route is the configured path and no other spelling of it.
+#
+# RFC 3986 section 4.2 reads a target beginning with // as an authority rather than
+# a path, so //health names something other than /health and no implementation may
+# answer the health document on it. This is asserted for all three because it was
+# NOT uniform: CPython's transport folds a leading // to a single slash before any
+# handler runs (gh-87389), so the Python listener answered 200 on //health,
+# ///health and //health/ - at any number of slashes - while the Node and Java
+# listeners answered 404. One poll, two verdicts, decided by which language was
+# behind the port; a proxy rule, an access log or a rate limiter keyed on the path
+# would have seen a route that this endpoint denied having.
+#
+# TRAP: curl transmits these targets verbatim, with and without --path-as-is, so no
+# extra flag is needed here. That was measured against all three servers rather than
+# assumed - a client that normalised the target would have made this gate assert the
+# happy path three times over and pass while the alias was still reachable.
+assert_route_aliases() {
+  local label="$1" base="$2"
+
+  # "$base/$RESOLVED_PATH" is base + / + /health, i.e. //health. Built from the
+  # RESOLVED path so that --path /healthz asserts //healthz and not a stale literal.
+  expect_status "$label (a leading // is not the route)" \
+    "$base/$RESOLVED_PATH" 'GET' '404'
+  expect_status "$label (a leading /// is not the route)" \
+    "$base//$RESOLVED_PATH" 'GET' '404'
+  # The trailing-slash tolerance must not combine with the leading slashes to make a
+  # fourth name for the route.
+  expect_status "$label (a leading // and a trailing / is not the route)" \
+    "$base/$RESOLVED_PATH/" 'GET' '404'
+}
+
+# assert_absolute_form: RFC 9112 section 3.2.2's absolute-form target reaches the
+# route its PATH names, and the authority it carries changes nothing.
+#
+# Asserted for all three because it is a deliberate uniform decision rather than an
+# accident, and because it is the shape most likely to drift: an implementation that
+# started comparing the authority against its bind address, or that stopped reducing
+# the target at all, would answer one of the four requests below differently while
+# every origin-form assertion above still passed.
+#
+# A FOREIGN authority is used on purpose - including one carrying userinfo, a port
+# that is not bound, and a scheme that is not the one in use - because that is the
+# case where honouring the authority would change the answer. All three answer the
+# frozen 200 for the route and the frozen 404 for an unknown path underneath it, so
+# the authority is proven to be discarded rather than inspected.
+assert_absolute_form() {
+  local label="$1" connect="$2"
+
+  expect_target_status "$label (absolute form reaches the route)" \
+    "$connect" "http://absolute-form.invalid$RESOLVED_PATH" '200'
+  expect_target_status "$label (a foreign authority with userinfo changes nothing)" \
+    "$connect" "http://user:pw@absolute-form.invalid:9$RESOLVED_PATH" '200'
+  expect_target_status "$label (a foreign scheme changes nothing)" \
+    "$connect" "https://absolute-form.invalid:443$RESOLVED_PATH?probe=1" '200'
+  # The reduction must not turn every absolute-form target into the route: an
+  # unknown path underneath a foreign authority is still unknown.
+  expect_target_status "$label (absolute form does not bypass the route check)" \
+    "$connect" "http://absolute-form.invalid$UNKNOWN_PATH" '404'
+}
+
 # assert_unknown_path: the repository's first implemented request validation.
 assert_unknown_path() {
   local label="$1" base="$2"
@@ -1314,6 +1645,112 @@ assert_method_not_allowed() {
 # HEALTHCHECK, and the default no-flag invocation belongs to the backward
 # compatibility gates, which are the workflow's business and not this script's.
 # =============================================================================
+
+# preflight_authority: prove the target port is free BEFORE a child is launched.
+#
+# See ATTRIBUTION in the header for why this exists and why it cannot be replaced
+# by the liveness check alone. The mechanics, all measured rather than assumed:
+#
+#   * ONE GET to the exact URL the assertions will use. It is a GET, never a HEAD,
+#     for the same reason as every other request here (TRAP 2), and -f is NOT used
+#     so that a foreign listener answering 404 still counts as a listener.
+#   * %{num_connects} is the verdict, not the HTTP status and not curl's exit
+#     status. It counts TCP connections curl actually established, so it is 1 for
+#     an HTTP server (exit 0), for a peer that accepts and never replies (exit 28)
+#     and for a peer that closes immediately (exit 56) - three squatters that
+#     agree on nothing else - and 0 for a refused connection (exit 7) and for a
+#     host that does not resolve (exit 6).
+#   * The write-out is emitted even when curl fails, which is what makes one
+#     guarded exchange sufficient. curl's own complaint is discarded here: it is
+#     expected on the free path, and on the occupied path the message below is
+#     more use than "Connection refused" would have been.
+#   * A count of 0 deliberately says nothing more than "nothing accepted a
+#     connection". An unresolvable or unroutable host is NOT reported as occupied,
+#     because the child's own bind failure diagnoses that far better than a
+#     network guess from here would.
+#
+# Exit 2 rather than 1: nothing has been started, and the remedy is to change the
+# port or the environment - the same class of problem, and the same code, as the
+# port validation immediately above.
+probe_authority() {
+  local url="$1"
+
+  PROBE_CONNECTS="0"
+  PROBE_CURL_RC="0"
+
+  # The status is captured instead of being allowed to abort the script: on a FREE
+  # port curl legitimately exits 7, so a non-zero status here is data, not an
+  # error. The count is the verdict; the status only enriches the caller's message.
+  PROBE_CONNECTS="$(curl -sS -o /dev/null -X GET \
+    -w '%{num_connects}' \
+    --connect-timeout "$PREFLIGHT_MAX_TIME" --max-time "$PREFLIGHT_MAX_TIME" \
+    -- "$url" 2>/dev/null)" || PROBE_CURL_RC="$?"
+
+  case "$PROBE_CONNECTS" in
+    '' | *[!0-9]*)
+      # No usable count came back, so occupancy is unproven in either direction.
+      # It is reported as "nothing accepted a connection" so that neither caller
+      # can become the reason a sound run fails on an unmeasurable probe; the
+      # child's own bind failure and assert_child_alive remain behind both.
+      PROBE_CONNECTS="0"
+      ;;
+  esac
+
+  return 0
+}
+
+preflight_authority() {
+  local lang="$1" url="$2"
+
+  probe_authority "$url"
+
+  if [ "$PROBE_CONNECTS" -gt 0 ]; then
+    usage_error "$lang: $url is already answered by something this script did not start - the pre-flight exchange established $PROBE_CONNECTS connection(s) (curl exit $PROBE_CURL_RC). Verifying it would certify a server this repository never ran, because $lang cannot bind an occupied port and its absence would not change the verdict. Stop that listener, or choose a free port with --port."
+  fi
+
+  return 0
+}
+
+# assert_endpoint_released: prove, after the fact, that the endpoint just asserted
+# was the child this script started - the third and final attribution layer.
+#
+# Called once the child has been stopped and reaped, and before the PASS line is
+# printed. The reasoning is a syllogism the other two layers cannot express: the
+# only process this script launched is now gone, therefore nothing may still be
+# answering that URL. If something does, the assertions above were satisfied by a
+# listener this repository never started and the verdict is withheld.
+#
+# This closes the residual window the first two layers leave open. The pre-flight
+# proves the port was free an instant before the launch and the liveness checks
+# prove the child was running at two later instants, but neither can prove that
+# the process which answered was the child - a listener detached from the tracked
+# pid, or a squatter that bound in the microseconds between the pre-flight and the
+# child's own bind, satisfies both. Being observed after the child is gone is
+# proof, not inference (standard S7).
+#
+# The bounded settle loop is the mirror image of readiness polling, not a retry of
+# a failed assertion (standard S6): a listening socket is torn down with its owning
+# process, so the expected transition is immediate, and the loop exists only so
+# that scheduling noise cannot turn a sound run red. Failure is still terminal.
+assert_endpoint_released() {
+  local label="$1" url="$2"
+  local attempt=0
+
+  while : ; do
+    probe_authority "$url"
+    if [ "$PROBE_CONNECTS" -eq 0 ]; then
+      return 0
+    fi
+
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge "$SHUTDOWN_POLL_ATTEMPTS" ]; then
+      break
+    fi
+    sleep "$READINESS_POLL_INTERVAL"
+  done
+
+  fail "$label: $url still answers after the server this script started was stopped and reaped ($PROBE_CONNECTS connection(s) established, curl exit $PROBE_CURL_RC), so the responses asserted above did not come from it and a PASS would not be attributable to this repository - the verdict is withheld"
+}
 
 start_server() {
   local lang="$1" runtime="$2" entry="$3" port="$4" port_var="$5"
@@ -1421,18 +1858,34 @@ verify_language() {
   base="http://$CONNECT_HOST:$port"
   url="$base$RESOLVED_PATH"
 
+  # Before anything is started: the port must be free, or a green verdict would
+  # belong to whoever already holds it rather than to this repository.
+  preflight_authority "$lang" "$url"
+
   start_server "$lang" "$runtime" "$entry" "$port" "$port_var"
   wait_until_ready "$url" "$lang"
 
   assert_health_response "$lang" "$url"
   assert_path_variants "$lang" "$base"
+  assert_route_aliases "$lang" "$base"
+  assert_absolute_form "$lang" "$base/"
   assert_unknown_path "$lang" "$base"
   assert_method_not_allowed "$lang" "$url"
+
+  # The last thing checked before the first thing printed. Every assertion above
+  # passed, so the only remaining question is whether the process that satisfied
+  # them is still the one this script launched; a squatter that appeared in the
+  # window between the pre-flight and the child's bind is caught here.
+  assert_child_alive "$lang" 'now that every assertion has passed'
 
   # Stopped before the next language starts, so at most one server is live and at
   # most one pid is trap-managed at any moment - which is what lets a run with no
   # --port use the three default ports without a collision.
   stop_server
+
+  # With this script's own child gone, the URL must go quiet. Anything still
+  # answering it served the assertions above, and it was not this repository.
+  assert_endpoint_released "$lang" "$url"
 
   report "PASS $lang $url ($LAST_BODY_BYTES bytes)"
 }

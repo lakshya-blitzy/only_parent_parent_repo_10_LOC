@@ -23,11 +23,76 @@
  * parses; and HEAD answered 405, because the endpoint is GET-only by design.
  *
  * `node:http` is the entire HTTP implementation. This file supplies a handler
- * that writes exactly one of three responses:
+ * that writes exactly one of three responses, and the error bodies are quoted
+ * here as the EXACT BYTES on the wire, title case included, because they are
+ * part of a frozen contract that app.py and User.java emit byte-identically -
+ * a reader who took a lower-cased paraphrase from this comment and wrote a
+ * case-sensitive monitor would have one that failed against all three:
  *
  *   200  GET on the configured route   the health document
- *   404  any other target              {"error":"not found"}
- *   405  any other method              {"error":"method not allowed"}, Allow: GET
+ *   404  any other target              {"error":"Not Found"}
+ *   405  any other method              {"error":"Method Not Allowed"}, Allow: GET
+ *
+ * SOME REQUESTS NEVER REACH THAT HANDLER, because `node:http` frames and
+ * validates them in its own parser first. Every item below was established by
+ * execution against all three implementations, and none is reachable from
+ * application code - no hook runs before the method token and the framing are
+ * decided, and this file registers no `clientError` and no `connect` listener, so
+ * the runtime's own answer is the one that goes out. They are recorded rather
+ * than smoothed over, because they are where this implementation's bytes differ
+ * from app.py's and User.java's:
+ *
+ *   1. A method token outside the parser's own table is answered
+ *      `HTTP/1.1 400 Bad Request` with `Connection: close` as its ONLY field and
+ *      a ZERO-BYTE body - no Allow, no Content-Length, no media type, no banner
+ *      and nothing echoed from the request. The boundary is the table, not
+ *      novelty: LOCK, PURGE, M-SEARCH, PATCH, TRACE and OPTIONS are all in it and
+ *      all reach the handler and receive the frozen 405, while FROBNICATE and any
+ *      lower- or mixed-case spelling of a known token - `get`, `Get`, `post` - do
+ *      not. app.py and User.java treat the token as opaque, classify it as
+ *      not-GET, and answer the frozen 405 for every one of those shapes.
+ *   2. CONNECT is answered by destroying the connection with no response at all,
+ *      in both the authority form and the origin form. With no `connect` listener
+ *      no tunnel can be established and none is attempted - the strictest
+ *      available outcome for the one method whose purpose is to make a listener
+ *      proxy traffic. User.java also writes nothing for the authority form;
+ *      app.py answers the frozen 405 for both.
+ *   3. Every other framing fault shares the SAME minimal shape as item 1: a
+ *      status line, `Connection: close`, and no body. A bare-LF terminator, a
+ *      four-token request line, a TAB, VT or FF delimiter, an unparsable
+ *      HTTP-version token, whitespace before a field colon, and a header block
+ *      ended by EOF all draw that 400; header bytes past `http.maxHeaderSize`
+ *      (16,384 by default, so one field of ~16 KB is enough) draw the same shape
+ *      with 431. There is no ceiling on the NUMBER of fields - thousands of small
+ *      ones are served - where app.py refuses at 100 header lines with 431 and at
+ *      65,536 request-line bytes with 414, and User.java refuses at 200 distinct
+ *      field names by closing the connection in silence.
+ *   4. A two-token `GET /health` request line - the HTTP/0.9 form - is ACCEPTED
+ *      and answered with the frozen 200, where app.py and User.java both refuse
+ *      it with 400. This is the one place the parser is LOOSER than the other
+ *      two rather than stricter. It is left as the runtime decides it because the
+ *      response is still the frozen contract, the client that sent it still
+ *      learns only the health document, and overriding the parser would mean
+ *      re-implementing framing this file deliberately does not own.
+ *   5. An HTTP/1.1 request carrying NO `Host` field is refused 400 by the
+ *      parser's own host requirement, and that refusal is the one exception to
+ *      the shape in item 3: it is written through the normal response path, so it
+ *      carries `Connection: close`, a `Date`, and `Transfer-Encoding: chunked`
+ *      with an empty chunked body. It is therefore the ONLY response this program
+ *      can emit that carries a `Date` - `writeJson` suppresses that field on
+ *      every response it composes, and this one it does not compose. An HTTP/1.0
+ *      request needs no Host and is served normally. app.py and User.java both
+ *      route a hostless 1.1 request on its target and answer the frozen 200, so
+ *      RFC 9112 section 3.2 is read strictly here and permissively there. All
+ *      three implementations are conformant, because that section requires the
+ *      CLIENT to send the field and permits, without requiring, a server to
+ *      refuse when it does not.
+ *
+ * Items 1, 2, 3 and 5 are stricter than the frozen contract rather than looser: an
+ * empty 400 or 431, a destroyed connection and a bodiless 400 each disclose
+ * strictly less than the 405 or 200 they replace. index.test.js pins all five so
+ * the record cannot drift silently, and a runtime upgrade that moves any of them
+ * fails a test rather than being discovered by an operator.
  *
  * Everything here comes from the Node standard library, so `node index.js` works
  * on a bare runtime with no install step, no node_modules and no lockfile.
@@ -214,6 +279,19 @@ const PROBE_KEY_SET_REASON =
  * this is roughly seventy times the largest legitimate answer and exists only to
  * bound MEMORY: an endpoint that streams without end must be refused rather than
  * accumulated. The same ceiling is applied in app.py and User.java.
+ *
+ * Because it is the bound that stops an endless stream it is deliberately NOT
+ * raised to fit a large configuration, and that has an operational consequence
+ * worth stating where the number is defined. The rendered document is
+ * `73 + len(app.name) + len(app.version)` bytes of UTF-8 - 73 being the four
+ * keys, the punctuation, the fixed-width instant and the status - so a
+ * configuration whose name and version together exceed 8119 bytes makes this
+ * application's OWN healthy answer larger than the probe will read. The probe
+ * then fails closed on a healthy process, and a container health check reading
+ * its exit status restarts a container that was working. The direction of failure
+ * is the safe one and 8192 is generous against a 108-byte default; the budget is
+ * documented in app.config.properties and .env.example, where an operator sets
+ * the value.
  */
 const MAX_PROBE_BODY_BYTES = 8192;
 
@@ -907,6 +985,16 @@ function isScheme(candidate) {
  * contain `://` - a redirect parameter such as `/health?next=http://elsewhere/` -
  * has `/health?next=http` before the separator, which is not a scheme, so it is
  * returned completely untouched.
+ *
+ * The authority is DISCARDED, not inspected, and that is deliberate rather than an
+ * omission. A FOREIGN authority - `GET http://evil.example/health`, or one carrying
+ * userinfo, or a port that is not the one bound - therefore reaches exactly the
+ * route its path names: measured on the wire, all three implementations answer the
+ * frozen 200 for such a target and the frozen 404 for `http://evil.example/nope`.
+ * Nothing here depends on the authority, so honouring it would only create a way to
+ * make one deployment answer differently from another; RFC 9112 section 3.2.2 does
+ * require the target to be accepted, and section 7.2 puts host-based dispatch in
+ * `Host`, which a single-route endpoint has no use for.
  */
 function stripAuthority(target) {
   const separator = target.indexOf(SCHEME_SEPARATOR);
@@ -949,10 +1037,13 @@ function sanitizeForLog(text) {
  * keep-alive decision - so connections are still reused. No `Server` header is
  * ever set, so the runtime version is not advertised.
  *
- * The result is the same three-header set the other two emit - Content-Type,
- * Cache-Control and Content-Length - plus Allow on a 405. `Content-Length` is the
- * BYTE length rather than the character count, so a multi-byte character in a
- * configured value cannot desynchronise the advertised length from the body.
+ * The result is the three-header contract set - Content-Type, Cache-Control and
+ * Content-Length - plus Allow on a 405. That is byte-for-byte what app.py emits;
+ * User.java emits those three AND a `Date` it cannot suppress, which is recorded
+ * as a stated deviation on its own sendResponse rather than claimed here as
+ * parity. `Content-Length` is the BYTE length rather than the character count, so
+ * a multi-byte character in a configured value cannot desynchronise the advertised
+ * length from the body.
  */
 function writeJson(res, statusCode, body, extraHeaders) {
   res.sendDate = false;
@@ -1454,6 +1545,123 @@ function probeRejection(status, body) {
   return fieldRejection(parsed);
 }
 
+/**
+ * Reduces an answer's Content-Type field values to the ONE media type they name,
+ * or "" when they name none unambiguously.
+ *
+ * Two answers are indistinguishable to a probe and both reduce to "": no such
+ * field at all, and more than one of them. Requiring EXACTLY one is what keeps
+ * the three implementations in step, because their clients disagree about what a
+ * repeated Content-Type means - measured on the wire, Python's http.client joins
+ * the values with ", ", this runtime keeps the FIRST and discards the rest, and
+ * the JDK client exposes every one - so grading whichever value a client happened
+ * to surface would let one implementation accept a duplicated header the other
+ * two refused. Node's `res.headers` cannot show the repetition, so the values are
+ * read from `res.rawHeaders`, which preserves it.
+ *
+ * Parameters are stripped and the result folded and trimmed: RFC 9110 section
+ * 8.3.1 makes `application/json; charset=utf-8` the same media type as
+ * `application/json`, section 5.6.2 permits whitespace around a field value, and
+ * section 8.3 defines the type and subtype as case-insensitive tokens.
+ * `toLowerCase` rather than `toLocaleLowerCase`, so no ambient locale can fold a
+ * token differently. The same reduction is what scripts/verify-health.sh applies.
+ *
+ * @param {Iterable<string>|undefined} contentTypes Every value the answer carried.
+ * @returns {string} The sole media type, or "" when there is not exactly one.
+ */
+function soleMediaType(contentTypes) {
+  const values = contentTypes === undefined || contentTypes === null ? [] : [...contentTypes];
+  if (values.length !== 1 || typeof values[0] !== "string") {
+    return "";
+  }
+  const semicolon = values[0].indexOf(";");
+  const media = semicolon === -1 ? values[0] : values[0].slice(0, semicolon);
+  return media.trim().toLowerCase();
+}
+
+/**
+ * Collects every Content-Type field value an answer carried, in order.
+ *
+ * `res.headers` is the wrong source: for this field Node keeps the first value
+ * and DISCARDS every later one, so a response carrying `application/json` and
+ * then `text/html` is indistinguishable there from one carrying only the first.
+ * `res.rawHeaders` is the flat name/value list exactly as received, which is the
+ * only place the repetition survives.
+ *
+ * @param {import("node:http").IncomingMessage} res
+ * @returns {string[]} Every value, in the order received.
+ */
+function answerContentTypes(res) {
+  const raw = Array.isArray(res.rawHeaders) ? res.rawHeaders : [];
+  const values = [];
+  for (let at = 0; at + 1 < raw.length; at += 2) {
+    if (String(raw[at]).toLowerCase() === "content-type") {
+      values.push(String(raw[at + 1]));
+    }
+  }
+  return values;
+}
+
+/**
+ * Returns why an answer is not THIS application's, or null when it is.
+ *
+ * Runs after probeRejection, never instead of it, and answers the question that
+ * grader cannot: probeRejection proves an answer satisfies the frozen contract,
+ * which ANY application implementing the contract would satisfy. On its own it
+ * therefore grades a different process that happens to hold this loopback port
+ * healthy, and reports this application up while it is down. `--probe` is the
+ * container health check, so that verdict keeps a dead container in service -
+ * the one outcome a health check exists to prevent.
+ *
+ * Three rules, in this order:
+ *
+ *   1. the answer is served as CONTENT_TYPE, unambiguously - a well-formed health
+ *      document delivered as `text/html` did not come from this contract;
+ *   2. `name` is exactly the configured application name;
+ *   3. `version` is exactly the configured application version.
+ *
+ * Media type first because it is settled by the FRAMING rather than by the
+ * document, and the identity in a document is not worth grading when the framing
+ * around it already says the answer is something else.
+ *
+ * No rule names an observed value. A response body is an input, and an input
+ * reaching a log line verbatim is how a forged log entry gets written, so the
+ * reasons state only the expectation the configuration already published.
+ *
+ * The body is parsed here as well as in probeRejection, deliberately: this
+ * function must be total for a direct call, so it cannot depend on a caller
+ * having parsed first. The parse is PLAIN - the strict rules (a repeated member, a
+ * trailing byte, a sequence that is not UTF-8) belong to probeRejection alone,
+ * because restating them here would change which of two simultaneous faults gets
+ * reported.
+ *
+ * @returns {string|null} A fixed-category reason, or null when the answer is ours.
+ */
+function identityRejection(contentTypes, body, expectedName, expectedVersion) {
+  if (soleMediaType(contentTypes) !== CONTENT_TYPE) {
+    return `the answer is not served as ${CONTENT_TYPE}`;
+  }
+  const buffer = Buffer.isBuffer(body)
+    ? body
+    : Buffer.from(body === undefined || body === null ? "" : String(body));
+  let parsed;
+  try {
+    parsed = JSON.parse(buffer.toString("utf8"));
+  } catch {
+    return "body is not the expected JSON document";
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "body is not a JSON object and carries no status field";
+  }
+  if (parsed.name !== expectedName) {
+    return "the name field is not this application's name";
+  }
+  if (parsed.version !== expectedVersion) {
+    return "the version field is not this application's version";
+  }
+  return null;
+}
+
 /** Self-probe deadline. Short, because a health check must answer quickly. */
 const PROBE_TIMEOUT_MS = 2500;
 
@@ -1462,11 +1670,23 @@ const PROBE_TIMEOUT_MS = 2500;
  * process exit code, which is the whole machine-readable result - a container
  * runtime can read it without an HTTP client of its own.
  *
- * Deliberately strict: 0 only when the endpoint answers 200 AND the body satisfies
- * the frozen contract. Every other outcome - refused connection, expired deadline,
- * wrong status code, oversized body, unparseable body, a document that merely
- * looks right, anything unforeseen - yields 1, because a probe that cannot PROVE
- * health must not report it.
+ * Deliberately strict: 0 only when the endpoint answers 200, the body satisfies
+ * the frozen contract, AND the answer identifies itself as this application -
+ * probeRejection followed by identityRejection. Every other outcome - refused
+ * connection, expired deadline, wrong status code, oversized body, unparseable
+ * body, a document that merely looks right, a well-formed document served by
+ * something else on this port, anything unforeseen - yields 1, because a probe
+ * that cannot PROVE health must not report it.
+ *
+ * The identity step exists because the contract grader cannot supply it: a
+ * document satisfying the contract is what any conforming implementation serves,
+ * so without it a different process holding this loopback port would vouch for
+ * this one. The expectation is taken from buildPayload, not restated, so the two
+ * can never disagree about what this application publishes.
+ *
+ * The body ceiling has an operational edge worth knowing here: see
+ * MAX_PROBE_BODY_BYTES for the `app.name` budget past which this application's own
+ * healthy answer is refused for being too large.
  *
  * The exchange is bounded twice, because either bound alone can be defeated:
  *
@@ -1610,7 +1830,22 @@ function probe(options = {}) {
           finish(1, `probe could not reach ${target}: ${error.code || "read failed"}`),
         );
         res.on("end", () => {
-          const rejection = probeRejection(res.statusCode, Buffer.concat(chunks));
+          const answer = Buffer.concat(chunks);
+          let rejection = probeRejection(res.statusCode, answer);
+          if (rejection === null) {
+            // The frozen contract holds. Now prove the answer came from THIS
+            // application rather than from whatever else could be holding this
+            // loopback port: the expectation is what buildPayload would publish,
+            // so a server built from this same configuration always matches and
+            // nothing else is assumed to.
+            const published = buildPayload(config);
+            rejection = identityRejection(
+              answerContentTypes(res),
+              answer,
+              published.name,
+              published.version,
+            );
+          }
           if (rejection === null) {
             finish(0);
             return;
@@ -1681,12 +1916,13 @@ if (require.main === module) {
  * are the same functions under both of the names the contract documents, so a
  * consumer written against either name resolves.
  *
- * `validateConfig`, `probeAuthority`, `probeRejection` and `MAX_PROBE_BODY_BYTES`
- * are exported because each is a rule the test suite has to be able to state
- * directly. A rule reachable only through a live socket can be asserted for one
- * happy path and guessed at for the rest; reachable as a function, every branch of
- * it is a test - and the same names are reachable in app.py and UserTest.java, so
- * the three suites assert one contract rather than three dialects of it.
+ * `validateConfig`, `probeAuthority`, `probeRejection`, `identityRejection`,
+ * `soleMediaType` and `MAX_PROBE_BODY_BYTES` are exported because each is a rule
+ * the test suite has to be able to state directly. A rule reachable only through a
+ * live socket can be asserted for one happy path and guessed at for the rest;
+ * reachable as a function, every branch of it is a test - and the same names are
+ * reachable in app.py and UserTest.java, so the three suites assert one contract
+ * rather than three dialects of it.
  */
 module.exports = {
   add,
@@ -1709,6 +1945,8 @@ module.exports = {
   probe,
   probeAuthority,
   probeRejection,
+  identityRejection,
+  soleMediaType,
   CONFIG_FILE,
   DEFAULTS,
   ENV_KEYS,

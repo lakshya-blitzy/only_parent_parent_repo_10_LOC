@@ -25,7 +25,7 @@
  * is assembled by hand through an explicit escape helper, and the result is
  * byte-identical to theirs for identical configuration.
  *
- * Three response details are decided by the server and cannot be reached from
+ * Four response details are decided by the server and cannot be reached from
  * application code. Each was established by execution, and each is a point where
  * this implementation's bytes differ from app.py's and index.js's:
  *   1. A Date field is always present. That is a STATED DEVIATION from the frozen
@@ -37,13 +37,87 @@
  *   2. Field names are normalised, so this server emits "Content-type" where the
  *      other two emit "Content-Type". RFC 9110 makes field names
  *      case-insensitive, so every assertion against these responses folds case.
- *   3. A target of //health is answered 404 by the server itself before this
- *      handler is reached, because it parses as a network-path reference whose
- *      authority is "health" and whose path is empty, so no context matches. An
- *      unparsable request line and an oversized header block are answered the
- *      same way. All three are fixed strings that echo no part of the request;
- *      only the media type of that error body differs from the other two
- *      implementations.
+ *   3. A malformed request is refused by the server BEFORE this handler is
+ *      reached, with an HTML body that is outside the frozen contract on media
+ *      type, header set AND body. This is enumerated below rather than
+ *      summarised, because summarising it once produced a claim that was
+ *      materially wrong: the surface is not one body differing only in media
+ *      type, it is EIGHT distinct bodies across THREE status codes, two of
+ *      which name an internal exception class.
+ *
+ * Every one of the eight carries exactly Content-Type: text/html,
+ * Content-Length and Connection: close - so NO Cache-Control, and, unlike the
+ * responses this class writes, no Date either, because these bypass
+ * ExchangeImpl.sendResponseHeaders entirely. Measured on this JDK against a
+ * live listener:
+ *
+ *   400  <h1>400 Bad Request</h1>URISyntaxException thrown
+ *          an unparsable target: %zz, a truncated %, % alone, or any of
+ *          <>{}|^`"[] appearing raw in the request target
+ *   400  <h1>400 Bad Request</h1>NumberFormatException thrown
+ *          a Content-Length that is not a decimal number, e.g. 0x5
+ *   400  <h1>400 Bad Request</h1>Illegal Content-Length value
+ *          a syntactically numeric but negative Content-Length, e.g. -1
+ *   400  <h1>400 Bad Request</h1>Conflicting or malformed headers detected
+ *          a repeated Content-Length, or Content-Length with
+ *          Transfer-Encoding - i.e. the request-smuggling shapes
+ *   400  <h1>400 Bad Request</h1>Header key contains illegal characters
+ *          whitespace before the colon of a field line, e.g. "X-A : 1"
+ *   400  <h1>400 Bad Request</h1>Bad request line
+ *          a request line that is not three tokens
+ *   404  <h1>404 Not Found</h1>No context found for request
+ *          a target no context matches: //health parses as a network-path
+ *          reference whose authority is "health" and whose path is empty, and
+ *          the asterisk-form target * matches nothing either
+ *   501  <h1>501 Not Implemented</h1>Unsupported Transfer-Encoding value
+ *          any transfer coding other than chunked, including identity. RFC
+ *          9112 section 7 recommends 501 here, so the STATUS is correct; it is
+ *          the body and media type that leave the contract
+ *
+ * ACCEPTED RISK: the first two bodies disclose a Java exception class name to
+ * an unauthenticated client, which fingerprints the runtime and is at odds
+ * with least disclosure. It is accepted rather than fixed because NO IN-PROCESS
+ * INTERCEPTION POINT EXISTS, which was established by execution rather than
+ * assumed: a root "/" context matching every target, PLUS a Filter, PLUS a
+ * com.sun.net.httpserver.Authenticator were installed together, and all eight
+ * shapes still produced the identical platform HTML while the Filter and the
+ * Authenticator printed nothing - yet a valid target on that same server did
+ * reach the handler and did run both, so the harness was sound and the absence
+ * of interception is real. Closing it needs a component in front of the
+ * listener that normalises non-conforming responses, or a hand-written
+ * ServerSocket transport; the second is excluded for the reason given in the
+ * deviation record on {@link #sendResponse}, and the first is a deployment
+ * decision, not a change to this file.
+ *
+ * What IS verified true of all eight: they echo no part of the request. A
+ * distinctive marker planted in the target, the Host field, a custom field
+ * name, a custom field value and the body appeared in none of them, so they
+ * are fixed platform strings and no reflected-input channel exists here. They
+ * carry no credential, no configured value, no filesystem path, no listening
+ * address and no stack trace.
+ *
+ * Because these strings belong to the platform and not to this program, section
+ * H of UserTest.java pins all eight verbatim as a CHANGE DETECTOR: if a JDK
+ * upgrade alters them, the suite fails and the record above is corrected,
+ * rather than the drift being discovered from a production packet capture.
+ *
+ *   4. The request ceilings are the server's, and they are the loosest of the
+ *      three. Neither a long request target nor a single large header field is
+ *      refused - both are read in full and answered. app.py refuses a request
+ *      line past 65,536 bytes with 414, a header line past the same bound with
+ *      431, and the 100th header line with 431; index.js refuses header bytes
+ *      past its 16,384-byte {@code maxHeaderSize} with 431, carrying only
+ *      {@code Connection: close} and no body. The one ceiling this server
+ *      enforces observably is a count of DISTINCT field names: 200 entries are
+ *      served, and at 201 the connection is closed with NO response written at
+ *      all. Repeated occurrences of one name collapse into a single entry, so a
+ *      thousand copies of the same field are served while two hundred and one
+ *      differently named fields are not - the limit is on the parsed map, not on
+ *      lines received. A long target must therefore be ROUTED correctly rather
+ *      than rejected, which is why it is asserted to answer 404 and never 200 -
+ *      a target truncated anywhere along its length could otherwise normalise
+ *      onto the health route and be graded healthy on bytes that were never
+ *      received.
  *
  * There is deliberately no package declaration. That is what keeps both
  * "java -cp . User" and "java User.java" single-file source launch working, and
@@ -89,6 +163,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
@@ -403,6 +478,18 @@ public class User {
      * detected rather than silently truncated to a body that might still parse.
      * app.py and index.js use the same number, so the same body is graded the same
      * way by all three.
+     *
+     * <p>Because it is the bound that stops an endless stream it is deliberately NOT
+     * raised to fit a large configuration, and that has an operational consequence
+     * worth stating where the number is defined. The rendered document is
+     * {@code 73 + app.name + app.version} bytes of UTF-8 - 73 being the four keys,
+     * the punctuation, the fixed-width instant and the status - so a configuration
+     * whose name and version together exceed 8119 bytes makes this application's OWN
+     * healthy answer larger than the probe will read. The probe then fails closed on
+     * a healthy process, and a container {@code HEALTHCHECK} reading its exit status
+     * restarts a container that was working. The direction of failure is the safe one
+     * and 8192 is generous against a 108-byte default; the budget is documented in
+     * app.config.properties and .env.example, where an operator sets the value.
      */
     private static final int MAX_PROBE_BODY_BYTES = 8192;
 
@@ -1062,6 +1149,17 @@ public class User {
      * <p>The scheme is validated before anything is stripped, so a relative target
      * whose query string happens to contain {@code ://} - a redirect parameter, for
      * instance - is left completely alone.
+     *
+     * <p>The authority is DISCARDED, not inspected, and that is deliberate rather than
+     * an omission. A FOREIGN authority - {@code GET http://evil.example/health}, or
+     * one carrying userinfo, or a port that is not the one bound - therefore reaches
+     * exactly the route its path names: measured on the wire, all three
+     * implementations answer the frozen 200 for such a target and the frozen 404 for
+     * {@code http://evil.example/nope}. Nothing here depends on the authority, so
+     * honouring it would only create a way to make one deployment answer differently
+     * from another; RFC 9112 section 3.2.2 does require the target to be accepted, and
+     * section 7.2 puts host-based dispatch in {@code Host}, which a single-route
+     * endpoint has no use for.
      */
     private static String stripAuthority(String target) {
         int separator = target.indexOf(SCHEME_SEPARATOR);
@@ -1521,11 +1619,21 @@ public class User {
         try {
             config = loadConfig();
         } catch (IllegalArgumentException unusablePort) {
-            // The category is identical in all three implementations; the offending
-            // value is appended because this program's own suite requires an
-            // operator to be able to trace the refusal back to what they typed.
-            logWarning("probe cannot run: the configured port is unusable: "
-                    + unusablePort.getMessage());
+            // The bare category, with the refused value withheld - byte-identical
+            // after the prefix to app.py's and index.js's line for the same fault.
+            //
+            // The value used to be appended here, which was wrong for the mode this
+            // is: --probe runs unattended on a container health-check timer, so
+            // nobody is at a terminal to use the value, and everything it reaches is
+            // a log collector. A configured port is an INPUT, so appending it made
+            // the one line an unattended refusal writes carry attacker-influenced
+            // text; sanitiseForLog kept that to one line and could not stop it
+            // reading like a second record from another program. serve() still names
+            // the value, deliberately and for the opposite reason - an interactive
+            // start has an operator at the terminal who typed it - and the comment
+            // there has always described this path as reporting a bare category.
+            // probeAuthority withholds its own rejected value on the same reasoning.
+            logWarning("probe cannot run: the configured port is unusable");
             return EXIT_FAILURE;
         }
         try {
@@ -1536,15 +1644,17 @@ public class User {
             logWarning("probe cannot run: " + unpublishable.getMessage());
             return EXIT_FAILURE;
         }
-        return probe(config.host(), config.port(), config.healthPath());
+        return probe(config);
     }
 
     /**
-     * Self-checks one explicit endpoint and grades the answer against the contract.
+     * Self-checks the endpoint one explicit snapshot describes.
      *
-     * <p>Kept separate from {@link #probe()} so that a harness can aim it at an
-     * arbitrary port without an environment override, which is what makes the
-     * positive and negative cases testable in-process.
+     * <p>The snapshot carries the identity as well as the transport coordinates,
+     * which is what lets the verdict include {@link #identityRejection}: the answer
+     * has to be THIS application's, not merely a conforming one. app.py's
+     * {@code probe(config)} and index.js's {@code probe({config})} take the same
+     * single snapshot for the same reason.
      *
      * <p>The deadline is ABSOLUTE and covers the whole exchange - connect, request,
      * status line, header block and body - because the two per-operation budgets the
@@ -1556,8 +1666,8 @@ public class User {
      *
      * @return {@value #EXIT_SUCCESS} when healthy, {@value #EXIT_FAILURE} otherwise
      */
-    static int probe(String host, int port, String healthPath) {
-        String route = configRoute(healthPath);
+    static int probe(Config config) {
+        String route = configRoute(config.healthPath());
         if (!isRequestTarget(route)) {
             // The route is withheld from this line on purpose: a configured path
             // carrying CR or LF is what a log-forgery attempt looks like, so the
@@ -1566,12 +1676,12 @@ public class User {
                     + " request target");
             return EXIT_FAILURE;
         }
-        if (port < MIN_PORT || port > MAX_PORT) {
+        if (config.port() < MIN_PORT || config.port() > MAX_PORT) {
             logWarning("probe cannot run: the configured port is unusable");
             return EXIT_FAILURE;
         }
-        String authority = probeAuthority(host);
-        String target = "http://" + authority + ":" + port + route;
+        String authority = probeAuthority(config.host());
+        String target = "http://" + authority + ":" + config.port() + route;
         URI uri;
         try {
             uri = new URI(target);
@@ -1580,11 +1690,40 @@ public class User {
                     + " request target");
             return EXIT_FAILURE;
         }
-        return probeAnswer(uri, target);
+        return probeAnswer(uri, target, config.name(), config.version());
+    }
+
+    /**
+     * Self-checks one explicit endpoint, taking the expected identity from the file.
+     *
+     * <p>Kept separate from {@link #probe()} so that a harness can aim it at an
+     * arbitrary port without an environment override, which is what makes the
+     * positive and negative cases testable in-process. The name and version come from
+     * {@link #loadConfig()} rather than from the caller, exactly as
+     * {@link #createServer(String, int)} takes them from there while accepting an
+     * explicit host and port - so a server created that way and probed this way agree
+     * about the identity by construction. Use {@link #probe(Config)} to state one
+     * explicitly.
+     *
+     * @return {@value #EXIT_SUCCESS} when healthy, {@value #EXIT_FAILURE} otherwise
+     */
+    static int probe(String host, int port, String healthPath) {
+        Config resolved;
+        try {
+            resolved = loadConfig();
+        } catch (IllegalArgumentException unusablePort) {
+            // The file names a port this build cannot use. Reported as the bare
+            // category, with the refused value withheld, exactly as probe() does.
+            logWarning("probe cannot run: the configured port is unusable");
+            return EXIT_FAILURE;
+        }
+        return probe(new Config(resolved.name(), resolved.version(), healthPath,
+                host, port));
     }
 
     /** Runs one bounded exchange and turns its answer into a verdict. */
-    private static int probeAnswer(URI uri, String target) {
+    private static int probeAnswer(URI uri, String target, String expectedName,
+            String expectedVersion) {
         HttpClient client = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .proxy(HttpClient.Builder.NO_PROXY)
@@ -1606,12 +1745,24 @@ public class User {
                     // One byte over the ceiling, deliberately: reading exactly the
                     // ceiling could not tell a body that fits from one that was
                     // truncated to fit, and a truncated body might still parse.
+                    //
+                    // allValues rather than firstValue for the media type: firstValue
+                    // hides a REPEATED Content-Type, and whether the field was
+                    // repeated is a rule identityRejection applies.
                     return new Answer(response.statusCode(),
-                            stream.readNBytes(MAX_PROBE_BODY_BYTES + 1));
+                            stream.readNBytes(MAX_PROBE_BODY_BYTES + 1),
+                            response.headers().allValues(HEADER_CONTENT_TYPE));
                 }
             });
             Answer answer = pending.get(PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             String rejection = probeRejection(answer.status(), answer.body());
+            if (rejection == null) {
+                // The frozen contract holds. Now prove the answer came from THIS
+                // application rather than from whatever else could be holding this
+                // loopback port.
+                rejection = identityRejection(answer.contentTypes(), answer.body(),
+                        expectedName, expectedVersion);
+            }
             if (rejection == null) {
                 return EXIT_SUCCESS;
             }
@@ -1646,8 +1797,11 @@ public class User {
         }
     }
 
-    /** One endpoint answer: the status code and the bounded body bytes. */
-    private record Answer(int status, byte[] body) { }
+    /**
+     * One endpoint answer: the status code, the bounded body bytes and every
+     * {@code Content-Type} value the answer carried, in the order received.
+     */
+    private record Answer(int status, byte[] body, List<String> contentTypes) { }
 
     /**
      * Converts a configured bind address into a loopback destination.
@@ -1769,6 +1923,108 @@ public class User {
         if (!(members.get(PAYLOAD_KEY_TIMESTAMP) instanceof String moment)
                 || !TIMESTAMP_GRAMMAR.matcher(moment).matches()) {
             return "the timestamp field is not a whole-second UTC instant";
+        }
+        return null;
+    }
+
+    /**
+     * Reduces an answer's {@code Content-Type} values to the ONE media type they
+     * name, or {@code ""} when they name none unambiguously.
+     *
+     * <p>Two answers are indistinguishable to a probe and both reduce to {@code ""}:
+     * no such field at all, and more than one of them. Requiring EXACTLY one is what
+     * keeps the three implementations in step, because their clients disagree about
+     * what a repeated {@code Content-Type} means - measured on the wire, Python's
+     * {@code http.client} joins the values with {@code ", "}, Node keeps the first
+     * and discards the rest, and this client exposes every one through
+     * {@code allValues} while {@code firstValue} would hide the repetition - so
+     * grading whichever value a client happened to surface would let one
+     * implementation accept a duplicated header the other two refused.
+     *
+     * <p>Parameters are stripped and the result folded and trimmed: RFC 9110 section
+     * 8.3.1 makes {@code application/json; charset=utf-8} the same media type as
+     * {@code application/json}, section 5.6.2 permits whitespace around a field
+     * value, and section 8.3 defines the type and subtype as case-insensitive
+     * tokens. Folding uses {@link Locale#ROOT}, so no ambient locale can turn an
+     * {@code I} into a dotless {@code i} and stop a token matching - the same reason
+     * scripts/verify-health.sh pins {@code LC_ALL} before it folds a header name.
+     *
+     * @param contentTypes every value the answer carried, in order; may be null
+     * @return the sole media type, or {@code ""} when there is not exactly one
+     */
+    static String soleMediaType(List<String> contentTypes) {
+        if (contentTypes == null || contentTypes.size() != 1) {
+            return "";
+        }
+        String value = contentTypes.get(0);
+        if (value == null) {
+            return "";
+        }
+        int semicolon = value.indexOf(';');
+        String media = (semicolon < 0) ? value : value.substring(0, semicolon);
+        return media.trim().toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * Returns why an answer is not THIS application's, or {@code null} when it is.
+     *
+     * <p>Runs after {@link #probeRejection}, never instead of it, and answers the
+     * question that grader cannot: {@code probeRejection} proves an answer satisfies
+     * the frozen contract, which ANY application implementing the contract would
+     * satisfy. On its own it therefore grades a different process that happens to
+     * hold this loopback port healthy, and reports this application up while it is
+     * down. {@code --probe} is the container health check, so that verdict keeps a
+     * dead container in service - the one outcome a health check exists to prevent.
+     *
+     * <p>Three rules, in this order:
+     *
+     * <ol>
+     *   <li>the answer is served as {@value #CONTENT_TYPE_JSON}, unambiguously - a
+     *       well-formed health document delivered as {@code text/html} did not come
+     *       from this contract;</li>
+     *   <li>{@code name} is exactly the configured application name;</li>
+     *   <li>{@code version} is exactly the configured application version.</li>
+     * </ol>
+     *
+     * <p>Media type first because it is settled by the FRAMING rather than by the
+     * document, and the identity in a document is not worth grading when the framing
+     * around it already says the answer is something else.
+     *
+     * <p>No rule names an observed value. A response body is an input, and an input
+     * reaching a log line verbatim is how a forged log entry gets written, so the
+     * reasons state only the expectation the configuration already published.
+     *
+     * <p>The body is parsed here as well as in {@link #probeRejection},
+     * deliberately: this method must be total for a direct call, so it cannot depend
+     * on a caller having parsed first. The parse is PLAIN - the strict rules (a
+     * repeated member, a trailing byte, a sequence that is not UTF-8) belong to
+     * {@code probeRejection} alone, because restating them here would change which of
+     * two simultaneous faults gets reported. app.py and index.js state the same three
+     * rules, in the same order, with the same wording.
+     *
+     * @return {@code null} when the answer is this application's, otherwise the
+     *         reason it is not
+     */
+    static String identityRejection(List<String> contentTypes, byte[] body,
+            String expectedName, String expectedVersion) {
+        if (!CONTENT_TYPE_JSON.equals(soleMediaType(contentTypes))) {
+            return "the answer is not served as " + CONTENT_TYPE_JSON;
+        }
+        Object document;
+        try {
+            document = new JsonReader(decodeStrictUtf8(
+                    (body == null) ? new byte[0] : body)).readDocument();
+        } catch (IllegalArgumentException malformed) {
+            return "body is not the expected JSON document";
+        }
+        if (!(document instanceof Map<?, ?> members)) {
+            return "body is not a JSON object and carries no status field";
+        }
+        if (!Objects.equals(members.get(PAYLOAD_KEY_NAME), expectedName)) {
+            return "the name field is not this application's name";
+        }
+        if (!Objects.equals(members.get(PAYLOAD_KEY_VERSION), expectedVersion)) {
+            return "the version field is not this application's version";
         }
         return null;
     }

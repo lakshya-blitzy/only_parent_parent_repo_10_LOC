@@ -52,6 +52,47 @@
 #   The output is line oriented, so a path containing a newline character
 #   cannot be represented; no such path exists in this project.
 #
+# DELIBERATE BEHAVIOURS AND THEIR LIMITS
+#   Each of the four below is a decision rather than an oversight, and each is
+#   recorded here so that no reader has to rediscover it from the code and no
+#   later change mistakes it for a defect.
+#
+#   Regular files only.  The search matches -type f, so an entry point that is a
+#   SYMLINK is not listed even when it resolves to a real app.py, index.js or
+#   User.java.  That is the prescribed behaviour and it is also the safer one: a
+#   link can point outside the tree being searched, so following one would let a
+#   link inside a submodule enumerate a file that is not part of this project,
+#   and a link cycle could otherwise duplicate the output or send the walk
+#   running away.  No file in this project is a symlink.  Listing them would be
+#   a deliberate widening of the contract - adding -L, or matching -type l as
+#   well - and not a bug fix.
+#
+#   Lexical root resolution.  The default ROOT is the parent of this script's
+#   own directory, derived textually from BASH_SOURCE.  Invoked through a
+#   SYMLINK to this file that lives outside the repository, the default ROOT is
+#   therefore the symlink's own lexical parent rather than the real checkout, and
+#   the run reports whatever is (usually nothing) under that directory.
+#   Resolving the physical path would mean calling readlink or realpath, and
+#   neither is in the four-command requirement list below; the documented
+#   invocations - `bash scripts/discover-apps.sh`, `./scripts/discover-apps.sh`,
+#   or any path to the real file - are unaffected.  When invoking through a link,
+#   pass ROOT explicitly.
+#
+#   One record per line.  A directory or file name containing a NEWLINE cannot
+#   be represented in newline-delimited output and would be read as two records.
+#   The line-oriented format is the prescribed one and is precisely what makes
+#   the list diffable, greppable and safe to redirect into a file; a
+#   NUL-delimited mode would be a different contract, not a hardening of this
+#   one.  No such name exists in this project.
+#
+#   Trust in the invoking environment.  Like every shell script, this one calls
+#   find, sed and sort by name, and so inherits whatever the invoking
+#   environment has already arranged - a shell function of the same name
+#   exported through BASH_ENV, for instance, could substitute its own output.
+#   Hardening against that would not buy anything: a caller able to set BASH_ENV
+#   in this process already executes arbitrary code, so that trust boundary
+#   belongs to the environment, not to this file.
+#
 # EXIT STATUS
 #   0       success, including a legitimately empty result set
 #   1       usage error, or ROOT is not a directory
@@ -121,7 +162,9 @@ usage() {
     "  ROOT        Directory to search.  Defaults to the repository root," \
     "              resolved from this script's own location, so the result" \
     "              never depends on the current working directory.  Paths are" \
-    "              printed relative to ROOT." \
+    "              printed relative to ROOT.  That resolution is lexical, so" \
+    "              pass ROOT explicitly when invoking this script through a" \
+    "              symlink from outside the repository." \
     "" \
     "Options:" \
     "  -h, --help  Print this help on stdout and exit 0." \
@@ -130,6 +173,8 @@ usage() {
     "" \
     "Matched file names (exact names, never by extension):" \
     "  app.py  index.js  User.java" \
+    "  Regular files only: a symlink to an entry point is deliberately not" \
+    "  listed, and no symlink is ever followed." \
     "" \
     "Pruned directories (never descended into):" \
     "  .git  node_modules  __pycache__  classes  .pytest_cache" \

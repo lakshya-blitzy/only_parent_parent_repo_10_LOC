@@ -23,6 +23,7 @@ the :class:`HealthRequestHandler` docstring for its full text.
 
 import datetime
 import http.client
+import io
 import json
 import os
 import re
@@ -113,7 +114,9 @@ TIMESTAMP_GRAMMAR = re.compile(
 )
 
 #: Visible US-ASCII only: a configured route carrying a CR or an LF is a
-#: header-injection primitive once it reaches a request or a log line.
+#: header-injection primitive once it reaches a request or a log line.  The same bound
+#: applies to an INBOUND request line, where RFC 9112 section 3 permits nothing else
+#: between the two delimiters; see :meth:`HealthRequestHandler.parse_request`.
 TARGET_MIN_CHAR = 0x21
 TARGET_MAX_CHAR = 0x7E
 
@@ -165,6 +168,20 @@ PROBE_TIMEOUT_SECONDS = 3.0
 
 #: Largest health document ``probe`` will read; the contract body is 108 bytes.
 #: A local endpoint that streams without end must be refused, not accumulated.
+#:
+#: This ceiling is the bound that stops an endless stream, so it is deliberately NOT
+#: raised to accommodate a large configuration - and that has an operational
+#: consequence worth stating where the number is defined.  The rendered document is
+#: ``73 + len(app.name) + len(app.version)`` bytes of UTF-8 (73 being the four keys,
+#: the punctuation, the fixed-width instant and the status), so a configuration whose
+#: name and version together exceed 8119 bytes makes this application's OWN healthy
+#: answer larger than the probe will read.  The probe then fails closed on a healthy
+#: process, and a container health check reading its exit status restarts a container
+#: that was working.  8192 is generous against a 108-byte default, the direction of
+#: failure is the safe one, and the budget is documented in app.config.properties and
+#: .env.example, where an operator actually sets the value.  All three
+#: implementations apply the identical ceiling and report it with the identical
+#: wording.
 MAX_PROBE_BODY_BYTES = 8192
 
 #: Ceiling on the request body read and discarded before answering, and the
@@ -212,30 +229,96 @@ SCHEME_SEPARATOR = "://"
 #: function normalises the CONFIGURED path, where one could be hand-written.
 FRAGMENT_MARKER = "#"
 
+#: RFC 9112 section 3: ``method SP request-target SP HTTP-version CRLF`` - exactly two
+#: single spaces and a CR LF, nothing else.  ``BaseHTTPRequestHandler`` splits the line
+#: on ANY run of whitespace and strips either terminator, so it reads a TAB, VERTICAL
+#: TAB or FORM FEED as a delimiter and a bare LF as a terminator; the JavaScript and
+#: Java listeners refuse all of those.  Validating the RAW line is what makes the three
+#: agree, and it is what keeps the ORIGINAL target - the one the caller sent - available
+#: for routing.
+REQUEST_LINE_TERMINATOR = b"\r\n"
+REQUEST_LINE_SEPARATOR = b" "
+REQUEST_LINE_TOKENS = 3
+HTTP_VERSION_PATTERN = re.compile(rb"\AHTTP/[0-9]+\.[0-9]+\Z")
+
+#: An empty line, in both spellings the transport accepts as one.  It terminates a header
+#: block, and RFC 9112 section 2.2 also permits a run of them BEFORE a request line.
+EMPTY_LINES = (b"\r\n", b"\n")
+
+#: RFC 9112 section 2.2: a server SHOULD ignore at least one empty line received before
+#: a request line, and MUST NOT treat it as a request.  ``parse_request`` returns false
+#: for such a line without sending anything, so the caller receives NO response at all;
+#: skipping a bounded run answers the request that follows instead.  Bounded because an
+#: unbounded run of empty lines is a way to hold a handler thread on nothing.
+MAX_LEADING_EMPTY_LINES = 64
+
+#: The transport's own header-block limits, restated so the pre-parse validation applies
+#: exactly the ceilings ``http.client`` applies - ``_MAXLINE`` and ``_MAXHEADERS`` - and
+#: therefore reports the identical 431 for an over-long line and for too many lines, at
+#: the identical byte and line counts.  Deviating either way would move a status code
+#: that is part of the refusal contract.
+MAX_HEADER_LINE_BYTES = 65536
+MAX_HEADER_LINES = 100
+
+#: A field line is ``field-name ":" OWS field-value`` (RFC 9112 section 5), and a
+#: field-name is a token: visible US-ASCII with no space, no TAB and no colon.  Section
+#: 5.1 requires a server to REJECT a line with whitespace between the name and the colon.
+#: The inherited parser instead ENDS the header block at any line whose name is not a
+#: token - ``email.feedparser`` records a defect and unreads the line - so every field
+#: AFTER it silently disappears, ``Content-Length`` among them, and the body is left on
+#: the connection to be read as the next request line (CWE-444).  ``OBS_FOLD_PREFIXES``
+#: is the deprecated line-folding continuation, legal after a field line and never as the
+#: first line of a block.
+HEADER_FIELD_SEPARATOR = b":"
+OBS_FOLD_PREFIXES = b" \t"
+
+#: Upper bound on one diagnostic line.  Every value that reaches the emitter is fixed
+#: category text today, but a bound means a future caller cannot turn an operator's log
+#: into an unbounded write, and it is cheaper than auditing every call site.
+MAX_LOG_MESSAGE_CHARS = 512
+
 
 def log_warning(message):
     """Write one diagnostic line to stderr, and to stderr only.
 
     Standard output is the legacy contract this program is hashed on, so nothing
-    diagnostic may reach it.  Callers pass fixed category text plus at most a status
-    code or an exception TYPE name - never a configured value, an exception message
-    or response content.
+    diagnostic may reach it.  What callers may pass depends on who supplied the text,
+    and the three cases are different on purpose:
+
+    * A REQUEST-derived value never reaches this function.  Everything an outside
+      caller controls - the request line, the target, the method token, a field value -
+      is dropped by :meth:`HealthRequestHandler.send_error`, which logs fixed category
+      text and a status code and nothing else.  The one exception is generated by the
+      runtime rather than by the caller: the inherited pre-parse deadline logs the
+      repr of its own :exc:`TimeoutError`, which quotes no part of the request.
+    * An OPERATOR-supplied configuration value MAY appear in a start-up diagnostic, as
+      it does in all three implementations: the person who typed a bad port is the only
+      reader of the message that rejects it, and the listener does not exist yet, so no
+      network caller can reach that path.
+    * The PROBE path names no value at all, not even a configured one, because a
+      container health check's stderr is collected by machinery rather than read by the
+      person who typed it.
+
+    Whatever is passed, :func:`sanitize_for_log` bounds it and strips the control
+    characters that would forge a second entry.
     """
     sys.stderr.write(f"[app.py] {sanitize_for_log(message)}\n")
 
 
 def sanitize_for_log(text):
-    """Strip control characters from text before it reaches a log line.
+    """Strip control characters from text before it reaches a log line, and bound it.
 
-    The inherited request machinery logs request-derived text through
-    :meth:`HealthRequestHandler.log_message`, where a CR or LF would forge extra
-    log lines.  Dropped rather than escaped, because a human reads this.
+    Nothing request-derived reaches the emitter, so this is the second line of defence
+    rather than the first: a control character would forge extra log entries and an
+    unbounded value would flood the log, so both are removed here regardless of what a
+    caller passes.  Dropped rather than escaped, because a human reads this.
     """
     if not text:
         return ""
-    return "".join(
+    cleaned = "".join(
         current for current in text if ord(current) >= 0x20 and ord(current) != 0x7F
     )
+    return cleaned[:MAX_LOG_MESSAGE_CHARS]
 
 
 class PropertiesFormatError(ValueError):
@@ -574,7 +657,11 @@ def normalize_path(target):
     by a name that is not the configured one.
 
     ``parse_request`` folds an inbound target beginning with ``//`` to one slash
-    (CPython gh-87389), which is not correctable from here; the correctable half is
+    (CPython gh-87389), so ``self.path`` would reach this function already rewritten and
+    ``//health`` would route as ``/health`` - an alias the other two implementations
+    refuse.  This function is not where that is corrected: the ORIGINAL target is kept as
+    ``HealthRequestHandler.raw_target`` and is what :meth:`HealthRequestHandler.do_GET`
+    passes here, so the fold cannot manufacture a route.  The other half is
     :func:`validate_config` refusing such a CONFIGURED route in all three.
     """
     if not target:
@@ -611,6 +698,16 @@ def strip_authority(target):
     stripped, which is the whole safety of this function: in
     ``/health?next=http://elsewhere/`` the text before the separator is not a scheme,
     so the target is returned untouched.
+
+    The authority is DISCARDED, not inspected, and that is deliberate rather than an
+    omission.  A FOREIGN authority - ``GET http://evil.example/health``, or one
+    carrying userinfo, or a port that is not the one bound - therefore reaches exactly
+    the route its path names: measured on the wire, all three implementations answer
+    the frozen 200 for such a target and the frozen 404 for
+    ``http://evil.example/nope``.  Nothing here depends on the authority, so honouring
+    it would only create a way to make one deployment answer differently from another;
+    RFC 9112 section 3.2.2 does require the target to be accepted, and section 7.2
+    puts host-based dispatch in ``Host``, which a single-route endpoint has no use for.
     """
     separator = target.find(SCHEME_SEPARATOR)
     if separator <= 0 or not _is_scheme(target[:separator]):
@@ -693,13 +790,15 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     ``Server`` banner and no ``Date``.  A response to HEAD carries no body (RFC 9110
     section 9.3.2) while ``Content-Length`` still advertises what a GET would return.
 
-    Three responses, and no fourth.  Reading the request and framing the connection are
-    :mod:`http.server`'s job; this class only decides which of the three to write.  The
-    common verbs get one explicit ``do_*`` method each so the policy can be read off the
-    class, and :meth:`__getattr__` makes dispatch TOTAL: every method token a request
-    line can carry reaches the 405 responder.  The one response this class does not
-    compose - a transport-level rejection of a request too malformed to have a method -
-    is narrowed to a status line by :meth:`send_error`.
+    Three responses, and no fourth.  Deciding which of the three to write is most of what
+    this class does; the rest is :meth:`parse_request`, which holds the inherited parser
+    to the request grammar it is lenient about, because the leniency is what let a caller
+    reach the endpoint under a name that is not the configured route.  The common verbs
+    get one explicit ``do_*`` method each so the policy can be read off the class, and
+    :meth:`__getattr__` makes dispatch TOTAL: every method token a request line can carry
+    reaches the 405 responder.  The one response this class does not compose - a
+    transport-level rejection of a request too malformed to have a method - is narrowed to
+    a status line by :meth:`send_error`.
     """
 
     protocol_version = HTTP_VERSION
@@ -713,6 +812,201 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     #: accepted socket.  See :data:`REQUEST_HEADER_TIMEOUT_SECONDS`.
     timeout = REQUEST_HEADER_TIMEOUT_SECONDS
 
+    #: The request target exactly as the caller sent it, which is what :meth:`do_GET`
+    #: routes on: ``self.path`` has been rewritten by then (CPython gh-87389 folds a
+    #: leading ``//`` to one slash), and routing on a rewritten target answers ``200``
+    #: on a name the JavaScript and Java listeners answer ``404`` on.  Class-level so a
+    #: handler constructed without a request - as a test may do - reads as "no target".
+    raw_target = ""
+
+    def parse_request(self):
+        """Hold the request to its grammar on the RAW bytes, then parse it as usual.
+
+        The inherited parser is lenient in five ways that each let a caller reach this
+        endpoint by a route or a framing at least one of the other two implementations
+        refuses, and every one of them is decided before any ``do_*`` method runs:
+
+        * it splits the request line on ANY whitespace run, so ``GET\\t/health\\tHTTP/1.1``
+          parses, and it strips either line terminator, so a bare LF parses;
+        * a request line of zero words returns false WITHOUT sending anything, so a single
+          empty line before the request - which RFC 9112 section 2.2 says to ignore -
+          leaves the caller with no response at all;
+        * a two-word line is HTTP/0.9, for which the inherited writer emits no status line
+          and no headers, so the reply is a bare body that is not an HTTP response;
+        * ``email.feedparser`` ends the header block at the first line whose field-name is
+          not a token, discarding every field after it - ``Content-Length`` among them -
+          which leaves the body to be read as the next request line (CWE-444);
+        * end of stream inside the header block reads as the end of the headers, so a
+          request that was never finished is served.
+
+        So the request line and the header block are validated as the bytes they arrived
+        as, and only then handed to the inherited parser - through a buffer holding the
+        validated block, with the socket restored afterwards, positioned at the first BODY
+        byte.  That last detail is what keeps :meth:`_drain_request_body` correct: it
+        reads a body, never a following request.  Delegating rather than reimplementing
+        keeps the ``Connection`` and ``Expect`` handling, the 505 for an unsupported major
+        version, and the request-line ceiling exactly as the transport defines them.
+        """
+        line = self._request_line()
+        if line is None:
+            return False
+        if not self._accept_request_line(line):
+            return False
+        block = self._header_block()
+        if block is None:
+            return False
+        socket_reader = self.rfile
+        self.rfile = io.BytesIO(block)
+        try:
+            return super().parse_request()
+        finally:
+            self.rfile = socket_reader
+
+    def _read_raw_line(self, oversize_status):
+        """Read one line under the transport's own length ceiling.
+
+        Returns the raw bytes, ``b""`` at end of stream, or ``None`` once a refusal has
+        been written.  The ceiling and the one-byte overshoot that detects it are
+        ``http.client``'s own, so an over-long line is refused at the same byte count the
+        inherited parser refuses it at - with the status its context calls for, ``414``
+        for a request line and ``431`` for a field line.
+        """
+        line = self.rfile.readline(MAX_HEADER_LINE_BYTES + 1)
+        if len(line) > MAX_HEADER_LINE_BYTES:
+            self.send_error(oversize_status)
+            return None
+        return line
+
+    def _request_line(self):
+        """Return the request line, skipping a bounded run of empty lines before it.
+
+        RFC 9112 section 2.2 says a server SHOULD ignore at least one empty line received
+        where a request line is expected.  The inherited loop reads that line, hands it to
+        this method, and the inherited parser returns false for it without sending
+        anything - so the connection closes in silence and a client that ends a previous
+        message with a stray CRLF is never answered.  Ignoring a bounded run answers the
+        request that follows; exceeding the bound is refused rather than absorbed, because
+        an endless run of empty lines is a way to hold a handler thread on no request.
+        """
+        line = self.raw_requestline
+        ignored = 0
+        while line in EMPTY_LINES:
+            if ignored >= MAX_LEADING_EMPTY_LINES:
+                self.send_error(400)
+                return None
+            ignored += 1
+            line = self._read_raw_line(414)
+            if line is None:
+                return None
+            if not line:
+                # Empty lines and then a hang-up: there is no request to answer, and
+                # nothing to refuse either.  This is how a client closes an idle
+                # keep-alive connection.
+                self.close_connection = True
+                return None
+        self.raw_requestline = line
+        return line
+
+    def _accept_request_line(self, line):
+        """Refuse anything that is not ``method SP request-target SP HTTP-version CRLF``.
+
+        RFC 9112 section 3 admits exactly two single spaces, exactly three fields and one
+        CR LF, and permits nothing but visible US-ASCII inside the method and the target.
+        Each clause below is one of those, so a TAB, VERTICAL TAB or FORM FEED delimiter,
+        a bare LF terminator, a stray fourth field, an embedded CR, and the two-field
+        HTTP/0.9 form are all refused here - the same refusals the JavaScript and Java
+        listeners make one layer lower.  The version is checked for SHAPE only: the
+        inherited parser owns what a shaped version MEANS, which is what keeps ``HTTP/9.9``
+        a 505 rather than turning it into a 400.
+
+        The accepted target is kept as :attr:`raw_target`, before any rewriting.
+        """
+        if not line.endswith(REQUEST_LINE_TERMINATOR):
+            self.send_error(400)
+            return False
+        fields = line[: -len(REQUEST_LINE_TERMINATOR)].split(REQUEST_LINE_SEPARATOR)
+        if len(fields) != REQUEST_LINE_TOKENS or not all(fields):
+            self.send_error(400)
+            return False
+        method, target, version = fields
+        if not HTTP_VERSION_PATTERN.match(version):
+            self.send_error(400)
+            return False
+        for field in (method, target):
+            for octet in field:
+                if not TARGET_MIN_CHAR <= octet <= TARGET_MAX_CHAR:
+                    self.send_error(400)
+                    return False
+        # Latin-1 is what the inherited parser decodes the line with, so the two agree on
+        # every byte and no target can mean one thing here and another there.
+        self.raw_target = target.decode("latin-1")
+        return True
+
+    def _accept_field_line(self, line, first):
+        """Refuse a field line the inherited parser would read as the END of the block.
+
+        A field-name is a token - visible US-ASCII, no space, no TAB, no colon - so
+        ``X-A : 1`` and ``X A: 1`` are not field lines, and RFC 9112 section 5.1 requires
+        a recipient to reject them.  ``email.feedparser`` instead records a defect and
+        stops reading headers there, which is what silently drops the ``Content-Length``
+        that :meth:`_drain_request_body` needs.  A continuation line is accepted after a
+        field line, matching ``User.java``, and refused as the first line of a block, where
+        it continues nothing - a position all three refuse.
+
+        Accepting the continuation is the majority reading and the conservative one:
+        measured on the wire, ``User.java`` answers such a request 200 and ``index.js``
+        refuses it 400 in its parser, which RFC 9112 section 5.2 also permits.  Refusing
+        outright is a behaviour change no finding asked for, so the divergence is recorded
+        here and in ``index.js`` rather than resolved by tightening this file.
+        """
+        if line[0] in OBS_FOLD_PREFIXES:
+            if first:
+                self.send_error(400)
+                return False
+            return True
+        separator = line.find(HEADER_FIELD_SEPARATOR)
+        if separator <= 0:
+            self.send_error(400)
+            return False
+        for octet in line[:separator]:
+            if not TARGET_MIN_CHAR <= octet <= TARGET_MAX_CHAR:
+                self.send_error(400)
+                return False
+        return True
+
+    def _header_block(self):
+        """Read and validate the whole header block, or refuse and return ``None``.
+
+        The block is returned as the bytes it arrived as, terminator included, so the
+        delegated parse sees exactly what the peer sent and the socket is left positioned
+        at the first body byte.  Lines are counted the way ``http.client`` counts them -
+        the terminating empty line included - so the 431 for too many fields lands on the
+        same line number as before.  End of stream in place of the terminator is refused:
+        the inherited parser treats it as the end of the headers and serves the request,
+        which is not a message the peer ever finished sending.
+
+        ``index.js`` refuses it too, with the minimal 400 its parser writes.  ``User.java``
+        does NOT - measured on the wire, the JDK server answers such a request 200, and
+        that behaviour sits below anything application code on that side can reach, so it
+        is recorded as a residual divergence rather than claimed as parity.
+        """
+        lines = []
+        while True:
+            line = self._read_raw_line(431)
+            if line is None:
+                return None
+            if not line:
+                self.send_error(400)
+                return None
+            lines.append(line)
+            if len(lines) > MAX_HEADER_LINES:
+                self.send_error(431)
+                return None
+            if line in EMPTY_LINES:
+                return b"".join(lines)
+            if not self._accept_field_line(line, len(lines) == 1):
+                return None
+
     def __getattr__(self, name):
         """Route every unimplemented HTTP method to the 405 responder.
 
@@ -721,8 +1015,11 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         the interpreter, a ``Date`` header and a REFLECTION of the caller's method token -
         four departures from the contract.  Claiming the ``do_`` namespace makes the
         policy total instead: the same constant 405 with the same headers plus ``Allow``,
-        whatever the caller called it, which is how the other two reject on "not GET"
-        rather than on a list of known verbs.
+        whatever the caller called it - a decision on "not GET" rather than on a list of
+        known verbs.  ``User.java`` decides the same way, for any token at all.
+        ``index.js`` decides that way only for a token its parser recognises: measured on
+        the wire, an unrecognised or lower-cased token is refused 400 by llhttp before its
+        handler runs, which is recorded there.
 
         Only ``do_`` names are claimed; everything else raises :exc:`AttributeError` as it
         must, so :func:`hasattr` keeps telling the truth and the copy, pickle and
@@ -736,9 +1033,9 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         """Refuse a request too malformed to have a method, in one status line.
 
         Reached only for a request the transport itself rejects - an over-long or
-        unparsable request line, an unsupported HTTP version, an over-long header block.
-        Such requests never reach a ``do_*`` method, so they are the one class of response
-        this handler cannot compose from the frozen contract.
+        unparsable request line, an unsupported HTTP version, an over-long or malformed
+        header block.  Such requests never reach a ``do_*`` method, so they are the one
+        class of response this handler cannot compose from the frozen contract.
 
         The inherited version emits an HTML document, a ``Server`` banner, a ``Date``
         header and the caller's message - which embeds the offending request line - into
@@ -747,13 +1044,19 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         reply that is not a valid HTTP response.  Written instead, straight to the socket
         so the HTTP/0.9 classification cannot suppress it: a status line with the
         canonical reason phrase, ``Content-Length: 0`` and ``Connection: close`` - the
-        shape the JavaScript listener sends.  The caller's message is logged through the
-        sanitising emitter and never sent.
+        shape the JavaScript listener sends.
+
+        ``message`` and ``explain`` are accepted because the inherited parser passes them,
+        and they are DISCARDED: the inherited wordings quote the offending request line
+        (``Bad request syntax ('GET /health with space HTTP/1.1')``), so logging them would
+        put caller-chosen text into an operator's log through the one path an outside
+        caller can reach - the exact thing :func:`log_warning` documents it never carries.
+        The status code says everything an operator can act on, and the JavaScript and Java
+        listeners log no more than that either.
         """
         status = int(code)
         phrase = self.responses[code][0] if code in self.responses else ""
-        self.log_error("refusing a malformed request with %d: %s", status,
-                       message if message is not None else phrase)
+        self.log_error("refusing a malformed request with %d", status)
         # Retired unconditionally: the framing of a request this server could not parse
         # is unknowable, so no following request could be trusted to start in place.
         self.close_connection = True
@@ -767,7 +1070,7 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
                 ).encode("latin-1")
             )
         except OSError as exc:
-            self.log_error("client closed the connection: %r", exc)
+            self.log_error("client closed the connection: %s", type(exc).__name__)
 
     def _snapshot(self):
         """Return the configuration snapshot and route this server was built on.
@@ -803,9 +1106,17 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         Retiring, rather than draining a guess, is what closes CWE-444: a front end that
         resolved an ambiguous length differently from this server would treat bytes as
         body that this server would read as the next request line.  Undrained bytes on a
-        RETIRED connection are never parsed, so the two cannot disagree.  Node and Java
-        reach the same outcome one layer lower, in llhttp and in the JDK server, which is
-        why all three refuse every one of these framings exactly once.
+        RETIRED connection are never parsed, so the two cannot disagree.  The property that
+        closes it is ONE response and no second parse, not a particular status: measured on
+        the wire, this server answers each of the four exactly once and never answers a
+        request that followed the undrained bytes.
+
+        Node reaches the same outcome one layer lower in llhttp, refusing a repeated or
+        non-decimal length 400 and answering an over-ceiling length once.  Java does not,
+        on two of the four, and it is recorded rather than assumed: it ACCEPTS a signed
+        ``+5``, drains five bytes and then answers the request behind them, and for a length
+        above what it will wait for it writes NO response at all.  Both sit below
+        application code there.
         """
         if self.command == METHOD_GET or self.command == METHOD_HEAD:
             # Neither verb carries a body here, and reading zero bytes still costs a
@@ -882,7 +1193,7 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(encoded)
         except OSError as exc:
             self.close_connection = True
-            self.log_error("client closed the connection: %r", exc)
+            self.log_error("client closed the connection: %s", type(exc).__name__)
 
     def _respond(self, code, payload, send_allow=False):
         """Serialise a payload and write it as a contract response.
@@ -893,9 +1204,17 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         self._write(code, render_payload(payload), send_allow=send_allow)
 
     def do_GET(self):
-        """Answer the health route; anything else is a 404."""
+        """Answer the health route; anything else is a 404.
+
+        Routed on :attr:`raw_target` - the target as the caller sent it - and not on
+        ``self.path``, which the inherited parser rewrites: it folds a leading ``//`` to
+        one slash (CPython gh-87389), so ``//health`` and ``///health`` would arrive here
+        as ``/health`` and this endpoint would answer ``200`` on a name the JavaScript and
+        Java listeners answer ``404`` on.  The fallback covers a handler driven without a
+        parsed request, which only a test does.
+        """
         config, route = self._snapshot()
-        if normalize_path(self.path) == route:
+        if normalize_path(self.raw_target or self.path) == route:
             self._respond(200, build_payload(config))
         else:
             self._respond(404, NOT_FOUND_BODY)
@@ -941,9 +1260,16 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         """Send every server log line to stderr, through the one safe emitter.
 
-        The text here is REQUEST-derived - the inherited machinery logs the request
-        line it was sent - making this the one log path carrying a value an outside
-        caller chose, so it goes through :func:`log_warning`.
+        The inherited default writes to stderr directly, with a timestamp and the client
+        address; routing it through :func:`log_warning` gives every line of this process
+        one prefix, one sanitising pass and one length bound.
+
+        Nothing an outside caller supplies arrives here.  The inherited machinery would
+        log the request line - :meth:`send_error` is where it would enter, and that
+        override discards it - and the inherited access log is unreachable because every
+        response is written with ``send_response_only``, which does not call
+        ``log_request``.  What remains is this server's own fixed category text, a status
+        code, an exception TYPE name, and the runtime's own deadline repr.
         """
         log_warning(fmt % args)
 
@@ -1162,6 +1488,79 @@ def probe_rejection(status, body):
     return None
 
 
+def sole_media_type(content_types):
+    """Reduce an answer's ``Content-Type`` values to the ONE media type they name.
+
+    Returns ``""`` when they name none unambiguously, which covers two answers that
+    are indistinguishable to a probe: no such field at all, and more than one of them.
+
+    Requiring EXACTLY one is what keeps the three implementations in step, because
+    their clients disagree about what a repeated ``Content-Type`` means - measured on
+    the wire, :mod:`http.client` joins the values with ``", "``, Node keeps the first
+    and discards the rest, and the JDK client exposes every one - so grading whichever
+    value a client happened to surface would let one implementation accept a
+    duplicated header the other two refused.
+
+    Parameters are stripped and the result folded and trimmed: RFC 9110 section 8.3.1
+    makes ``application/json; charset=utf-8`` the same media type as
+    ``application/json``, section 5.6.2 permits whitespace around a field value, and
+    section 8.3 defines the type and subtype as case-insensitive tokens.  The same
+    reduction is what ``scripts/verify-health.sh`` applies to the served header.
+    """
+    values = list(content_types or ())
+    if len(values) != 1 or not isinstance(values[0], str):
+        return ""
+    return values[0].split(";", 1)[0].strip().lower()
+
+
+def identity_rejection(content_types, body, expected_name, expected_version):
+    """Return why an answer is not THIS application's, or ``None`` when it is.
+
+    Runs after :func:`probe_rejection`, never instead of it, and answers the question
+    that grader cannot: :func:`probe_rejection` proves an answer satisfies the frozen
+    contract, which ANY application implementing the contract would satisfy.  On its
+    own it therefore grades a different process that happens to hold this loopback
+    port healthy, and reports this application up while it is down.  ``--probe`` is
+    the container health check, so that verdict keeps a dead container in service -
+    which is the one outcome a health check exists to prevent.
+
+    Three rules, in this order:
+
+      1. the answer is served as :data:`CONTENT_TYPE`, unambiguously - a well-formed
+         health document delivered as ``text/html`` did not come from this contract;
+      2. ``name`` is exactly the configured application name;
+      3. ``version`` is exactly the configured application version.
+
+    Media type first because it is settled by the FRAMING rather than by the document,
+    and the identity in a document is not worth grading when the framing around it
+    already says the answer is something else.
+
+    No rule names an observed value.  A response body is an input, and an input
+    reaching a log line verbatim is how a forged log entry gets written, so the
+    reasons state only the expectation the configuration already published.
+
+    The body is parsed here as well as in :func:`probe_rejection`, deliberately: this
+    function must be total for a direct call, so it cannot depend on a caller having
+    parsed first.  The parse is PLAIN - the strict rules (a repeated key, a trailing
+    byte, a sequence that is not UTF-8) belong to :func:`probe_rejection` alone,
+    because restating them here would change which of two simultaneous faults is
+    reported.
+    """
+    if sole_media_type(content_types) != CONTENT_TYPE:
+        return f"the answer is not served as {CONTENT_TYPE}"
+    try:
+        document = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return "body is not the expected JSON document"
+    if not isinstance(document, dict):
+        return "body is not a JSON object and carries no status field"
+    if document.get("name") != expected_name:
+        return "the name field is not this application's name"
+    if document.get("version") != expected_version:
+        return "the version field is not this application's version"
+    return None
+
+
 def _probe_answer(host, port, route, target):
     """GET the health answer from a loopback endpoint, bounded twice.
 
@@ -1183,6 +1582,11 @@ def _probe_answer(host, port, route, target):
     Every failure resolves to ``None`` with one fixed-category line logged, carrying at
     most the sanitised probe TARGET and an exception TYPE name - never an exception
     message, which can carry resolver-derived or response-derived text.
+
+    :returns: ``(status, body, content_types)`` on any answer at all, where the third
+        element is EVERY ``Content-Type`` field value the answer carried, in order -
+        the values rather than a joined string, because :func:`sole_media_type` grades
+        a repeated field and cannot see the repetition once it has been joined.
     """
     expired = threading.Event()
     connection = http.client.HTTPConnection(host, port, timeout=PROBE_TIMEOUT_SECONDS)
@@ -1205,7 +1609,14 @@ def _probe_answer(host, port, route, target):
     try:
         connection.request(METHOD_GET, route, headers={"Accept": CONTENT_TYPE})
         response = connection.getresponse()
-        return response.status, response.read(MAX_PROBE_BODY_BYTES + 1)
+        # get_all rather than getheader: getheader joins repeated values with ", ",
+        # which makes a duplicated Content-Type indistinguishable from a single
+        # parameterised one, and that distinction is a rule identity_rejection applies.
+        return (
+            response.status,
+            response.read(MAX_PROBE_BODY_BYTES + 1),
+            tuple(response.headers.get_all("Content-Type") or ()),
+        )
     except http.client.InvalidURL:
         # The client layer refuses to place some characters in a request line.  Listed
         # before the catch-all so it is reported as the configuration fault it is.
@@ -1227,11 +1638,23 @@ def _probe_answer(host, port, route, target):
 def probe(config=None):
     """Check this application's own health endpoint.
 
-    Deliberately strict: healthy only when the endpoint answers ``200`` AND the body is
-    a JSON object satisfying the frozen contract.  Every other outcome - refused
-    connection, expired deadline, wrong status, oversized or unparseable body, a
-    document that merely looks right, anything unforeseen - is unhealthy, because a
+    Deliberately strict: healthy only when the endpoint answers ``200``, the body is a
+    JSON object satisfying the frozen contract, AND the answer identifies itself as
+    this application - :func:`probe_rejection` followed by :func:`identity_rejection`.
+    Every other outcome - refused connection, expired deadline, wrong status, oversized
+    or unparseable body, a document that merely looks right, a well-formed document
+    from something else on this port, anything unforeseen - is unhealthy, because a
     probe that cannot PROVE health must not report it.
+
+    The identity step exists because the contract grader cannot supply it: a document
+    satisfying the contract is what any conforming implementation serves, so without
+    it a different process holding this loopback port would vouch for this one.  The
+    expectation is taken from :func:`build_payload`, not restated, so the two can never
+    disagree about what this application publishes.
+
+    The body ceiling has an operational edge worth knowing here: see
+    :data:`MAX_PROBE_BODY_BYTES` for the ``app.name`` budget past which this
+    application's own healthy answer is refused for being too large.
 
     Step order is what makes the diagnostics safe: the configuration is validated first,
     so a value carrying a CR and an LF is refused before it can be interpolated
@@ -1269,6 +1692,15 @@ def probe(config=None):
     if answer is None:
         return 1
     reason = probe_rejection(answer[0], answer[1])
+    if reason is None:
+        # The frozen contract holds.  Now prove the answer came from THIS application
+        # rather than from whatever else could be holding this loopback port: the
+        # expectation is what build_payload would publish, so a server built from this
+        # same configuration always matches and nothing else is assumed to.
+        published = build_payload(resolved)
+        reason = identity_rejection(
+            answer[2], answer[1], published["name"], published["version"]
+        )
     if reason is not None:
         log_warning(f"probe rejected: {reason}")
         return 1

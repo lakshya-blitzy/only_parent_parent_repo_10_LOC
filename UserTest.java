@@ -149,6 +149,8 @@ public class UserTest {
                     UserTest::verifyProbeValidationAndReuse);
             runSection("K the shared properties grammar and the failure policy",
                     UserTest::verifySharedPropertiesGrammar);
+            runSection("L probe identity and media-type verification",
+                    UserTest::verifyProbeIdentity);
         } catch (RuntimeException unexpected) {
             // Defensive: runSection already contains every section, so reaching
             // this point means the harness itself misbehaved. It is still turned
@@ -406,6 +408,27 @@ public class UserTest {
     /** A numerically valid but out-of-range port, refused for a different reason. */
     private static final String OUT_OF_RANGE_PORT_VALUE = "70000";
 
+    /**
+     * The bare category an unattended refusal reports for an unusable port.
+     *
+     * <p>Byte-identical after the log prefix in all three implementations, and the
+     * text is the whole assertion: {@code --probe} reports this CATEGORY and stops,
+     * where {@code --serve} reports the same fault and names the value. The split is
+     * deliberate - an interactive start has an operator who typed the value, while a
+     * probe on a container health-check timer has only a log collector, and a
+     * configured value is an input.
+     */
+    private static final String PORT_REFUSAL_CATEGORY = "the configured port is unusable";
+
+    /**
+     * The prefix of the diagnostic a probe writes once it has actually connected.
+     *
+     * <p>Used as a NEGATIVE assertion: its absence proves a refusal happened before
+     * any socket was opened, which is what makes a configuration check deterministic
+     * and network-free rather than merely usually fast.
+     */
+    private static final String PROBE_REACH_PREFIX = "probe could not reach";
+
     // Transport expectations - section H. The exact header sets, the runtime's
     // one observable ceiling, and the sizes used to probe it. There is no 400,
     // 414, 431 or 505 expectation because this endpoint produces no such
@@ -541,14 +564,67 @@ public class UserTest {
             Set.of("connection", "content-length", "content-type");
 
     /**
-     * The only request ceiling the runtime enforces observably: more header fields
-     * than this and the connection is dropped without a response.
+     * Every transport-level rejection body the runtime emits, keyed by the shape
+     * that triggers it, as a CHANGE DETECTOR for a recorded security position.
+     *
+     * <p>These strings are the PLATFORM's, not this program's, and this is the only
+     * place in the harness that pins a body no line of {@link User} composes. They
+     * earn that exception because the class documentation on {@link User} records
+     * them as an ACCEPTED RISK - two of the eight name a Java exception class to an
+     * unauthenticated client, and closing that is impossible from inside this
+     * process. An accepted risk is only honestly accepted while its description is
+     * accurate, so the description is pinned: if a JDK upgrade adds, removes or
+     * reworks any of these, the suite fails here and the record is corrected,
+     * instead of the drift being discovered from a production packet capture.
+     *
+     * <p>This does NOT weaken the position stated in section H's preamble. Nothing
+     * here asserts that the ENDPOINT produces a 400, a 404 with an HTML body or a
+     * 501 - it produces exactly 200, 404 and 405 with JSON. What is asserted is what
+     * the listener beneath it does with a request the endpoint never sees, which is a
+     * different subject with a different reason to be asserted.
+     */
+    private static final Map<String, String> RUNTIME_REJECTION_BODIES = Map.of(
+            "an unparsable target",
+            "<h1>400 Bad Request</h1>URISyntaxException thrown",
+            "a non-numeric Content-Length",
+            "<h1>400 Bad Request</h1>NumberFormatException thrown",
+            "a negative Content-Length",
+            "<h1>400 Bad Request</h1>Illegal Content-Length value",
+            "conflicting framing fields",
+            "<h1>400 Bad Request</h1>Conflicting or malformed headers detected",
+            "whitespace before a field colon",
+            "<h1>400 Bad Request</h1>Header key contains illegal characters",
+            "a request line that is not three tokens",
+            "<h1>400 Bad Request</h1>Bad request line",
+            "a target no context matches",
+            "<h1>404 Not Found</h1>No context found for request",
+            "an unsupported transfer coding",
+            "<h1>501 Not Implemented</h1>Unsupported Transfer-Encoding value");
+
+    /**
+     * A marker planted in every part of a request a rejection body could echo.
+     *
+     * <p>The "no reflection" half of the documented position is the half that would
+     * matter if it were false: a fixed platform string discloses a runtime, while an
+     * echoed one is a reflected-input channel. It is asserted rather than assumed.
+     */
+    private static final String REFLECTION_MARKER = "UserTestReflectionMarker";
+
+    /**
+     * The only request ceiling the runtime enforces observably: more DISTINCT header
+     * field names than this and the connection is dropped without a response.
      *
      * <p>The server's own limit, not this endpoint's, and established by execution:
-     * at this many fields a request is served normally, and at one more the
+     * at this many entries a request is served normally, and at one more the
      * connection closes with no bytes written and the handler is never entered. It
      * is asserted because it is a denial-of-service control that is reachable from
      * the network, and a control nobody tests is a control nobody has.
+     *
+     * <p>The count is of PARSED ENTRIES, which is why {@code headerFieldBlock} gives
+     * every field a distinct name. Repeated occurrences of one name collapse into a
+     * single entry, so a thousand copies of the same field are served and would
+     * measure this ceiling as absent - a block built from one repeated name would
+     * make this assertion pass for the wrong reason.
      */
     private static final int RUNTIME_HEADER_FIELD_CEILING = 200;
 
@@ -915,6 +991,18 @@ public class UserTest {
 
         String errorText() {
             return new String(standardError, StandardCharsets.UTF_8);
+        }
+
+        /**
+         * How many lines the child wrote to standard error.
+         *
+         * <p>A count rather than a substring check, because the property a refusal
+         * needs is that it is ONE record: a diagnostic that carries an input can be
+         * made to look like two, and counting is what detects that no matter which
+         * character was used to attempt it.
+         */
+        int errorLineCount() {
+            return (int) errorText().lines().count();
         }
     }
 
@@ -2264,8 +2352,11 @@ public class UserTest {
             // frozen field set is what proves the disagreement is the documented
             // one rather than a framing defect. The set is the SAME set every
             // other refused method gets, Content-Length included, which is the
-            // RFC 9110 section 9.3.2 expectation and what keeps this
-            // implementation's HEAD block equal to app.py's and index.js's.
+            // RFC 9110 section 9.3.2 expectation; measured on the wire, this
+            // implementation's HEAD block equals app.py's and index.js's field for
+            // field APART FROM the Date this transport inserts unconditionally,
+            // which is why the expectation is built from the specified set plus
+            // that one named deviation rather than written out flat.
             HttpResponse<String> headed = send(client, "HEAD", port, route);
             checkEquals("HEAD is answered 405 by documented design",
                     HTTP_METHOD_NOT_ALLOWED, headed.statusCode());
@@ -2683,8 +2774,22 @@ public class UserTest {
                 Map.of(ENV_APP_HOST, TEST_HOST, ENV_JAVA_PORT, UNUSABLE_PORT_VALUE));
         checkEquals("--probe exits 1 on a port that cannot be parsed",
                 EXIT_FAILURE, unparseable.status());
-        check("the unrunnable probe names the offending port value",
-                unparseable.errorText().contains(UNUSABLE_PORT_VALUE));
+        // The category, and NOT the value. This is the reverse of what --serve is
+        // asserted to do a few methods above, and the difference is the point: the
+        // interactive start names the value for the operator who typed it, and the
+        // unattended probe withholds it because a configured value is an input and
+        // everything an unattended refusal reaches is a log collector. Asserting the
+        // absence as well as the presence is what makes this a policy rather than a
+        // wording preference - and what keeps it byte-comparable to app.py's and
+        // index.js's line for the same fault.
+        check("the unrunnable probe reports the port category",
+                unparseable.errorText().contains(PORT_REFUSAL_CATEGORY));
+        check("the unrunnable probe does not echo the offending port value",
+                !unparseable.errorText().contains(UNUSABLE_PORT_VALUE));
+        check("the unrunnable probe refuses before it opens a socket",
+                !unparseable.errorText().contains(PROBE_REACH_PREFIX));
+        checkEquals("the unrunnable probe writes exactly one diagnostic line",
+                1, unparseable.errorLineCount());
     }
 
     /**
@@ -2735,6 +2840,20 @@ public class UserTest {
     // the contract genuinely promises: whatever answer comes back reflects nothing
     // from the request, and the endpoint is still serving afterwards.
     //
+    // WHAT THIS SECTION DOES ASSERT ABOUT THE RUNTIME'S OWN REJECTIONS
+    //
+    // One exception to the paragraph above, and it is an exception with a different
+    // subject rather than a softening of it. verifyRuntimeRejectionBodies pins all
+    // eight of the runtime's rejection bodies VERBATIM. That is not an expectation
+    // placed on this endpoint - the endpoint never sees these requests - it is a
+    // change detector on a security position the class documentation on User records
+    // as an accepted risk, because two of the eight disclose a Java exception class
+    // name and no in-process interception point exists to stop them. A risk accepted
+    // on the strength of a description stops being honestly accepted the moment the
+    // description silently goes stale, so the description is held by a test. The
+    // eight are asserted together with the absence of reflection, which is the half
+    // of the position that would change the risk rating if it were ever false.
+    //
     // The connection assertions are kept in full. A served 1.1 connection is reused,
     // a client that asks to close is answered and then closed, a lookalike connection
     // option does not retire a good connection, and HTTP/1.0's inverted default is
@@ -2755,6 +2874,7 @@ public class UserTest {
         try {
             verifyContractOverRawBytes(port, route);
             verifyHostileRequestLines(port, route);
+            verifyRuntimeRejectionBodies(port, route);
             verifyProtocolVersions(port, route);
             verifyRequestSizeHandling(port, route);
             verifyRequestTargetHandling(port, route);
@@ -2854,6 +2974,19 @@ public class UserTest {
      * routed and refused 405 like any other non-GET. All of those are conformant,
      * none is in this endpoint's contract, so none is asserted as a specific status.
      *
+     * <p>The fourth-token case is the one worth naming as a CROSS-LANGUAGE
+     * DIVERGENCE rather than merely as a tolerance, because it is the one shape on
+     * which the three implementations disagree about the outcome and not just about
+     * the wording: {@code GET /health with space HTTP/1.1} is answered 200 with the
+     * document here, and 400 by app.py and index.js, which both require exactly
+     * three space-separated tokens. RFC 9112 section 3 permits a recipient to refuse
+     * such a line, so 400 is the stricter reading and this listener takes the more
+     * tolerant one. It matters only as a precondition for desynchronising an
+     * intermediary that splits the line differently, and no intermediary is in scope
+     * for this repository - so it is recorded here, asserted through the general
+     * properties below, and deliberately not made a status expectation on a parser
+     * this endpoint is specified not to own.
+     *
      * <p>What IS asserted holds for every shape without exception: the answer is a
      * well-formed HTTP/1.1 message, its status is a recognised one rather than
      * something invented, nothing from the request comes back in the status line, the
@@ -2935,6 +3068,93 @@ public class UserTest {
             }
         } catch (IOException failure) {
             recordRawFailure(label, failure);
+        }
+    }
+
+    /**
+     * Pins every transport-level rejection body the runtime emits, verbatim.
+     *
+     * <p>One trigger per body in {@link #RUNTIME_REJECTION_BODIES}, each asserted on
+     * three counts: the exact body text, the rejection's own three-field header set
+     * with {@code text/html} and {@code Connection: close}, and the absence of any
+     * echoed part of the request. The status is asserted through the body, which
+     * carries it - so a status that changed without the text changing would still be
+     * caught, and a text that changed would be reported as the text it now is.
+     *
+     * <p>Why the reflection assertion travels with these rather than being left to
+     * {@link #checkHostileExchange}: there it is one property of a general hostile
+     * request, and here it is the specific claim that makes an exception-class
+     * disclosure a fingerprint rather than a reflected-input channel. The marker is
+     * planted in five places at once - the target, {@code Host}, a field NAME, a
+     * field VALUE and the body - because a rejection decided at any of the five
+     * stages could only echo the part it had already read.
+     *
+     * <p>Each case is followed by a control on a fresh connection: the runtime closes
+     * a rejected connection, so a rejection that also disabled the listener would look
+     * identical from the rejected socket alone.
+     */
+    private static void verifyRuntimeRejectionBodies(int port, String route) {
+        Map<String, String> triggers = new LinkedHashMap<>();
+        triggers.put("an unparsable target",
+                wireRequest(List.of("GET " + route + "%zz" + REFLECTION_MARKER + " HTTP/1.1",
+                        "Host: " + REFLECTION_MARKER,
+                        "X-" + REFLECTION_MARKER + ": " + REFLECTION_MARKER)));
+        triggers.put("a non-numeric Content-Length",
+                wireRequest(List.of("POST " + route + " HTTP/1.1",
+                        "Host: " + REFLECTION_MARKER, "Content-Length: 0x5")));
+        triggers.put("a negative Content-Length",
+                wireRequest(List.of("POST " + route + " HTTP/1.1",
+                        "Host: " + REFLECTION_MARKER, "Content-Length: -1")));
+        triggers.put("conflicting framing fields",
+                wireRequest(List.of("POST " + route + " HTTP/1.1",
+                        "Host: " + REFLECTION_MARKER, "Content-Length: 5",
+                        "Transfer-Encoding: chunked"), REFLECTION_MARKER));
+        triggers.put("whitespace before a field colon",
+                wireRequest(List.of("GET " + route + " HTTP/1.1",
+                        "Host: " + REFLECTION_MARKER, "X-" + REFLECTION_MARKER + " : 1")));
+        triggers.put("a request line that is not three tokens",
+                wireRequest(List.of("GET " + route + REFLECTION_MARKER,
+                        "Host: " + REFLECTION_MARKER)));
+        // A leading slash ahead of the route: the whole thing parses as a network-path
+        // reference whose authority is the route text, so no context matches. Built
+        // from the resolved route rather than a literal, so an overridden health path
+        // exercises the same rule.
+        triggers.put("a target no context matches",
+                wireRequest(List.of("GET /" + route + REFLECTION_MARKER + " HTTP/1.1",
+                        "Host: " + REFLECTION_MARKER)));
+        triggers.put("an unsupported transfer coding",
+                wireRequest(List.of("POST " + route + " HTTP/1.1",
+                        "Host: " + REFLECTION_MARKER, "Transfer-Encoding: identity")));
+
+        checkEquals("every recorded rejection body has a trigger",
+                RUNTIME_REJECTION_BODIES.size(), triggers.size());
+        String good = wireRequest(List.of("GET " + route + " HTTP/1.1", "Host: " + TEST_HOST));
+        for (Map.Entry<String, String> entry : triggers.entrySet()) {
+            String shape = entry.getKey();
+            String expected = RUNTIME_REJECTION_BODIES.get(shape);
+            check(shape + " is a recorded rejection shape", expected != null);
+            if (expected == null) {
+                continue;
+            }
+            checkRawExchange(port, shape + " is refused by the runtime", entry.getValue(),
+                    response -> {
+                        checkEquals(shape + ": the recorded rejection body is unchanged",
+                                expected, bodyText(response));
+                        checkSetEquals(shape + ": the rejection carries its three fields",
+                                RUNTIME_REJECTION_HEADER_NAMES, response.names());
+                        checkEquals(shape + ": the rejection declares HTML",
+                                CONTENT_TYPE_HTML, response.headers().get("content-type"));
+                        checkEquals(shape + ": the rejection announces the close",
+                                "close", response.headers().get("connection"));
+                        check(shape + ": the rejection echoes no part of the request",
+                                !response.statusLine().contains(REFLECTION_MARKER)
+                                        && !bodyText(response).contains(REFLECTION_MARKER)
+                                        && response.headers().values().stream()
+                                                .noneMatch(v -> v.contains(REFLECTION_MARKER)));
+                    });
+            checkRawExchange(port, shape + " leaves the endpoint serving", good, response ->
+                    checkEquals(shape + " does not disable the listener",
+                            HTTP_OK, response.status()));
         }
     }
 
@@ -3100,8 +3320,16 @@ public class UserTest {
      * required at all. That it is not required records the listener's behaviour rather
      * than endorsing it: RFC 9112 section 3.2 requires a 1.1 client to send one and
      * allows a server to reject a request without one, and this listener chooses to
-     * serve it. The frozen contract defines no 400 and all three implementations route
-     * on the target alone, so a hostless request is answered by the route it asked for.
+     * serve it. The frozen contract defines no 400, so a hostless request is answered
+     * by the route it asked for.
+     *
+     * <p>This is a CROSS-LANGUAGE DIVERGENCE and is recorded as one rather than left
+     * to be discovered. Measured on the wire: app.py routes a hostless HTTP/1.1
+     * request on its target and answers 200 exactly as this listener does, while
+     * index.js refuses it 400 because its parser enforces the host requirement before
+     * any handler runs. All three readings are conformant - the section requires the
+     * CLIENT to send the field and permits, without requiring, a server to refuse
+     * when it does not. An HTTP/1.0 request needs no Host and all three serve it.
      */
     private static void verifyRequestTargetHandling(int port, String route) {
         checkRawExchange(port, "a request with no Host at all",
@@ -4227,15 +4455,27 @@ public class UserTest {
 
             // 2. WELL-FORMED, delivered identically - the control that gives the
             //    three failure cases their meaning. That the file was READ rather
-            //    than merely present is proved by the refusal naming ITS port value:
-            //    no environment variable is set here, so the built-in default would
-            //    have been usable and the child would have gone to the network.
+            //    than merely present is proved by WHICH refusal arrives: this child
+            //    is given no environment at all, so the built-in default port would
+            //    have been perfectly usable and the child would have connected and
+            //    reported that it could not reach the endpoint. Getting the port
+            //    CATEGORY instead can only mean the file's own unusable value was
+            //    the one resolved.
+            //
+            //    Proving it this way rather than by finding the value in the text is
+            //    deliberate and is the stronger form: the diagnostic withholds the
+            //    value on purpose, so a control that depended on seeing it would be a
+            //    control that only worked while the disclosure existed.
             Files.writeString(config, KEY_JAVA_PORT + "=" + UNUSABLE_PORT_VALUE + "\n",
                     StandardCharsets.UTF_8);
             ChildOutcome wellFormed = probeInEnclosure(prefix, enclosure, null);
             checkConfigurationDiagnostics("a well-formed configuration file", wellFormed, 0, 0);
             check("the isolated file was read, not merely present",
-                    wellFormed.errorText().contains(UNUSABLE_PORT_VALUE));
+                    wellFormed.errorText().contains(PORT_REFUSAL_CATEGORY));
+            check("the isolated file's port was resolved, so no socket was opened",
+                    !wellFormed.errorText().contains(PROBE_REACH_PREFIX));
+            check("the isolated file's value is not echoed into the refusal",
+                    !wellFormed.errorText().contains(UNUSABLE_PORT_VALUE));
 
             // 3. MALFORMED - one warning, then the defaults.
             Files.writeString(config, SHARED_MALFORMED_PROPERTIES.get(0).getValue(),
@@ -4304,6 +4544,355 @@ public class UserTest {
         if (expectedUnreadableWarnings + expectedMalformedWarnings > 0) {
             check(label + " reports on standard error under the usual prefix",
                     diagnostics.startsWith(DIAGNOSTIC_PREFIX));
+        }
+    }
+
+    // Section L - probe identity and media-type verification. probeRejection in
+    // section J grades the SHAPE of an answer, and a document satisfying that shape
+    // is what any conforming implementation serves - so on its own it lets a
+    // different application holding this loopback port vouch for this one. Measured
+    // before the fix, over a real socket: a decoy serving "name":"IMPOSTOR", one
+    // serving "version":"9.9.9" and one serving a correct document as text/html all
+    // made --probe exit 0, in this implementation and in the other two. The identity
+    // step closes that, and every check below is worded and ordered identically in
+    // test_app.py (TestProbeIdentity) and index.test.js (group G2), because the three
+    // implementations answer the same container HEALTHCHECK contract.
+
+    /** The reason an answer that does not name exactly one JSON media type carries. */
+    private static final String MEDIA_TYPE_REFUSAL =
+            "the answer is not served as application/json";
+
+    /** The reason a conforming document naming another application carries. */
+    private static final String IDENTITY_NAME_REFUSAL =
+            "the name field is not this application's name";
+
+    /** The reason a conforming document naming another version carries. */
+    private static final String IDENTITY_VERSION_REFUSAL =
+            "the version field is not this application's version";
+
+    /**
+     * Bytes of the rendered document that are neither the name nor the version: the
+     * four keys, the punctuation, the 20-character instant and the status. Asserted
+     * against the renderer rather than trusted, because it is the constant the
+     * app.name budget in app.config.properties and .env.example is computed from.
+     */
+    private static final int RENDERED_FIXED_OVERHEAD_BYTES = 73;
+
+    /** A conforming health document carrying a stated identity. */
+    private static String identityDocument(String name, String version) {
+        return User.renderPayload(name, version, REFERENCE_TIMESTAMP, STATUS_UP);
+    }
+
+    /** Grades an answer against the shipped identity. */
+    private static String identityReject(List<String> contentTypes, String body) {
+        return User.identityRejection(contentTypes, utf8(body),
+                DEFAULT_APP_NAME, DEFAULT_APP_VERSION);
+    }
+
+    private static void verifyProbeIdentity() throws Exception {
+        // RFC 9110 sections 8.3, 8.3.1 and 5.6.2, one row each.
+        Map<String, String> reduced = new LinkedHashMap<>();
+        reduced.put("application/json", "application/json");
+        reduced.put("application/json; charset=utf-8", "application/json");
+        reduced.put("application/json;charset=UTF-8", "application/json");
+        reduced.put("APPLICATION/JSON", "application/json");
+        reduced.put("  application/json  ", "application/json");
+        reduced.put("text/html", "text/html");
+        for (Map.Entry<String, String> row : reduced.entrySet()) {
+            checkEquals("the sole media type of " + describe(row.getKey()) + " is "
+                            + row.getValue(), row.getValue(),
+                    User.soleMediaType(List.of(row.getKey())));
+        }
+
+        // The rule that keeps the three implementations in step. Their clients
+        // disagree about a REPEATED Content-Type: app.py's joins the values with
+        // ", ", index.js's res.headers keeps the first and discards the rest, and
+        // this one's allValues exposes every one. Grading whichever value a client
+        // surfaced would let one implementation accept a duplicate the other two
+        // refused, so every answer that does not name exactly one media type
+        // reduces to "". The non-string row the other two also assert has no
+        // analogue here, because this list is typed.
+        List<List<String>> nothing = new ArrayList<>();
+        nothing.add(List.of());
+        nothing.add(null);
+        nothing.add(List.of("application/json", "text/html"));
+        nothing.add(List.of("text/html", "application/json"));
+        nothing.add(List.of("application/json", "application/json"));
+        nothing.add(Arrays.asList((String) null));
+        for (List<String> values : nothing) {
+            checkEquals("a header block naming " + (values == null ? "no field" : values.size()
+                            + " value(s)") + " reduces to nothing", "",
+                    User.soleMediaType(values));
+        }
+
+        // The positive control for every rejection below.
+        String shipped = identityDocument(DEFAULT_APP_NAME, DEFAULT_APP_VERSION);
+        checkEquals("our own document served as JSON is accepted", null,
+                identityReject(List.of("application/json"), shipped));
+        checkEquals("a charset parameter changes nothing", null,
+                identityReject(List.of("application/json; charset=utf-8"), shipped));
+
+        for (String value : List.of("text/html", "text/plain", "application/health+json", "")) {
+            checkEquals("a conforming document served as " + describe(value) + " is refused",
+                    MEDIA_TYPE_REFUSAL, identityReject(List.of(value), shipped));
+        }
+        checkEquals("a conforming document with no media type at all is refused",
+                MEDIA_TYPE_REFUSAL, identityReject(List.of(), shipped));
+        checkEquals("a null header list is refused rather than trusted",
+                MEDIA_TYPE_REFUSAL, identityReject(null, shipped));
+
+        for (String name : List.of("IMPOSTOR", "", DEFAULT_APP_NAME + "x",
+                DEFAULT_APP_NAME.toUpperCase(Locale.ROOT), " " + DEFAULT_APP_NAME)) {
+            checkEquals("a document naming " + describe(name) + " is refused",
+                    IDENTITY_NAME_REFUSAL, identityReject(List.of("application/json"),
+                            identityDocument(name, DEFAULT_APP_VERSION)));
+        }
+
+        // A rolling deployment is the case that matters: the answer is a valid
+        // health document from the same codebase at a different version, so only an
+        // exact comparison can tell it apart from this process's own answer.
+        for (String version : List.of("9.9.9", "1.1.1", "1.2.0", "0.1.1")) {
+            checkEquals("a document reporting version " + version + " is refused",
+                    IDENTITY_VERSION_REFUSAL, identityReject(List.of("application/json"),
+                            identityDocument(DEFAULT_APP_NAME, version)));
+        }
+
+        // The order is part of the contract, so it is asserted rather than assumed:
+        // with the framing and both identity fields wrong at once, the framing is
+        // what gets reported, and with the framing right the name outranks the
+        // version.
+        String wrong = identityDocument("IMPOSTOR", "9.9.9");
+        checkEquals("the media type is graded before the identity", MEDIA_TYPE_REFUSAL,
+                identityReject(List.of("text/html"), wrong));
+        checkEquals("the name is graded before the version", IDENTITY_NAME_REFUSAL,
+                identityReject(List.of("application/json"), wrong));
+
+        // A response body is an input, and an input reaching a log line verbatim is
+        // how a forged entry gets written.
+        String planted = "QaW002IdentityMarker";
+        for (String body : List.of(identityDocument(planted, DEFAULT_APP_VERSION),
+                identityDocument(DEFAULT_APP_NAME, planted))) {
+            for (List<String> values : List.of(List.of("application/json"), List.of(planted))) {
+                String reason = identityReject(values, body);
+                check("a refusal never echoes the value the answer supplied",
+                        reason != null && !reason.contains(planted));
+            }
+        }
+
+        // Unreachable through probe, which grades shape first, and asserted anyway:
+        // this method is reachable from the harness, so it has to be total.
+        for (String shape : List.of("{\"status\":\"UP\"", "[]", "null", "")) {
+            check("a body shaped " + describe(shape) + " fails closed on a direct call",
+                    identityReject(List.of("application/json"), shape) != null);
+        }
+        check("a body that is not valid UTF-8 fails closed on a direct call",
+                User.identityRejection(List.of("application/json"),
+                        new byte[] {(byte) 0x7B, (byte) 0xC3, (byte) 0x28, (byte) 0x7D},
+                        DEFAULT_APP_NAME, DEFAULT_APP_VERSION) != null);
+
+        verifyProbeIdentityOverSockets();
+        verifyProbeCeilingBudget();
+    }
+
+    /**
+     * Drives {@code --probe} against decoy listeners, which is the finding itself.
+     *
+     * <p>Five decoys, each serving bytes this application would never serve on a port
+     * this application would be probed on: a document naming another application, one
+     * naming another version, a correct document framed as HTML, one framed as nothing
+     * at all, and one whose Content-Type is repeated. Each must fail closed with the
+     * shared reason and one line, and the two positive controls that follow must
+     * still succeed in silence - otherwise the refusals above would prove only that
+     * the identity step refuses everything.
+     */
+    private static void verifyProbeIdentityOverSockets() throws IOException {
+        String shipped = identityDocument(DEFAULT_APP_NAME, DEFAULT_APP_VERSION);
+        checkDecoyRefused("a decoy naming another application",
+                identityDocument("IMPOSTOR", DEFAULT_APP_VERSION),
+                List.of("application/json"), IDENTITY_NAME_REFUSAL);
+        checkDecoyRefused("a decoy reporting another version",
+                identityDocument(DEFAULT_APP_NAME, "9.9.9"),
+                List.of("application/json"), IDENTITY_VERSION_REFUSAL);
+        checkDecoyRefused("a decoy framing a correct document as HTML",
+                shipped, List.of("text/html"), MEDIA_TYPE_REFUSAL);
+        checkDecoyRefused("a decoy framing a correct document as nothing",
+                shipped, List.of(), MEDIA_TYPE_REFUSAL);
+        checkDecoyRefused("a decoy repeating the media type",
+                shipped, List.of("application/json", "application/json"), MEDIA_TYPE_REFUSAL);
+
+        // The end-to-end positive control: the decoys above must fail because of
+        // what they served, not because the identity step refuses everything.
+        checkProbeAccepts("the shipped contract is still healthy and silent",
+                shipped, DEFAULT_APP_NAME, DEFAULT_APP_VERSION);
+        // Identity is compared against the CONFIGURATION, not against a literal, so
+        // an overridden name and version are what the probe then requires.
+        checkProbeAccepts("a deployment that renames itself still probes itself healthy",
+                identityDocument("renamed-service", "4.5.6"), "renamed-service", "4.5.6");
+    }
+
+    /** Asserts that probing a decoy fails closed with exactly the shared reason. */
+    private static void checkDecoyRefused(String label, String body, List<String> contentTypes,
+            String expected) throws IOException {
+        try (DecoyListener decoy = new DecoyListener(decoyResponse(body, contentTypes))) {
+            int[] verdict = new int[1];
+            String written = withStderr(() -> verdict[0] = User.probe(new User.Config(
+                    DEFAULT_APP_NAME, DEFAULT_APP_VERSION, DEFAULT_HEALTH_PATH,
+                    TEST_HOST, decoy.port())));
+            checkEquals(label + " fails closed", EXIT_FAILURE, verdict[0]);
+            checkEquals(label + " reports exactly the shared reason and one line",
+                    DIAGNOSTIC_PREFIX + "probe rejected: " + expected
+                            + System.lineSeparator(), written);
+        }
+    }
+
+    /** Asserts that probing a listener serving `body` as JSON succeeds in silence. */
+    private static void checkProbeAccepts(String label, String body, String name, String version)
+            throws IOException {
+        try (DecoyListener listener = new DecoyListener(
+                decoyResponse(body, List.of("application/json")))) {
+            int[] verdict = new int[1];
+            String written = withStderr(() -> verdict[0] = User.probe(new User.Config(
+                    name, version, DEFAULT_HEALTH_PATH, TEST_HOST, listener.port())));
+            checkEquals(label, EXIT_SUCCESS, verdict[0]);
+            checkEquals(label + " says nothing at all", "", written);
+        }
+    }
+
+    /**
+     * Builds a raw 200 answer carrying exactly these header lines and body.
+     *
+     * <p>Assembled by hand rather than served by an {@code HttpServer}, because two
+     * of the cases above are about the header block itself - the media type absent,
+     * and the field repeated - which a server API normalises out of reach.
+     */
+    private static byte[] decoyResponse(String body, List<String> contentTypes) {
+        byte[] payload = utf8(body);
+        StringBuilder head = new StringBuilder("HTTP/1.1 200 OK\r\nContent-Length: ")
+                .append(payload.length).append("\r\n");
+        for (String value : contentTypes) {
+            head.append("Content-Type: ").append(value).append("\r\n");
+        }
+        head.append("Connection: close\r\n\r\n");
+        byte[] prefix = utf8(head.toString());
+        byte[] whole = new byte[prefix.length + payload.length];
+        System.arraycopy(prefix, 0, whole, 0, prefix.length);
+        System.arraycopy(payload, 0, whole, prefix.length, payload.length);
+        return whole;
+    }
+
+    /**
+     * A loopback listener that answers every request with one fixed byte string.
+     *
+     * <p>Bound to {@link #TEST_HOST} on an ephemeral port, served by a daemon thread
+     * so an abandoned accept can never hold the harness open, and closed by
+     * try-with-resources on every path. It answers repeatedly rather than once,
+     * because a client that retries must not see a refused connection and report the
+     * wrong fault category.
+     */
+    private static final class DecoyListener implements AutoCloseable {
+
+        private final ServerSocket socket;
+
+        DecoyListener(byte[] response) throws IOException {
+            socket = new ServerSocket(0, 1, InetAddress.getByName(TEST_HOST));
+            Thread worker = new Thread(() -> serve(response), "decoy-listener");
+            worker.setDaemon(true);
+            worker.start();
+        }
+
+        int port() {
+            return socket.getLocalPort();
+        }
+
+        private void serve(byte[] response) {
+            while (!socket.isClosed()) {
+                try (Socket peer = socket.accept()) {
+                    peer.setSoTimeout(REUSE_READ_TIMEOUT_MILLIS);
+                    InputStream in = peer.getInputStream();
+                    // Read the request head and discard it: what is asserted is how
+                    // the probe grades the ANSWER, so the question does not matter.
+                    int consecutive = 0;
+                    int next;
+                    while (consecutive < 2 && (next = in.read()) >= 0) {
+                        if (next == '\n') {
+                            consecutive++;
+                        } else if (next != '\r') {
+                            consecutive = 0;
+                        }
+                    }
+                    OutputStream out = peer.getOutputStream();
+                    out.write(response);
+                    out.flush();
+                } catch (IOException stopped) {
+                    // Closing the listener interrupts the accept above; a peer that
+                    // hangs up early is equally uninteresting. Either way the next
+                    // loop test ends the thread.
+                    return;
+                }
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            socket.close();
+        }
+    }
+
+    /**
+     * The probe body ceiling, from the operator's side.
+     *
+     * <p>F-15: the ceiling is what stops an endless stream, so it is deliberately not
+     * raised - which means a long enough {@code app.name} makes this application's OWN
+     * healthy answer too large to read and the probe fail closed on a working process,
+     * which a container health check then restarts. The budget is documented in
+     * app.config.properties and .env.example, and these checks are what keep the
+     * documented arithmetic true.
+     */
+    private static void verifyProbeCeilingBudget() throws IOException {
+        int overhead = utf8(identityDocument(DEFAULT_APP_NAME, DEFAULT_APP_VERSION)).length
+                - DEFAULT_APP_NAME.length() - DEFAULT_APP_VERSION.length();
+        checkEquals("the documented overhead is the measured overhead",
+                RENDERED_FIXED_OVERHEAD_BYTES, overhead);
+        checkEquals("the shipped identity renders the reference length",
+                REFERENCE_BODY_BYTE_LENGTH,
+                utf8(identityDocument(DEFAULT_APP_NAME, DEFAULT_APP_VERSION)).length);
+
+        int budget = PROBE_BODY_LIMIT - RENDERED_FIXED_OVERHEAD_BYTES
+                - DEFAULT_APP_VERSION.length();
+        String fitting = "a".repeat(budget);
+        checkEquals("the largest name inside the budget renders exactly to the ceiling",
+                PROBE_BODY_LIMIT, utf8(identityDocument(fitting, DEFAULT_APP_VERSION)).length);
+        checkEquals("one byte more renders one byte past it", PROBE_BODY_LIMIT + 1,
+                utf8(identityDocument("a".repeat(budget + 1), DEFAULT_APP_VERSION)).length);
+        checkEquals("an answer at the ceiling is still readable", null,
+                User.probeRejection(200, utf8(identityDocument(fitting, DEFAULT_APP_VERSION))));
+        check("an answer one byte past it is refused on its size",
+                User.probeRejection(200, utf8(identityDocument("a".repeat(budget + 1),
+                        DEFAULT_APP_VERSION))).startsWith("body exceeds the probe limit"));
+
+        // An operator setting a name in an astral script spends four bytes per
+        // character, which is the part of the budget a character count would miss.
+        String astral = "\uD83D\uDE00".repeat(budget / 4);
+        int rendered = utf8(identityDocument(astral, DEFAULT_APP_VERSION)).length;
+        check("the budget counts bytes and not characters",
+                rendered <= PROBE_BODY_LIMIT && rendered > PROBE_BODY_LIMIT - 4);
+        check("one astral character more crosses the ceiling",
+                utf8(identityDocument(astral + "\uD83D\uDE00",
+                        DEFAULT_APP_VERSION)).length > PROBE_BODY_LIMIT);
+        check("the same character count in ASCII is nowhere near the ceiling",
+                utf8(identityDocument("a".repeat(astral.codePointCount(0, astral.length())),
+                        DEFAULT_APP_VERSION)).length < 4000);
+
+        // The drift detector. If the arithmetic above changes, the two files an
+        // operator sets app.name from must change with it.
+        List<String> numbers = List.of(String.valueOf(PROBE_BODY_LIMIT),
+                String.valueOf(RENDERED_FIXED_OVERHEAD_BYTES), String.valueOf(budget),
+                String.valueOf(PROBE_BODY_LIMIT - RENDERED_FIXED_OVERHEAD_BYTES));
+        for (String filename : List.of("app.config.properties", ".env.example")) {
+            String text = Files.readString(Path.of(filename), StandardCharsets.UTF_8);
+            for (String number : numbers) {
+                check(filename + " states the measured " + number, text.contains(number));
+            }
         }
     }
 }
