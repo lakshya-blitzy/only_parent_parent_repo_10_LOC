@@ -1,0 +1,164 @@
+# =============================================================================
+# compose.yaml - start all three health endpoints at once, and OBSERVE them.
+#
+# WHY THIS FILE EXISTS
+#   Dockerfile already builds and runs each implementation, but a container's
+#   HEALTHCHECK result is only visible one container at a time. This file is the
+#   artifact that makes container health observable for the SET: one command
+#   brings up all three implementations, and `docker compose ps` prints the
+#   health of each one beside its name.
+#
+#     docker compose up --build -d    # build all three targets, start all three
+#     docker compose ps               # each service reports (healthy)
+#     docker compose logs python      # the startup line - it goes to stderr
+#     docker compose down             # stop and remove all three
+#
+#   Using this file is entirely OPTIONAL and nothing depends on it. The three
+#   test suites, scripts/verify-health.sh and the workflow all run with no
+#   container at all, and the response contract is identical whether a server
+#   was started here or by a bare `python app.py --serve`. Containerisation is a
+#   recorded tension for a repository this small - the Dockerfile header states
+#   it plainly - so this file keeps that surface minimal and purely additive.
+#
+# THE THREE SERVICES ARE INDEPENDENT
+#   None of them needs, waits for, or talks to another. That is why there is no
+#   depends_on and no explicit network: Compose's implicit default network is
+#   sufficient and no service ever uses it to reach a sibling. Any one can be
+#   run alone - `docker compose up java` - and the three are grouped here only
+#   because watching all of them at once is the entire point.
+#
+#   The three distinct ports are deliberate. 8000, 8001 and 8002 are the
+#   per-language defaults in app.config.properties, and having three of them is
+#   what lets all three listeners bind at the same time on one host.
+#
+# EVERY HEALTH CHECK IS THE APPLICATION CHECKING ITSELF
+#   Each healthcheck below mirrors, declaratively, the HEALTHCHECK already built
+#   into its stage: the same command, the same four timings, the same exit
+#   convention - 0 healthy, 1 unhealthy. It is a MIRROR rather than an override,
+#   so `docker run` and `docker compose up` observe identical health; if a
+#   timing ever changes in Dockerfile, change it here in the same commit.
+#
+#   No healthcheck shells out to a command-line HTTP client, because a slim
+#   Debian base and a JRE base ship none - verified in these exact images,
+#   neither of the two conventional fetchers is present in any of them, and
+#   installing one would enlarge the image and widen its attack surface for a
+#   request the application can already make itself. Each service instead runs
+#   its own --probe mode, which requests its own endpoint using the runtime
+#   already in the image and asserts the whole frozen response contract.
+#
+# CONFIGURATION IS NOT REPEATED HERE
+#   app.config.properties travels into every image beside the program and stays
+#   the single source of truth. APP_NAME, APP_VERSION and HEALTH_PATH are
+#   therefore deliberately NOT set as service environment values: an
+#   environment value outranks the file and would silently shadow it, which is
+#   precisely the drift a single source of truth exists to prevent. The port
+#   mapping is the one number restated here, and each one matches its
+#   per-language default. APP_HOST is already fixed to the wildcard bind in
+#   every runnable stage, because a listener on loopback is unreachable from
+#   outside its container, so it is not repeated either.
+#
+#   Every value remains overridable one key at a time. Each service carries a
+#   commented example: PORT outranks every other source, so uncommenting it
+#   means changing that service's published port to match.
+#
+# NO version: KEY
+#   The top-level version field is obsolete in the Compose Specification and
+#   current Compose warns when it is present. The file format IS the
+#   specification, so declaring a version would buy a warning and nothing else.
+#
+# NO VOLUMES, NO SECRETS, NO EXTRA SERVICES
+#   There is no data store, cache, queue or external service anywhere in this
+#   system, and none is invented here: three application services and nothing
+#   else. No volume is mounted either - each application reads its configuration
+#   from the image and writes only to stderr, so no writable path is needed.
+# =============================================================================
+---
+
+# A fixed project name. Without it the project - and therefore every image
+# Compose builds - is named after whatever the checkout directory happens to be
+# called, which makes the build environment-specific. Fixing it means Compose
+# builds exactly the opprl10-python, opprl10-node and opprl10-java tags the
+# Dockerfile header documents building by hand, and `docker compose ps` reads
+# the same either way.
+name: opprl10
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Python implementation - app.py, serving /health on 8000.
+  # ---------------------------------------------------------------------------
+  python:
+    build:
+      context: .
+      # Selected BY NAME from the one multi-stage Dockerfile. No image tag and
+      # no build step is restated here; the stage owns both.
+      target: python
+    container_name: opprl10-python
+    # PID 1 receives no default signal disposition from the kernel, so a signal
+    # with no handler installed is discarded. app.py deliberately keeps
+    # CPython's default SIGTERM behaviour, which as PID 1 means SIGTERM is
+    # ignored: measured, `docker stop` waited out the full 10s grace period and
+    # then killed the container (10155ms, exit 137). Docker's own init runs as
+    # PID 1 instead and forwards the signal one level down, where the documented
+    # disposition applies - same measurement, 164ms and exit 143. The node and
+    # java services need no init: index.js installs its own SIGTERM handler and
+    # the JVM installs one, and both stopped in ~160ms without it.
+    init: true
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "app.py", "--probe"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+    # Overrides are per key and need no rebuild. PORT outranks every other
+    # source, so match the published mapping above before uncommenting:
+    # environment:
+    #   PORT: 9000
+
+  # ---------------------------------------------------------------------------
+  # JavaScript implementation - index.js, serving /health on 8001.
+  # ---------------------------------------------------------------------------
+  node:
+    build:
+      context: .
+      target: node
+    container_name: opprl10-node
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "node", "index.js", "--probe"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+    # environment:
+    #   PORT: 9001
+
+  # ---------------------------------------------------------------------------
+  # Java implementation - User.java, serving /health on 8002.
+  #
+  # Built from the `java` stage, which is a JRE: the compiler stayed behind in
+  # the `java-build` stage, which is not a service here because it is not
+  # runnable. An absolute -cp in the probe, matching the stage's own
+  # HEALTHCHECK, so the command does not depend on the working directory.
+  # ---------------------------------------------------------------------------
+  java:
+    build:
+      context: .
+      target: java
+    container_name: opprl10-java
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "java", "-cp", "/app", "User", "--probe"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+    # environment:
+    #   PORT: 9002
