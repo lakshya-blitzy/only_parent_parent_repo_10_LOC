@@ -23,11 +23,10 @@ public class User {
     private static final String HEALTH_STATUS = "UP";
     private static final String STATUS_NOT_FOUND = "NOT_FOUND";
     private static final String STATUS_METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED";
-    private static final String STATUS_BAD_REQUEST = "BAD_REQUEST";
 
     // The two fields HTTP frames a request payload with. A liveness answer needs no payload,
-    // so a request announcing one is refused instead of read: reading a body is the one
-    // thing a client can make this program wait for.
+    // so a request announcing one is answered without its payload being read: reading a body
+    // is the one thing a client can make this program wait for.
     private static final String CONTENT_LENGTH_HEADER = "Content-Length";
     private static final String TRANSFER_ENCODING_HEADER = "Transfer-Encoding";
 
@@ -48,10 +47,9 @@ public class User {
     private static final String MAX_REQUEST_SECONDS = "10";
     private static final String MAX_RESPONSE_SECONDS = "10";
 
-    // How many requests may be handled at once. Bounded, so no client can make this process
-    // create threads without end, and more than one, so a request that stops progressing
-    // cannot be the only thing this listener is doing.
-    private static final int HANDLER_THREADS = 8;
+    // What every thread this listener creates is called, numbered from the suffix onwards.
+    private static final String HANDLER_THREAD_PREFIX = "-health-";
+    private static final long FIRST_HANDLER_THREAD = 0;
 
     private static final String SERVE_FLAG = "--serve";
 
@@ -270,25 +268,19 @@ public class User {
             rejectMethod(exchange, path, withBody);
             return;
         }
-        // Read once and carried into both replies below: a request whose payload this program
-        // refuses to read is also a request whose connection it has to end, since the bytes
-        // left on that connection would otherwise be misread as the request after it.
+        // Read once and carried into both replies below. A declared payload changes nothing
+        // about which reply a request receives - the status and body are the ones this
+        // contract specifies either way - only whether the connection survives it: the
+        // payload is never read, because waiting for a body a sender never sends is exactly
+        // how one client could keep this endpoint from answering, and bytes left unread on a
+        // kept-alive connection would be misread as the request after it.
         boolean carriesPayload = declaresBody(exchange);
         if (!HEALTH_PATH.equals(path)) {
             sendJson(exchange, 404, statusPayload(STATUS_NOT_FOUND), withBody, null,
                 carriesPayload);
             return;
         }
-        if (carriesPayload) {
-            // Tested after the method and the path, so every reply this contract specifies
-            // is still the reply those requests receive. What is refused here is the one
-            // request shape it does not describe: a liveness probe carrying a payload, which
-            // is answered without reading it, because waiting for a body a sender never
-            // sends is exactly how one client could keep this endpoint from answering.
-            sendJson(exchange, 400, statusPayload(STATUS_BAD_REQUEST), withBody, null, true);
-            return;
-        }
-        sendJson(exchange, 200, healthPayload(), withBody, null, false);
+        sendJson(exchange, 200, healthPayload(), withBody, null, carriesPayload);
     }
 
     private static void rejectMethod(HttpExchange exchange, String path, boolean withBody)
@@ -334,9 +326,10 @@ public class User {
             report(APP_NAME + ": cannot bind " + where + ": " + bindReason(error));
             return 1;
         }
-        // Requests are answered on these threads rather than on the one thread the listener
-        // dispatches from, so a client that stops sending holds a handler rather than the
-        // listener itself and the endpoint keeps answering everyone else.
+        // Requests are answered on threads of this listener's own rather than on the one
+        // thread it dispatches from, and on one such thread each, so a client that stops
+        // sending holds nothing but the thread reading it and the endpoint keeps answering
+        // everyone else.
         ExecutorService handlers = handlerPool();
         server.setExecutor(handlers);
         // One context at the root and one handler: the rule in handleRequest is the whole
@@ -377,13 +370,19 @@ public class User {
     }
 
     private static ExecutorService handlerPool() {
-        return Executors.newFixedThreadPool(HANDLER_THREADS, runnable -> {
-            Thread worker = new Thread(runnable, APP_NAME + "-health");
-            // Daemon threads, so what keeps this process alive is still the listener's own
-            // thread and nothing here changes the status a signal produces.
-            worker.setDaemon(true);
-            return worker;
-        });
+        // One thread per exchange rather than a fixed set of them, because the platform reads
+        // a request head on the thread it hands the exchange to: with a fixed set, that many
+        // clients that stop sending mid-head occupy every thread and this endpoint answers
+        // nobody until their deadline expires - the same denial a single client could cause
+        // when handling ran on the dispatch thread. A virtual thread is what makes one per
+        // exchange affordable: it costs a few kilobytes rather than a megabyte of stack, it
+        // releases its carrier while a read waits, and it is always a daemon, so what keeps
+        // this process alive is still the listener's own thread and the status a signal
+        // produces is unchanged. What bounds the work one client can create is the request
+        // and response deadline set in limitRequestHandling(), not a thread count.
+        return Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
+            .name(APP_NAME + HANDLER_THREAD_PREFIX, FIRST_HANDLER_THREAD)
+            .factory());
     }
 
     private static String environment(String variable) {
