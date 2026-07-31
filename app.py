@@ -57,9 +57,14 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     timeout = 10
 
     # BaseHTTPRequestHandler answers an unsupported verb or a malformed request
-    # line with an HTML page. Re-point that template at a compact JSON document so
-    # that every response this program can emit is JSON, and so that nothing the
-    # client sent is echoed back to it.
+    # line with an HTML page that quotes what the client sent. Re-point that
+    # template at a compact JSON document so that every response this program can
+    # emit is JSON and no request content reaches any response body. The status
+    # line is the one place the standard library still names the offending token,
+    # which it renders with %r: a request-line token cannot contain a carriage
+    # return, a line feed, a space or a tab, and control characters come back
+    # escaped, so that reason phrase can neither split a response nor inject a
+    # header, and it discloses nothing except the client's own input.
     error_content_type = "application/json"
     error_message_format = '{"status":"ERROR","code":%(code)d}'
 
@@ -141,21 +146,34 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         sys.stderr.flush()
 
 
+class InvalidHealthConfig(Exception):
+    # Raised when an environment override is present but unusable. It carries the
+    # operator-facing sentence, so the caller can report the fault on one line and
+    # exit non-zero without a traceback ever reaching the operator.
+    pass
+
+
 def health_port():
     port = os.environ.get("HEALTH_PORT", "").strip()
     if not port:
+        # Unset, empty or whitespace-only means "not overridden", which is not a
+        # fault: the documented default applies, silently.
         return DEFAULT_PORT
     try:
         number = int(port)
     except ValueError:
-        # Rejected by the range check below, which reports the substitution once.
-        number = 0
-    if not 0 < number < 65536:
-        # A malformed or out-of-range override falls back to the default instead of
-        # aborting startup, and the fallback is reported so it is never silent.
-        sys.stderr.write(f"{APP_NAME}: ignoring invalid HEALTH_PORT {port}, using {DEFAULT_PORT}\n")
-        sys.stderr.flush()
-        return DEFAULT_PORT
+        # Rejected by the check below, which reports every unusable value alike.
+        number = None
+    if number is None or not 0 < number < 65536:
+        # An override that is present but cannot be honoured is a configuration
+        # fault, so startup stops here. Falling back to the default would answer a
+        # typo by silently moving the endpoint off the port that was asked for: the
+        # process would report itself UP while the probe watching the intended port
+        # saw nothing at all. Failing fast makes that mistake impossible to miss,
+        # and !r keeps a value carrying spaces or control characters both visible
+        # and confined to a single line.
+        raise InvalidHealthConfig(
+            f"invalid HEALTH_PORT {port!r}: expected an integer from 1 to 65535")
     return number
 
 
@@ -169,7 +187,15 @@ def stop_on_signal(signum, frame):
 
 def serve_health():
     host = os.environ.get("HEALTH_HOST", "").strip() or DEFAULT_HOST
-    port = health_port()
+    try:
+        port = health_port()
+    except InvalidHealthConfig as error:
+        # Reported in the same shape as the bind failure below, one readable line
+        # and a non-zero status, so that no listener is ever started on an address
+        # nobody asked for.
+        sys.stderr.write(f"{APP_NAME}: {error}\n")
+        sys.stderr.flush()
+        return 1
     try:
         server = ThreadingHTTPServer((host, port), HealthRequestHandler)
     except OSError as error:
