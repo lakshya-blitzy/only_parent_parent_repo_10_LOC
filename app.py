@@ -166,6 +166,30 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         # not serve. index.js draws the line in the same place.
         return self.path.split("?", 1)[0]
 
+    def send_response(self, code, message=None):
+        # The status line, and the only header the standard library adds here that this
+        # program is willing to send. BaseHTTPRequestHandler.send_response() appends two
+        # of its own to every response: Date, and a Server header whose value is
+        # version_string() - server_version followed by sys_version, which reads
+        # "BaseHTTP/0.6 Python/3.12.13". That names the library and the interpreter this
+        # endpoint runs on down to their patch levels, on the one route a liveness probe
+        # is guaranteed to reach, and a patch level is precisely what a published
+        # advisory is indexed by. It is also something nobody asked this program for: the
+        # response already carries the only name and version this contract publishes, and
+        # both of those describe the application rather than the machinery underneath it.
+        # So the header is not sent at all. HTTP has always made it optional, and
+        # index.js sends none either, so the two applications now answer with the same
+        # set of headers as well as the same document. Date is kept, because RFC 9110
+        # asks an origin server that knows the time to date its responses, and because it
+        # describes the response rather than this program. The access record is unchanged:
+        # log_request() below is the redacted one this class defines. Overriding here
+        # rather than at the single call site is what makes this hold for every response
+        # the program can emit, including the ones send_error() writes for a request the
+        # standard library could not parse.
+        self.log_request(code)
+        self.send_response_only(code, message)
+        self.send_header("Date", self.date_time_string())
+
     def send_json(self, status, payload, with_body=True, allow=None, close=False):
         # Compact separators are part of the wire contract: the default ", " and
         # ": " separators pad the document with whitespace and would make this
@@ -326,18 +350,28 @@ def stop_on_signal(signum, frame):
 
 
 def serve_health():
-    # Stop handling is installed before the first step that can fail, block or take any
-    # measurable time. Registering it only once the listener was up left a window -
-    # environment reads, then the bind - in which a SIGTERM from a supervisor took the
-    # interpreter's default action: the process died on the signal with no notice on
-    # descriptor 2 and a signal exit status, even though it had been asked to stop
-    # politely. SIGINT already arrives as KeyboardInterrupt, and routing SIGTERM into the
-    # same exception is what lets both signals leave through the one shutdown path below,
-    # whether they arrive during startup or an hour into serving.
-    signal.signal(signal.SIGINT, stop_on_signal)
-    signal.signal(signal.SIGTERM, stop_on_signal)
     server = None
     try:
+        # Stop handling is installed before the first step that can fail, block or take
+        # any measurable time. Registering it only once the listener was up left a window -
+        # environment reads, then the bind - in which a SIGTERM from a supervisor took the
+        # interpreter's default action: the process died on the signal with no notice on
+        # descriptor 2 and a signal exit status, even though it had been asked to stop
+        # politely. SIGINT already arrives as KeyboardInterrupt, and routing SIGTERM into
+        # the same exception is what lets both signals leave through the one shutdown path
+        # below, whether they arrive during startup or an hour into serving.
+        #
+        # It is installed from inside this block rather than ahead of it, because the
+        # earliest signal these two lines can catch is one that arrives while the second
+        # of them is still running: the handler exists by then, so it raises, and with the
+        # registration sitting outside the block that exception had nowhere to go. It left
+        # through this function uncaught, which printed the interpreter's own traceback -
+        # interpreter path, library path and source path with it - and ended the process on
+        # a signal status, for a stop request the program was in the middle of arming
+        # itself to honour. Registering here means the shutdown path exists before the
+        # handlers that reach it do.
+        signal.signal(signal.SIGINT, stop_on_signal)
+        signal.signal(signal.SIGTERM, stop_on_signal)
         try:
             # Both overrides are validated before anything is constructed, so a value
             # that cannot be honoured stops startup instead of reaching a socket call.
@@ -379,10 +413,11 @@ def serve_health():
         report(f"{APP_NAME} {APP_VERSION} serving {HEALTH_PATH} on http://{host}:{port}")
         server.serve_forever()
     except KeyboardInterrupt:
-        # Reached from a signal delivered at any point above: while an override was being
-        # read, while the socket was being bound, or while requests were being served. The
-        # notice and the exit status are the same in every case, and the listener - if one
-        # exists by then - is closed by the finally below.
+        # Reached from a signal delivered at any point above: while stop handling was
+        # still being installed, while an override was being read, while the socket was
+        # being bound, or while requests were being served. The notice and the exit status
+        # are the same in every case, and the listener - if one exists by then - is closed
+        # by the finally below.
         report(f"{APP_NAME}: shutting down")
     finally:
         # Releases the listening socket, so the port is free the moment this process
