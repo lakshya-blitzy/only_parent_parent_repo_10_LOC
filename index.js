@@ -332,12 +332,16 @@ function startHealthServer() {
   if (host === null) {
     // Reported in the same shape as the bind failure below, one readable line and a
     // non-zero status, so that no listener is ever started on an address nobody asked
-    // for. The quoting is composed on purpose: JSON.stringify escapes the control
-    // characters but leaves U+2028 and U+2029 exactly as they arrived, so logSafe
-    // finishes the job and the offending value cannot break out of this single line.
-    process.stderr.write(logSafe(APP_NAME + ": invalid HEALTH_HOST " +
-      JSON.stringify(requestedHost) + ": expected a host name or address with no " +
-      "blanks and no control characters") + "\n");
+    // for. The rejected value is deliberately not quoted back: an environment variable
+    // is a common place for a secret to be pasted by mistake, and a diagnostic is the
+    // one part of this program that is routinely collected, forwarded and kept, so
+    // echoing the value would write whatever was supplied into a log this program does
+    // not control. Naming the variable and the rule it broke is all an operator needs
+    // to correct it, and they already have the value: they set it. app.py withholds it
+    // for the same reason and in the same words. Every line still leaves through
+    // logSafe, so a diagnostic can never span more than one line.
+    process.stderr.write(logSafe(APP_NAME + ": invalid HEALTH_HOST: expected a host " +
+      "name or address with no blanks and no control characters") + "\n");
     process.exitCode = 1;
     return;
   }
@@ -346,31 +350,19 @@ function startHealthServer() {
   if (port === null) {
     // Reported in the same shape as the bind failure below, one readable line and a
     // non-zero status, so that no listener is ever started on an address nobody asked
-    // for. JSON.stringify quotes the offending value, which keeps a stray space or
-    // control character both visible and confined to this single line.
-    process.stderr.write(logSafe(APP_NAME + ": invalid HEALTH_PORT " +
-      JSON.stringify(requested) + ": expected 1 to " + PORT_MAX_DIGITS +
-      " decimal digits denoting a port from 1 to 65535") + "\n");
+    // for. The rejected value is withheld for the reason given above: an environment
+    // variable can carry a secret, and a diagnostic outlives the process that wrote it.
+    process.stderr.write(logSafe(APP_NAME + ": invalid HEALTH_PORT: expected 1 to " +
+      PORT_MAX_DIGITS + " decimal digits denoting a port from 1 to 65535") + "\n");
     process.exitCode = 1;
     return;
   }
   const server = http.createServer(handleRequest);
   let stopping = false;
-  const shutdown = function () {
-    // One closure serves both signals, and it runs its body once however many
-    // signals arrive.
-    if (stopping) {
-      return;
-    }
-    stopping = true;
-    process.stderr.write(logSafe(APP_NAME + ": shutting down") + "\n");
-    // Dropping both handlers restores the default action for a second interrupt and
-    // lets the event loop drain, so the process ends with status 0 by itself once the
-    // socket is closed, with every diagnostic already flushed. process.exit() would
-    // risk truncating those writes whenever descriptor 2 is a pipe.
-    process.removeListener("SIGINT", shutdown);
-    process.removeListener("SIGTERM", shutdown);
-    // Releases the listening socket, so the port is free from here on.
+  const closeListener = function () {
+    // Releases the listening socket, so the port is free from here on. Safe to call
+    // before the socket is up as well as after: with nothing bound yet, close() cancels
+    // the pending bind rather than leaving one behind.
     server.close();
     // server.close() stops new connections but waits for every existing one, so on its
     // own a keep-alive connection sitting between requests, a request whose head never
@@ -388,15 +380,55 @@ function startHealthServer() {
       server.closeAllConnections();
     }
   };
+  const dropSignalHandlers = function (handler) {
+    // Restores the default action for a second interrupt and lets the event loop drain,
+    // so the process ends with the status it already has once the socket is closed, with
+    // every diagnostic flushed. process.exit() would risk truncating those writes
+    // whenever descriptor 2 is a pipe. The handler is passed in rather than closed over,
+    // so this reads in the order it runs and nothing is referenced before it exists.
+    process.removeListener("SIGINT", handler);
+    process.removeListener("SIGTERM", handler);
+  };
+  const shutdown = function () {
+    // One closure serves both signals, and it runs its body once however many
+    // signals arrive - including a signal that arrives before the listener is up, which
+    // is why it is registered before listen() below rather than from its callback.
+    if (stopping) {
+      return;
+    }
+    stopping = true;
+    process.stderr.write(logSafe(APP_NAME + ": shutting down") + "\n");
+    dropSignalHandlers(shutdown);
+    closeListener();
+  };
   server.on("error", function (error) {
     // Binding is the first operation in this program that can fail for reasons
     // outside its control, most often because the port is already taken. One readable
-    // line and a non-zero status serve the operator better than a stack dump. No
-    // signal handler is registered yet and no socket is listening, so the event loop
-    // drains and the process ends with this status on its own.
-    process.stderr.write(logSafe(APP_NAME + ": cannot bind " + host + ":" + port + ": " +
-      bindFailureReason(error)) + "\n");
+    // line and a non-zero status serve the operator better than a stack dump. No socket
+    // is listening, so once the two signal handlers are dropped the event loop drains
+    // and the process ends with this status on its own. Dropping them matters for what
+    // they would otherwise say rather than for the exit: a signal arriving after a
+    // failed start would announce a shutdown of a listener that never existed.
+    //
+    // Naming the address is what makes the line actionable, so the default is named in
+    // full: that literal is declared at the top of this file, and repeating a value
+    // already present in the source discloses nothing. A host that arrived in
+    // HEALTH_HOST is named only by its variable, because the checks above accept any
+    // printable, blank-free word as a host name and only the resolver can discover that
+    // the word names nothing. Such a value must not reach this record, and here that
+    // takes two steps rather than one: the runtime puts the host it could not resolve
+    // into the message itself, as in "getaddrinfo ENOTFOUND <host>", so the reason is
+    // reported by its error code instead. The code is a fixed symbol such as ENOTFOUND
+    // or EADDRINUSE, which names the failure exactly and cannot carry anything the
+    // environment supplied. The port is always named because it is validated to be
+    // nothing but decimal digits.
+    const where = host === DEFAULT_HOST ? host + ":" + port :
+      "the address named by HEALTH_HOST, port " + port;
+    const reason = host === DEFAULT_HOST ? bindFailureReason(error) :
+      (error.code || "bind failed");
+    process.stderr.write(logSafe(APP_NAME + ": cannot bind " + where + ": " + reason) + "\n");
     process.exitCode = 1;
+    dropSignalHandlers(shutdown);
   });
   server.on("clientError", function (error, socket) {
     // A request Node could not parse never reaches the router. Answer it with JSON
@@ -432,14 +464,28 @@ function startHealthServer() {
     }
     socket.end(connectResponse(request));
   });
+  // Registered before listen() rather than from its callback. listen() completes on a
+  // later turn of the event loop, so a supervisor's SIGTERM arriving in between used to
+  // find no handler at all: the runtime took its default action and the process died on
+  // the signal with no notice on descriptor 2 and a signal exit status, even though it
+  // had been asked to stop politely. Registering here closes that window, because a
+  // signal delivered during this synchronous startup is not dispatched until the turn
+  // ends - by which point shutdown is armed. It cannot keep a failed start alive either:
+  // a signal listener does not hold the event loop open, and the bind-failure path above
+  // drops both listeners anyway.
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
   server.listen(port, host, function () {
+    if (stopping) {
+      // A stop was requested while the bind was still in flight. Whether or not the
+      // socket came up in the meantime, closing it here is what guarantees the port is
+      // released and the event loop can drain, so the shutdown already announced is the
+      // one that actually happens.
+      closeListener();
+      return;
+    }
     process.stderr.write(logSafe(APP_NAME + " " + APP_VERSION + " serving " + HEALTH_PATH +
       " on http://" + host + ":" + port) + "\n");
-    // Registered only once the listener is up: before that there is nothing to shut
-    // down, and a signal handle would keep a failed start alive instead of letting it
-    // exit with the status reported above.
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
   });
 }
 

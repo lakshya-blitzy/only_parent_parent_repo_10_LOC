@@ -66,10 +66,21 @@ def log_safe(text):
     # terminal escape reaching a terminal is acted on rather than printed, so any
     # character that is not printable is replaced by its escape sequence instead.
     # Printable text - which is all a host name, an address, an operator-facing
-    # sentence or a request line legitimately consists of - is returned unchanged,
-    # so every diagnostic reads exactly as written and occupies exactly one line.
+    # sentence or a runtime error message legitimately consists of - is returned
+    # unchanged, so every diagnostic reads exactly as written and occupies one line.
     return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii")
                    for ch in text)
+
+
+def report(text):
+    # Every line this program writes to file descriptor 2 leaves through here, so the
+    # escaping above cannot be bypassed by any diagnostic and none of them can span
+    # more than one line. The explicit flush puts each line on the stream the moment it
+    # is written, whatever buffering the runtime chose for a redirected descriptor 2.
+    # Nothing is ever written to descriptor 1 from here: that stream carries only the
+    # output this program has always produced.
+    sys.stderr.write(log_safe(text) + "\n")
+    sys.stderr.flush()
 
 
 class HealthRequestHandler(BaseHTTPRequestHandler):
@@ -104,7 +115,9 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             super().handle()
         except ConnectionError as error:
             self.close_connection = True
-            self.log_message("client disconnected: %s", error)
+            # The message comes from the operating system, names an errno and nothing the
+            # client sent, so it is safe to record as it stands.
+            self.log_event(f"client disconnected: {error}")
 
     def do_GET(self):
         self.dispatch(with_body=True)
@@ -173,17 +186,61 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         if with_body:
             self.wfile.write(body)
 
+    def log_event(self, event):
+        # The one place this handler records anything. Only text this class composes
+        # itself reaches it, so nothing derived from a request can be written. Access
+        # lines and handler diagnostics belong on file descriptor 2 so that descriptor 1
+        # carries only this program's original output.
+        report(f"{APP_NAME}: [{self.log_date_time_string()}] {event}")
+
+    def log_request(self, code="-", size="-"):
+        # The access line, and deliberately only the response status this program chose.
+        # BaseHTTPRequestHandler's own access line quotes the request line exactly as the
+        # client sent it and prefixes the address it came from, so a probe of
+        # /health?token=... put that token, and the address that sent it, on descriptor 2
+        # for whoever reads the logs afterwards. A liveness endpoint is polled by anything
+        # that can reach it and its target is chosen by the caller, so neither the request
+        # line nor the peer address belongs in a log record. The status is the whole of the
+        # operationally useful signal and, unlike the request line, it comes from this
+        # program rather than from the client. int() renders an HTTPStatus as its number
+        # on every version that ships one.
+        self.log_event(f"responded {int(code) if isinstance(code, int) else code}")
+
+    def log_error(self, format, *args):
+        # send_error() reports its diagnosis through here, and the standard library's
+        # diagnosis of a request it could not parse quotes the offending token - "code
+        # 400, message Bad request version ('HTTP/9')" - which is client input. The
+        # arguments are therefore dropped and only the fact is recorded. The status of the
+        # response that follows is still recorded by log_request() above, so nothing
+        # operationally useful is lost with them.
+        self.log_event("request could not be served as sent")
+
     def log_message(self, format, *args):
-        # Access lines and handler diagnostics belong on file descriptor 2 so that
-        # descriptor 1 carries only this program's original output. An access line
-        # quotes the request line exactly as the client sent it, which makes this the
-        # most exposed sink in the program, so the finished line goes through log_safe
-        # before it is written.
-        stamp = self.log_date_time_string()
-        client = self.address_string()
-        record = f"{APP_NAME}: [{stamp}] {client} {format % args}"
-        sys.stderr.write(log_safe(record) + "\n")
-        sys.stderr.flush()
+        # A guard rather than a sink. Both standard-library callers are overridden above -
+        # log_request() for a request that was answered and log_error() for one that was
+        # not - so nothing reaches here today. Anything that ever did would arrive with
+        # request text already interpolated into it, so the arguments are withheld instead
+        # of written, and the call is still recorded so that it cannot pass unnoticed.
+        self.log_event("standard library diagnostic withheld")
+
+
+class HealthServer(ThreadingHTTPServer):
+    # A thread per connection, so one slow or half-open client cannot keep a probe
+    # waiting, exactly as ThreadingHTTPServer provides. The one behavior changed here is
+    # how an unexpected handler exception is reported.
+
+    def handle_error(self, request, client_address):
+        # socketserver reports an exception the handler did not catch by printing two
+        # separator lines, the address the request came from, and a full traceback. That
+        # is four lines where this program emits one, it puts the peer's address on
+        # descriptor 2, and the traceback discloses interpreter and source paths - none of
+        # which belongs in the output of a liveness endpoint. The exception type is
+        # recorded instead: it comes from this program rather than from the request, and
+        # it is enough to tell an operator that a fault occurred and which one. The
+        # exception is swallowed here exactly as it is by the default, so one failed
+        # request never takes the listener down with it.
+        error = sys.exc_info()[1]
+        report(f"{APP_NAME}: request handling failed: {type(error).__name__}")
 
 
 class InvalidHealthConfig(Exception):
@@ -209,9 +266,16 @@ def health_host():
         # quietly trimmed to something bindable would put the endpoint on an address
         # nobody asked for. The same rule is applied by index.js, so an override is
         # accepted or rejected identically whichever application reads it.
+        #
+        # The rejected value is deliberately not quoted back. An environment variable is
+        # a common place for a secret to be pasted by mistake, and a diagnostic is the
+        # one part of this program that is routinely collected, forwarded and kept, so
+        # echoing the value would write whatever was supplied into a log this program
+        # does not control. Naming the variable and the rule it broke is all an operator
+        # needs to correct it, and they already have the value: they set it.
         raise InvalidHealthConfig(
-            f"invalid HEALTH_HOST {host!r}: expected a host name or address with no "
-            "blanks and no control characters")
+            "invalid HEALTH_HOST: expected a host name or address with no blanks and no "
+            "control characters")
     return host
 
 
@@ -236,61 +300,96 @@ def health_port():
     # so startup stops here. Falling back to the default would answer a typo by
     # silently moving the endpoint off the port that was asked for: the process
     # would report itself UP while the probe watching the intended port saw nothing
-    # at all. Failing fast makes that mistake impossible to miss, and !r keeps a
-    # value carrying spaces or control characters both visible and confined to a
-    # single line.
+    # at all. Failing fast makes that mistake impossible to miss. The rejected value
+    # is not quoted back, for the reason given in health_host() above: an environment
+    # variable can carry a secret, and a diagnostic outlives the process that wrote it.
     raise InvalidHealthConfig(
-        f"invalid HEALTH_PORT {port!r}: expected 1 to {PORT_MAX_DIGITS} decimal "
-        "digits denoting a port from 1 to 65535")
+        f"invalid HEALTH_PORT: expected 1 to {PORT_MAX_DIGITS} decimal digits denoting "
+        "a port from 1 to 65535")
 
 
 def stop_on_signal(signum, frame):
-    # Signal handlers run on the main thread, so raising from here unwinds
-    # serve_forever and reaches the shutdown path below. Calling server.shutdown()
-    # from a handler would deadlock instead, because it waits for the very loop the
-    # handler interrupted.
+    # Signal handlers run on the main thread, so raising from here unwinds whatever
+    # startup step or serve_forever loop was running and reaches the one shutdown path
+    # in serve_health below. Calling server.shutdown() from a handler would deadlock
+    # instead, because it waits for the very loop the handler interrupted.
+    #
+    # Both handlers are dropped first, which makes this idempotent: the shutdown path
+    # cannot be re-entered by a second signal and cannot be interrupted by one either,
+    # so it can neither report twice nor surface as a traceback. Restoring the default
+    # action rather than ignoring the signal also means an operator who signals again
+    # is never left waiting - the second one ends the process outright. index.js drops
+    # its two listeners at the same point and for the same reasons.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     raise KeyboardInterrupt
 
 
 def serve_health():
-    try:
-        # Both overrides are validated before anything is constructed, so a value
-        # that cannot be honoured stops startup instead of reaching a socket call.
-        host = health_host()
-        port = health_port()
-    except InvalidHealthConfig as error:
-        # Reported in the same shape as the bind failure below, one readable line
-        # and a non-zero status, so that no listener is ever started on an address
-        # nobody asked for.
-        sys.stderr.write(log_safe(f"{APP_NAME}: {error}") + "\n")
-        sys.stderr.flush()
-        return 1
-    try:
-        server = ThreadingHTTPServer((host, port), HealthRequestHandler)
-    except OSError as error:
-        # Binding is the first operation in this program that can fail for reasons
-        # outside its control, most often because the port is already taken. One
-        # readable line and a non-zero status serve the operator better than a
-        # traceback.
-        failure = f"{APP_NAME}: cannot bind {host}:{port}: {error}"
-        sys.stderr.write(log_safe(failure) + "\n")
-        sys.stderr.flush()
-        return 1
-    # SIGINT already arrives as KeyboardInterrupt, so turning SIGTERM into the same
-    # exception lets both signals leave serve_forever through one shutdown path.
+    # Stop handling is installed before the first step that can fail, block or take any
+    # measurable time. Registering it only once the listener was up left a window -
+    # environment reads, then the bind - in which a SIGTERM from a supervisor took the
+    # interpreter's default action: the process died on the signal with no notice on
+    # descriptor 2 and a signal exit status, even though it had been asked to stop
+    # politely. SIGINT already arrives as KeyboardInterrupt, and routing SIGTERM into the
+    # same exception is what lets both signals leave through the one shutdown path below,
+    # whether they arrive during startup or an hour into serving.
+    signal.signal(signal.SIGINT, stop_on_signal)
     signal.signal(signal.SIGTERM, stop_on_signal)
-    banner = f"{APP_NAME} {APP_VERSION} serving {HEALTH_PATH} on http://{host}:{port}"
-    sys.stderr.write(log_safe(banner) + "\n")
-    sys.stderr.flush()
+    server = None
     try:
+        try:
+            # Both overrides are validated before anything is constructed, so a value
+            # that cannot be honoured stops startup instead of reaching a socket call.
+            host = health_host()
+            port = health_port()
+        except InvalidHealthConfig as error:
+            # Reported in the same shape as the bind failure below, one readable line
+            # and a non-zero status, so that no listener is ever started on an address
+            # nobody asked for.
+            report(f"{APP_NAME}: {error}")
+            return 1
+        try:
+            server = HealthServer((host, port), HealthRequestHandler)
+        except OSError as error:
+            # Binding is the first operation in this program that can fail for reasons
+            # outside its control, most often because the port is already taken. One
+            # readable line and a non-zero status serve the operator better than a
+            # traceback.
+            #
+            # Naming the address is what makes the line actionable, so the default is
+            # named in full: that literal is declared at the top of this file, and
+            # repeating a value already present in the source discloses nothing. A host
+            # that arrived in HEALTH_HOST is named only by its variable, because the
+            # checks above accept any printable, blank-free word as a host name and only
+            # the resolver can discover that the word names nothing. A variable set to
+            # something that was never an address - a token, a path, a URL - would
+            # otherwise be copied into a record that outlives this process, and its
+            # length would set the length of this line. Naming the variable tells the
+            # operator exactly where to look without repeating what was found there. The
+            # port is always named because it is validated to be nothing but decimal
+            # digits, so it can carry nothing else, and the reason comes from the errno,
+            # whose text describes the failure without ever quoting the operand.
+            if host == DEFAULT_HOST:
+                where = f"{host}:{port}"
+            else:
+                where = f"the address named by HEALTH_HOST, port {port}"
+            report(f"{APP_NAME}: cannot bind {where}: {error}")
+            return 1
+        report(f"{APP_NAME} {APP_VERSION} serving {HEALTH_PATH} on http://{host}:{port}")
         server.serve_forever()
     except KeyboardInterrupt:
-        sys.stderr.write(log_safe(f"{APP_NAME}: shutting down") + "\n")
-        sys.stderr.flush()
+        # Reached from a signal delivered at any point above: while an override was being
+        # read, while the socket was being bound, or while requests were being served. The
+        # notice and the exit status are the same in every case, and the listener - if one
+        # exists by then - is closed by the finally below.
+        report(f"{APP_NAME}: shutting down")
     finally:
-        # Releases the listening socket, so the port is free the moment this
-        # process ends. Request threads are daemons and never delay this call.
-        server.server_close()
+        # Releases the listening socket, so the port is free the moment this process
+        # ends. Request threads are daemons and never delay this call. Guarded because a
+        # signal or a failed bind can reach here before there is a server to close.
+        if server is not None:
+            server.server_close()
     return 0
 
 
