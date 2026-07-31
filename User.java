@@ -1,11 +1,14 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class User {
     private static final String APP_NAME = "user-app";
@@ -20,6 +23,35 @@ public class User {
     private static final String HEALTH_STATUS = "UP";
     private static final String STATUS_NOT_FOUND = "NOT_FOUND";
     private static final String STATUS_METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED";
+    private static final String STATUS_BAD_REQUEST = "BAD_REQUEST";
+
+    // The two fields HTTP frames a request payload with. A liveness answer needs no payload,
+    // so a request announcing one is refused instead of read: reading a body is the one
+    // thing a client can make this program wait for.
+    private static final String CONTENT_LENGTH_HEADER = "Content-Length";
+    private static final String TRANSFER_ENCODING_HEADER = "Transfer-Encoding";
+
+    // Three platform settings this listener cannot leave at their defaults, because each
+    // default lets one unfinished request hold the thread serving it for as long as its
+    // sender likes: an unread request body is otherwise read and discarded when the exchange
+    // closes (64k), and nothing bounds how long a request may take to arrive or a reply to
+    // be read (no deadline at all). Discarding nothing and closing a connection that stops
+    // progressing is what keeps this endpoint answerable while such a client is connected.
+    // They are properties rather than API calls, and the platform reads them once as its
+    // server classes initialise, so they are set before the first call into them.
+    private static final String DRAIN_AMOUNT_PROPERTY = "sun.net.httpserver.drainAmount";
+    private static final String MAX_REQUEST_TIME_PROPERTY = "sun.net.httpserver.maxReqTime";
+    private static final String MAX_RESPONSE_TIME_PROPERTY = "sun.net.httpserver.maxRspTime";
+    private static final String DRAIN_AMOUNT = "0";
+
+    // Seconds, matching the read timeout the Python listener applies to the same contract.
+    private static final String MAX_REQUEST_SECONDS = "10";
+    private static final String MAX_RESPONSE_SECONDS = "10";
+
+    // How many requests may be handled at once. Bounded, so no client can make this process
+    // create threads without end, and more than one, so a request that stops progressing
+    // cannot be the only thing this listener is doing.
+    private static final int HANDLER_THREADS = 8;
 
     private static final String SERVE_FLAG = "--serve";
 
@@ -150,6 +182,50 @@ public class User {
         return path == null ? "" : path;
     }
 
+    private static boolean declaresBody(HttpExchange exchange) {
+        // HTTP announces a request payload with one of two fields, so their presence is the
+        // whole test: any Transfer-Encoding at all, or a Content-Length above zero.
+        if (exchange.getRequestHeaders().getFirst(TRANSFER_ENCODING_HEADER) != null) {
+            return true;
+        }
+        String declared = exchange.getRequestHeaders().getFirst(CONTENT_LENGTH_HEADER);
+        if (declared == null) {
+            return false;
+        }
+        String length = trimBlanks(declared);
+        if (length.isEmpty()) {
+            return false;
+        }
+        if (!isAsciiDigits(length)) {
+            // A length this program cannot read as a number frames a request it cannot read
+            // either, so it counts as a payload rather than as an absent one.
+            return true;
+        }
+        for (int index = 0; index < length.length(); index++) {
+            // Tested digit by digit rather than converted, so a length too long for any
+            // numeric type still answers this question instead of failing to parse.
+            if (length.charAt(index) != '0') {
+                return true;
+            }
+        }
+        // A declared length of zero frames no payload, so such a request is served normally.
+        return false;
+    }
+
+    private static void endRequest(HttpExchange exchange) throws IOException {
+        // Only requests that announced no payload reach here, so this read reports the end
+        // of the stream at once without waiting on the connection. Reaching that end is what
+        // keeps the connection reusable: nothing is discarded on this program's behalf any
+        // more, so a request stream left unread closes the connection instead.
+        InputStream request = exchange.getRequestBody();
+        if (request.read() != -1) {
+            // A byte HTTP's own framing rules say cannot be there. It is discarded and the
+            // stream closed rather than read on, because no request payload has any part in
+            // a liveness answer.
+            request.close();
+        }
+    }
+
     private static void sendJson(HttpExchange exchange, int status, String payload,
             boolean withBody, String allow, boolean close) throws IOException {
         // Every reply leaves through here, so there is one place where the wire contract is
@@ -164,6 +240,10 @@ public class User {
             // Closing discards an unread request payload, so it can never be misread as the
             // start of the next request on this connection.
             exchange.getResponseHeaders().set("Connection", "close");
+        } else {
+            // This connection is to stay open, which it only can once the request it is
+            // carrying has been read to its end.
+            endRequest(exchange);
         }
         if (!withBody) {
             // The no-body form. Its negative length is also why a HEAD reply carries no
@@ -184,13 +264,28 @@ public class User {
         String path = requestPath(exchange);
         boolean withBody = !"HEAD".equals(method);
         // The method is tested before the path so that a rejected method is answered the
-        // same way on every target, not only on the one resource this program serves.
+        // same way on every target, not only on the one resource this program serves. Those
+        // replies already end their connection, so they need no payload test of their own.
         if (!"GET".equals(method) && !"HEAD".equals(method)) {
             rejectMethod(exchange, path, withBody);
             return;
         }
+        // Read once and carried into both replies below: a request whose payload this program
+        // refuses to read is also a request whose connection it has to end, since the bytes
+        // left on that connection would otherwise be misread as the request after it.
+        boolean carriesPayload = declaresBody(exchange);
         if (!HEALTH_PATH.equals(path)) {
-            sendJson(exchange, 404, statusPayload(STATUS_NOT_FOUND), withBody, null, false);
+            sendJson(exchange, 404, statusPayload(STATUS_NOT_FOUND), withBody, null,
+                carriesPayload);
+            return;
+        }
+        if (carriesPayload) {
+            // Tested after the method and the path, so every reply this contract specifies
+            // is still the reply those requests receive. What is refused here is the one
+            // request shape it does not describe: a liveness probe carrying a payload, which
+            // is answered without reading it, because waiting for a body a sender never
+            // sends is exactly how one client could keep this endpoint from answering.
+            sendJson(exchange, 400, statusPayload(STATUS_BAD_REQUEST), withBody, null, true);
             return;
         }
         sendJson(exchange, 200, healthPayload(), withBody, null, false);
@@ -224,6 +319,9 @@ public class User {
                 + " to " + PORT_MAX);
             return 1;
         }
+        // Before the first call into the platform's server classes, because that is the only
+        // point at which these settings are still read.
+        limitRequestHandling();
         HttpServer server;
         try {
             server = HttpServer.create(new InetSocketAddress(host, port), 0);
@@ -236,6 +334,11 @@ public class User {
             report(APP_NAME + ": cannot bind " + where + ": " + bindReason(error));
             return 1;
         }
+        // Requests are answered on these threads rather than on the one thread the listener
+        // dispatches from, so a client that stops sending holds a handler rather than the
+        // listener itself and the endpoint keeps answering everyone else.
+        ExecutorService handlers = handlerPool();
+        server.setExecutor(handlers);
         // One context at the root and one handler: the rule in handleRequest is the whole
         // route table, so every target reaches the same decision.
         server.createContext("/", exchange -> {
@@ -253,11 +356,34 @@ public class User {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             report(APP_NAME + ": shutting down");
             server.stop(0);
+            // Stopping the listener leaves the threads it handed work to running, so they
+            // are ended here as well; a request still in flight is abandoned, which is what
+            // a signalled shutdown asks for.
+            handlers.shutdownNow();
         }));
         server.start();
         report(APP_NAME + " " + APP_VERSION + " serving " + HEALTH_PATH + " on http://"
             + host + ":" + port);
         return 0;
+    }
+
+    private static void limitRequestHandling() {
+        // Nothing is discarded on this program's behalf, and a request that stops arriving or
+        // a reply that stops being read is given a deadline instead of the platform's none,
+        // so the work one client can create for this listener is finite.
+        System.setProperty(DRAIN_AMOUNT_PROPERTY, DRAIN_AMOUNT);
+        System.setProperty(MAX_REQUEST_TIME_PROPERTY, MAX_REQUEST_SECONDS);
+        System.setProperty(MAX_RESPONSE_TIME_PROPERTY, MAX_RESPONSE_SECONDS);
+    }
+
+    private static ExecutorService handlerPool() {
+        return Executors.newFixedThreadPool(HANDLER_THREADS, runnable -> {
+            Thread worker = new Thread(runnable, APP_NAME + "-health");
+            // Daemon threads, so what keeps this process alive is still the listener's own
+            // thread and nothing here changes the status a signal produces.
+            worker.setDaemon(true);
+            return worker;
+        });
     }
 
     private static String environment(String variable) {
