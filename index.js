@@ -16,6 +16,34 @@ const DEFAULT_PORT = 3000;
 const HEALTH_PATH = "/health";
 const HEALTH_METHODS = "GET, HEAD";
 
+// The blanks stripped from an override before it is read, and the digits a port may be
+// written with. Both sets are spelled out rather than left to String.prototype.trim()
+// and Number(), because those two disagree with the Python facilities app.py would
+// otherwise reach for: trim() removes U+FEFF where str.strip() does not and leaves
+// U+0085 where str.strip() removes it, and Number() accepts hexadecimal, octal, binary
+// and exponent forms, so HEALTH_PORT=0x4be0 silently started this application on port
+// 19424 while app.py refused the same value. An override has to mean the same thing to
+// every application that reads it, so the grammar is stated here instead of inherited
+// from a language.
+const ASCII_BLANKS = /^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g;
+const PORT_DIGITS = /^[0-9]+$/;
+const PORT_MAX_DIGITS = 5;
+
+// The shape a request line must have for this program to answer a request the runtime's
+// own parser turned away, in rejectedMethodResponse below. MAX_REQUEST_LINE is the window
+// that line has to end inside, and it is deliberately the 65536 bytes app.py's own
+// http.server allows a request line, so the two applications agree about every request
+// line a client can send rather than only about short ones; it also means a packet that
+// carries no request line at all is never scanned past that point. An RFC 9110 method is
+// one or more tchar and is case-sensitive, so "get" names a method this application does
+// not serve rather than a spelling of GET. Both patterns are anchored single character
+// classes, so matching is linear in the length of the bounded input. A request target is
+// only routed and then discarded, so it need only be recognisable: visible ASCII, no
+// spaces and no control characters.
+const MAX_REQUEST_LINE = 65536;
+const METHOD_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const REQUEST_TARGET = /^[!-~]+$/;
+
 function add(a, b) {
   return a + b;
 }
@@ -49,7 +77,7 @@ function rawResponse(status, reason, token, allow) {
     body;
 }
 
-function clientErrorResponse(code) {
+function malformedRequestResponse(code) {
   // The runtime's own status choices are kept: 431 for an oversized header block, 408
   // for a connection that never completed a request, 400 for anything else it could
   // not parse. Only the body is upgraded, from the bare, bodyless default to the same
@@ -87,11 +115,16 @@ function healthPayload() {
 
 function requestPath(target) {
   // Route on the path alone, so /health?probe=1 still matches while /health/ and
-  // every other path do not.
-  return target.split("?")[0].split("#")[0];
+  // every other path do not. A query string is the only component dropped here. A "#"
+  // is deliberately left in place: a fragment is not part of a request-target and a
+  // conforming client never sends one, so treating /health#anything as an alias of
+  // /health would invent a second route rather than tolerate a real one, and would
+  // answer UP on a target this program does not serve. app.py draws the line in the
+  // same place.
+  return target.split("?")[0];
 }
 
-function sendJson(response, status, payload, withBody, allow) {
+function sendJson(response, status, payload, withBody, allow, close) {
   // Every response leaves through here, so the wire contract cannot drift between
   // routes. The serialisation is deliberately plain: JSON.stringify emits no padding,
   // which is what keeps this body byte-identical to the Python and Java bodies apart
@@ -113,6 +146,13 @@ function sendJson(response, status, payload, withBody, allow) {
   if (allow !== undefined) {
     headers["Allow"] = allow;
   }
+  if (close) {
+    // Ending the connection also discards whatever is left of the request body, which
+    // is what keeps an unread payload from being misread as the start of the next
+    // request here, and from holding this connection open after the listener has been
+    // asked to stop.
+    headers["Connection"] = "close";
+  }
   response.writeHead(status, headers);
   // A response to HEAD carries the headers of the equivalent GET, no body.
   response.end(withBody ? body : undefined);
@@ -123,15 +163,31 @@ function handleRequest(request, response) {
   // document that reports nothing back about the request.
   const path = requestPath(request.url || "");
   const withBody = request.method !== "HEAD";
+  // The method is tested before the path so that a rejected method is answered the same
+  // way on every target, not only on the one resource this application serves.
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    rejectMethod(response, path, withBody);
+    return;
+  }
   if (path !== HEALTH_PATH) {
     sendJson(response, 404, { status: "NOT_FOUND" }, withBody);
     return;
   }
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    sendJson(response, 405, { status: "METHOD_NOT_ALLOWED" }, withBody, HEALTH_METHODS);
+  sendJson(response, 200, healthPayload(), withBody);
+}
+
+function rejectMethod(response, path, withBody) {
+  // The twin of app.py's reject_method, and of rejectionResponse above: the served
+  // resource answers with the method-rejection contract and its Allow header, every
+  // other target with the same 404 document, and either way the connection is closed.
+  // Closing is what keeps a client that announced a request body it has not finished
+  // sending from holding this connection - and with it the process, once the listener
+  // has been asked to stop - alive.
+  if (path !== HEALTH_PATH) {
+    sendJson(response, 404, { status: "NOT_FOUND" }, withBody, undefined, true);
     return;
   }
-  sendJson(response, 200, healthPayload(), withBody);
+  sendJson(response, 405, { status: "METHOD_NOT_ALLOWED" }, withBody, HEALTH_METHODS, true);
 }
 
 function connectResponse(request) {
@@ -139,15 +195,64 @@ function connectResponse(request) {
   // it. CONNECT is neither GET nor HEAD, so /health can only ever answer it with the
   // shared method-rejection contract, and any other target gets the same 404 document
   // a normal request would.
-  if (requestPath(request.url || "") !== HEALTH_PATH) {
+  return rejectionResponse(requestPath(request.url || ""));
+}
+
+function rejectionResponse(path) {
+  // The one routing rule for a method this application does not serve, wherever the
+  // request came from: the served resource answers with the method-rejection contract
+  // and its Allow header, every other target with the same 404 document a request for
+  // it would get. It is the raw-text twin of handleRequest's rejected-method branch,
+  // and app.py's reject_method draws the line in exactly the same place.
+  if (path !== HEALTH_PATH) {
     return rawResponse(404, "Not Found", "NOT_FOUND");
   }
   return rawResponse(405, "Method Not Allowed", "METHOD_NOT_ALLOWED", HEALTH_METHODS);
 }
 
+function rejectedMethodResponse(error) {
+  // The runtime's parser turns a request away before the router ever sees it when the
+  // method is not one of the tokens it knows - and an unknown but well-formed method is
+  // exactly what "any other method" means. Left alone, "FROB /health" was answered 400
+  // Bad Request while app.py answered the same bytes 405 with an Allow header, so the
+  // shared contract held only for the verbs this runtime happens to recognise. Recognise
+  // that one parser failure here, and only from a complete request line inside the
+  // bounded window above, so the contract holds for any method a client can name. Every
+  // other parse failure is a genuinely malformed request and keeps its own 4xx.
+  if (error.code !== "HPE_INVALID_METHOD" || !Buffer.isBuffer(error.rawPacket)) {
+    return null;
+  }
+  const head = error.rawPacket.subarray(0, MAX_REQUEST_LINE).toString("latin1");
+  const end = head.indexOf("\r\n");
+  if (end < 0) {
+    // No complete request line arrived inside the window - a truncated write, or bytes
+    // that are not a request line at all - so there is nothing to route.
+    return null;
+  }
+  const parts = head.slice(0, end).split(" ");
+  if (parts.length !== 3 || !METHOD_TOKEN.test(parts[0]) ||
+      !REQUEST_TARGET.test(parts[1]) ||
+      (parts[2] !== "HTTP/1.1" && parts[2] !== "HTTP/1.0")) {
+    // Not a request line this application can answer on its own terms: no version, an
+    // unparseable target, a method carrying bytes a method may not carry, or a protocol
+    // that is not HTTP/1.x. Those keep the runtime's own diagnosis below.
+    return null;
+  }
+  // The parser knows GET and HEAD, so a method token it refused can never be either and
+  // this is always a rejection. Nothing the client sent is echoed back: the target is
+  // used to choose between two fixed documents and is then discarded.
+  return rejectionResponse(requestPath(parts[1]));
+}
+
+function trimBlanks(value) {
+  // The one place an override's surrounding blanks are removed, so HEALTH_HOST and
+  // HEALTH_PORT are read on identical terms and on the same terms app.py reads them.
+  return value.replace(ASCII_BLANKS, "");
+}
+
 function healthHost(requested) {
-  // An unset, empty or whitespace-only HEALTH_HOST means "not overridden", which is
-  // not a fault: the documented default applies, silently.
+  // An unset, empty or blank-only HEALTH_HOST means "not overridden", which is not a
+  // fault: the documented default applies, silently.
   if (requested === "") {
     return DEFAULT_HOST;
   }
@@ -182,21 +287,28 @@ function logSafe(text) {
 }
 
 function healthPort(requested) {
-  // An unset, empty or whitespace-only HEALTH_PORT means "not overridden", which is
-  // not a fault: the documented default applies, silently.
+  // An unset, empty or blank-only HEALTH_PORT means "not overridden", which is not a
+  // fault: the documented default applies, silently.
   if (requested === "") {
     return DEFAULT_PORT;
   }
-  const port = Number(requested);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    // An override that is present but cannot be honoured is a configuration fault,
-    // reported as null so that the caller stops startup. Falling back to the default
-    // would answer a typo by silently moving the endpoint off the port that was asked
-    // for: the process would report itself UP while the probe watching the intended
-    // port saw nothing at all.
-    return null;
+  // The grammar is checked before any conversion, and it is exactly the grammar app.py
+  // applies: one to five ASCII decimal digits and nothing else. Anything a reader might
+  // expect Number() to take - "0x4be0", "0o17700", "1e3", "13e3" - is refused by both
+  // applications alike, and the digit class is ASCII so a fullwidth digit cannot slip
+  // through either.
+  if (requested.length <= PORT_MAX_DIGITS && PORT_DIGITS.test(requested)) {
+    const port = Number(requested);
+    if (port > 0 && port < 65536) {
+      return port;
+    }
   }
-  return port;
+  // An override that is present but cannot be honoured is a configuration fault,
+  // reported as null so that the caller stops startup. Falling back to the default
+  // would answer a typo by silently moving the endpoint off the port that was asked
+  // for: the process would report itself UP while the probe watching the intended
+  // port saw nothing at all.
+  return null;
 }
 
 function bindFailureReason(error) {
@@ -215,7 +327,7 @@ function bindFailureReason(error) {
 function startHealthServer() {
   // Everything this function reports goes to file descriptor 2, so that descriptor 1
   // carries only the output the five console writes above have always produced.
-  const requestedHost = (process.env.HEALTH_HOST || "").trim();
+  const requestedHost = trimBlanks(process.env.HEALTH_HOST || "");
   const host = healthHost(requestedHost);
   if (host === null) {
     // Reported in the same shape as the bind failure below, one readable line and a
@@ -229,7 +341,7 @@ function startHealthServer() {
     process.exitCode = 1;
     return;
   }
-  const requested = (process.env.HEALTH_PORT || "").trim();
+  const requested = trimBlanks(process.env.HEALTH_PORT || "");
   const port = healthPort(requested);
   if (port === null) {
     // Reported in the same shape as the bind failure below, one readable line and a
@@ -237,7 +349,8 @@ function startHealthServer() {
     // for. JSON.stringify quotes the offending value, which keeps a stray space or
     // control character both visible and confined to this single line.
     process.stderr.write(logSafe(APP_NAME + ": invalid HEALTH_PORT " +
-      JSON.stringify(requested) + ": expected an integer from 1 to 65535") + "\n");
+      JSON.stringify(requested) + ": expected 1 to " + PORT_MAX_DIGITS +
+      " decimal digits denoting a port from 1 to 65535") + "\n");
     process.exitCode = 1;
     return;
   }
@@ -259,10 +372,20 @@ function startHealthServer() {
     process.removeListener("SIGTERM", shutdown);
     // Releases the listening socket, so the port is free from here on.
     server.close();
-    // A keep-alive connection sitting between requests would otherwise hold the loop
-    // open until it timed out. Guarded because this API arrived in Node 18.2.
+    // server.close() stops new connections but waits for every existing one, so on its
+    // own a keep-alive connection sitting between requests, a request whose head never
+    // finished arriving, or a client that announced a body and then went quiet would all
+    // hold the event loop open - and with it this process - until the peer gave up.
+    // Closing idle connections first lets a connection between requests end tidily;
+    // closing the rest then ends the ones still mid-request, so the shutdown a
+    // supervisor asked for cannot be deferred by any one client. Both are guarded
+    // because they arrived in Node 18.2, and app.py's server_close() with its daemon
+    // request threads ends just as promptly.
     if (typeof server.closeIdleConnections === "function") {
       server.closeIdleConnections();
+    }
+    if (typeof server.closeAllConnections === "function") {
+      server.closeAllConnections();
     }
   };
   server.on("error", function (error) {
@@ -278,13 +401,17 @@ function startHealthServer() {
   server.on("clientError", function (error, socket) {
     // A request Node could not parse never reaches the router. Answer it with JSON
     // like every other path, echoing nothing the client sent, and simply discard a
-    // connection the peer has already dropped.
-    process.stderr.write(logSafe(APP_NAME + ": client error: " + error.message) + "\n");
+    // connection the peer has already dropped. A well-formed request naming a method
+    // the parser does not know is not malformed at all, so it is answered with the
+    // method-rejection contract rather than with a parse error.
+    const rejection = rejectedMethodResponse(error);
+    process.stderr.write(logSafe(APP_NAME + (rejection === null ?
+      ": client error: " : ": unsupported method: ") + error.message) + "\n");
     if (error.code === "ECONNRESET" || !socket.writable) {
       socket.destroy();
       return;
     }
-    socket.end(clientErrorResponse(error.code));
+    socket.end(rejection === null ? malformedRequestResponse(error.code) : rejection);
   });
   server.on("connect", function (request, socket) {
     // An HTTP CONNECT never reaches the request handler: the runtime emits it here

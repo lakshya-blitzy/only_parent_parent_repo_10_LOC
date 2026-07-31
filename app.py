@@ -21,6 +21,18 @@ DEFAULT_PORT = 8000
 HEALTH_PATH = "/health"
 HEALTH_METHODS = "GET, HEAD"
 
+# The blanks stripped from an override before it is read, and the digits a port may be
+# written with. Both sets are spelled out rather than left to str.strip() and int(),
+# because those two disagree with the JavaScript facilities index.js would otherwise
+# reach for: str.strip() removes U+0085 where trim() does not and leaves U+FEFF where
+# trim() removes it, and int() accepts underscore separators, a leading sign and any
+# Unicode decimal digit, so HEALTH_PORT=1_9433 silently started this application on
+# port 19433 while index.js refused the same value. An override has to mean the same
+# thing to every application that reads it, so the grammar is stated here instead of
+# inherited from a language.
+ASCII_BLANKS = " \t\n\v\f\r"
+PORT_MAX_DIGITS = 5
+
 
 def greet(name):
     return f"Hello {name}"
@@ -133,8 +145,13 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
 
     def request_path(self):
         # Route on the path alone, so /health?probe=1 still matches while /health/
-        # and every other path do not.
-        return self.path.split("?", 1)[0].split("#", 1)[0]
+        # and every other path do not. A query string is the only component dropped
+        # here. A "#" is deliberately left in place: a fragment is not part of a
+        # request-target and a conforming client never sends one, so treating
+        # /health#anything as an alias of /health would invent a second route rather
+        # than tolerate a real one, and would answer UP on a target this program does
+        # not serve. index.js draws the line in the same place.
+        return self.path.split("?", 1)[0]
 
     def send_json(self, status, payload, with_body=True, allow=None, close=False):
         # Compact separators are part of the wire contract: the default ", " and
@@ -177,10 +194,10 @@ class InvalidHealthConfig(Exception):
 
 
 def health_host():
-    host = os.environ.get("HEALTH_HOST", "").strip()
+    host = os.environ.get("HEALTH_HOST", "").strip(ASCII_BLANKS)
     if not host:
-        # Unset, empty or whitespace-only means "not overridden", which is not a
-        # fault: the documented default applies, silently.
+        # Unset, empty or blank-only means "not overridden", which is not a fault:
+        # the documented default applies, silently.
         return DEFAULT_HOST
     if not host.isprintable() or any(ch.isspace() for ch in host):
         # A host name, an IPv4 or IPv6 literal and an IPv6 zone identifier are all
@@ -199,27 +216,32 @@ def health_host():
 
 
 def health_port():
-    port = os.environ.get("HEALTH_PORT", "").strip()
+    port = os.environ.get("HEALTH_PORT", "").strip(ASCII_BLANKS)
     if not port:
-        # Unset, empty or whitespace-only means "not overridden", which is not a
-        # fault: the documented default applies, silently.
+        # Unset, empty or blank-only means "not overridden", which is not a fault:
+        # the documented default applies, silently.
         return DEFAULT_PORT
-    try:
+    # The grammar is checked before any conversion, and it is exactly the grammar
+    # index.js applies: one to five ASCII decimal digits and nothing else. isascii()
+    # is what makes isdigit() mean [0-9] here - on its own isdigit() is also true of
+    # a fullwidth or superscript digit, and int() would then convert it, so a
+    # HEALTH_PORT of U+FF11 followed by 8000 would have bound port 18000. Anything a
+    # reader might expect int() to take - "1_9433", "+8000", "0x4be0", "1e3" - is
+    # refused by both applications alike.
+    if len(port) <= PORT_MAX_DIGITS and port.isascii() and port.isdigit():
         number = int(port)
-    except ValueError:
-        # Rejected by the check below, which reports every unusable value alike.
-        number = None
-    if number is None or not 0 < number < 65536:
-        # An override that is present but cannot be honoured is a configuration
-        # fault, so startup stops here. Falling back to the default would answer a
-        # typo by silently moving the endpoint off the port that was asked for: the
-        # process would report itself UP while the probe watching the intended port
-        # saw nothing at all. Failing fast makes that mistake impossible to miss,
-        # and !r keeps a value carrying spaces or control characters both visible
-        # and confined to a single line.
-        raise InvalidHealthConfig(
-            f"invalid HEALTH_PORT {port!r}: expected an integer from 1 to 65535")
-    return number
+        if 0 < number < 65536:
+            return number
+    # An override that is present but cannot be honoured is a configuration fault,
+    # so startup stops here. Falling back to the default would answer a typo by
+    # silently moving the endpoint off the port that was asked for: the process
+    # would report itself UP while the probe watching the intended port saw nothing
+    # at all. Failing fast makes that mistake impossible to miss, and !r keeps a
+    # value carrying spaces or control characters both visible and confined to a
+    # single line.
+    raise InvalidHealthConfig(
+        f"invalid HEALTH_PORT {port!r}: expected 1 to {PORT_MAX_DIGITS} decimal "
+        "digits denoting a port from 1 to 65535")
 
 
 def stop_on_signal(signum, frame):
