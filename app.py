@@ -47,6 +47,19 @@ def health_payload():
     }
 
 
+def log_safe(text):
+    # Every line this program writes to file descriptor 2 is rendered through here
+    # first. A carriage return, a line feed or a Unicode line separator reaching a
+    # log stream lets whoever supplied the text forge additional records, and a
+    # terminal escape reaching a terminal is acted on rather than printed, so any
+    # character that is not printable is replaced by its escape sequence instead.
+    # Printable text - which is all a host name, an address, an operator-facing
+    # sentence or a request line legitimately consists of - is returned unchanged,
+    # so every diagnostic reads exactly as written and occupies exactly one line.
+    return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii")
+                   for ch in text)
+
+
 class HealthRequestHandler(BaseHTTPRequestHandler):
     # HTTP/1.1 keeps the connection alive between requests, so every response
     # below declares an explicit Content-Length.
@@ -88,15 +101,21 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         # A response to HEAD carries the headers of the equivalent GET, no body.
         self.dispatch(with_body=False)
 
-    def do_POST(self):
-        self.reject_method()
-
-    # Every other method a client may send is answered exactly like POST.
-    do_PUT = do_POST
-    do_PATCH = do_POST
-    do_DELETE = do_POST
-    do_OPTIONS = do_POST
-    do_TRACE = do_POST
+    def __getattr__(self, name):
+        # BaseHTTPRequestHandler dispatches a request by looking up "do_" followed by
+        # the method token, and when that attribute is missing it answers with a 501
+        # of its own making: no Allow header, and a status line this class never
+        # chose. Only GET and HEAD are declared above, so every other token resolves
+        # here instead and is answered by the one rejection path below - POST, PUT,
+        # PATCH, DELETE, OPTIONS and TRACE, but equally CONNECT, a WebDAV verb, or an
+        # extension verb a client invents. Answering them from a single place is what
+        # makes "any other method" hold for literally any method, rather than for a
+        # list of names that has to be kept complete. The prefix test keeps the hook
+        # narrow: every other missing attribute still raises, so a typo elsewhere in
+        # this class stays as visible as it would be without it.
+        if name.startswith("do_") and len(name) > len("do_"):
+            return self.reject_method
+        raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
 
     def dispatch(self, with_body):
         if self.request_path() == HEALTH_PATH:
@@ -139,10 +158,14 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         # Access lines and handler diagnostics belong on file descriptor 2 so that
-        # descriptor 1 carries only this program's original output.
+        # descriptor 1 carries only this program's original output. An access line
+        # quotes the request line exactly as the client sent it, which makes this the
+        # most exposed sink in the program, so the finished line goes through log_safe
+        # before it is written.
         stamp = self.log_date_time_string()
         client = self.address_string()
-        sys.stderr.write(f"{APP_NAME}: [{stamp}] {client} {format % args}\n")
+        record = f"{APP_NAME}: [{stamp}] {client} {format % args}"
+        sys.stderr.write(log_safe(record) + "\n")
         sys.stderr.flush()
 
 
@@ -151,6 +174,28 @@ class InvalidHealthConfig(Exception):
     # operator-facing sentence, so the caller can report the fault on one line and
     # exit non-zero without a traceback ever reaching the operator.
     pass
+
+
+def health_host():
+    host = os.environ.get("HEALTH_HOST", "").strip()
+    if not host:
+        # Unset, empty or whitespace-only means "not overridden", which is not a
+        # fault: the documented default applies, silently.
+        return DEFAULT_HOST
+    if not host.isprintable() or any(ch.isspace() for ch in host):
+        # A host name, an IPv4 or IPv6 literal and an IPv6 zone identifier are all
+        # made of printable, non-blank characters, so anything else is refused right
+        # here, before the value can reach a socket or a diagnostic. A carriage return
+        # or a line feed inside it would otherwise let whoever set the variable forge
+        # extra lines on descriptor 2, and an interior blank cannot name a host in any
+        # case. Refusing rather than repairing is also the only safe answer: a value
+        # quietly trimmed to something bindable would put the endpoint on an address
+        # nobody asked for. The same rule is applied by index.js, so an override is
+        # accepted or rejected identically whichever application reads it.
+        raise InvalidHealthConfig(
+            f"invalid HEALTH_HOST {host!r}: expected a host name or address with no "
+            "blanks and no control characters")
+    return host
 
 
 def health_port():
@@ -186,14 +231,16 @@ def stop_on_signal(signum, frame):
 
 
 def serve_health():
-    host = os.environ.get("HEALTH_HOST", "").strip() or DEFAULT_HOST
     try:
+        # Both overrides are validated before anything is constructed, so a value
+        # that cannot be honoured stops startup instead of reaching a socket call.
+        host = health_host()
         port = health_port()
     except InvalidHealthConfig as error:
         # Reported in the same shape as the bind failure below, one readable line
         # and a non-zero status, so that no listener is ever started on an address
         # nobody asked for.
-        sys.stderr.write(f"{APP_NAME}: {error}\n")
+        sys.stderr.write(log_safe(f"{APP_NAME}: {error}") + "\n")
         sys.stderr.flush()
         return 1
     try:
@@ -203,18 +250,20 @@ def serve_health():
         # outside its control, most often because the port is already taken. One
         # readable line and a non-zero status serve the operator better than a
         # traceback.
-        sys.stderr.write(f"{APP_NAME}: cannot bind {host}:{port}: {error}\n")
+        failure = f"{APP_NAME}: cannot bind {host}:{port}: {error}"
+        sys.stderr.write(log_safe(failure) + "\n")
         sys.stderr.flush()
         return 1
     # SIGINT already arrives as KeyboardInterrupt, so turning SIGTERM into the same
     # exception lets both signals leave serve_forever through one shutdown path.
     signal.signal(signal.SIGTERM, stop_on_signal)
-    sys.stderr.write(f"{APP_NAME} {APP_VERSION} serving {HEALTH_PATH} on http://{host}:{port}\n")
+    banner = f"{APP_NAME} {APP_VERSION} serving {HEALTH_PATH} on http://{host}:{port}"
+    sys.stderr.write(log_safe(banner) + "\n")
     sys.stderr.flush()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        sys.stderr.write(f"{APP_NAME}: shutting down\n")
+        sys.stderr.write(log_safe(f"{APP_NAME}: shutting down") + "\n")
         sys.stderr.flush()
     finally:
         # Releases the listening socket, so the port is free the moment this
