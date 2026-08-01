@@ -51,14 +51,22 @@ disclose internal detail.
 | --- | --- |
 | `HEAD /health` | `200` with the same headers and an empty body |
 | Any other method on `/health` | `405 Method Not Allowed` with `Allow: GET, HEAD` and the body `{"status":"METHOD_NOT_ALLOWED"}` |
-| Any other path | `404 Not Found` with the body `{"status":"NOT_FOUND"}` |
+| `GET` on any other path | `404 Not Found` with the body `{"status":"NOT_FOUND"}` |
+| `HEAD` on any other path | `404 Not Found` with the same headers and an empty body |
 | A port that cannot be bound at startup | one readable diagnostic on standard error and a non-zero exit status, with no traceback and no stack trace |
+
+A `HEAD` reply carries no body: it is the status line and the headers of its `GET` counterpart
+with nothing after them, on `/health` and on any other path alike. Every other method does
+receive the body named above. Two departures from that rule are the Java platform's own and both
+are noted below: `User.java` omits `Content-length` from a `HEAD` reply, and the one reply it
+does not write itself carries a body whatever the method.
 
 ### Notes on the wire format
 
 - `application/json` is served rather than the `application/health+json` of the IETF health
-  check draft, whose IANA registration was never completed. `application/json` is parsed by
-  every client without special handling.
+  check draft, whose IANA registration was never completed. `application/json` is read by the
+  JSON-capable clients this endpoint is for - `curl`, common monitors and browsers - without a
+  media type any of them has to be taught.
 - `Cache-Control: no-store` is sent rather than a freshness lifetime, because `timestamp` is
   generated for each request and serving a cached copy would defeat it.
 - `User.java` serves through the Java platform's own HTTP server, `com.sun.net.httpserver`.
@@ -71,15 +79,16 @@ disclose internal detail.
     suppresses that field. This is a recorded limitation, and an acceptable one for a
     liveness probe.
   - It routes on the request target parsed as a URI, and answers a target it cannot match to
-    a route with its own `text/html` page before this application's handler is reached. Two
-    families of target are affected: one it cannot parse, and one whose parsed path is empty
-    or is not a path at all - a target opening with two slashes, such as `//health`, or the
-    asterisk form `*`. `app.py` and `index.js` read the target off the request line and
-    answer both families with the JSON above; `User.java` cannot, because that reply is
-    written before any handler, filter or authenticator of its own can run. Every target that
-    does reach this application is answered with the JSON above, and the platform's own reply
-    still carries the status this contract asks for and carries no host name, no file system
-    path, no environment value and no stack trace.
+    a route with its own `text/html` page - whatever the request method, which makes this the
+    one reply on which a `HEAD` carries a body - before this application's handler is
+    reached. Two families of target are affected: one it cannot parse, and one whose parsed
+    path is empty or is not a path at all - a target opening with two slashes, such as
+    `//health`, or the asterisk form `*`. `app.py` and `index.js` read the target off the
+    request line and answer both families on the terms in the table above; `User.java`
+    cannot, because that reply is written before any handler, filter or authenticator of its
+    own can run. Every target that does reach this application is answered on those same
+    terms, and the platform's own reply still carries the status this contract asks for and
+    carries no host name, no file system path, no environment value and no stack trace.
 
 ## Example
 
@@ -94,8 +103,12 @@ No installation step is required for any of the three applications. There is not
 `pip install`, nothing to `npm install` and nothing for Maven or Gradle to resolve: each
 program uses only its own language's standard library.
 
-Default mode is unchanged by the health endpoint. Each application prints what it has always
-printed, opens no port and exits immediately.
+The health endpoint leaves default mode alone: each application prints its own original output,
+opens no port and exits immediately. `index.js` printed its five `12` lines before this change
+and prints them still. `app.py` and `User.java` could not run at all until the duplicated
+trailing block that stopped the one from parsing and the other from compiling was removed, which
+this change also does; each now prints the line it was written to print, and nothing else about
+default mode differs.
 
 ```console
 $ python3 app.py                  # prints: Hello Lakshya
