@@ -147,7 +147,10 @@ function rejectionResponse(path) {
 function rejectedMethodResponse(error) {
   // An unknown but well-formed method is refused by the parser before the router sees it,
   // so a complete request line inside the bounded window is rejected here rather than
-  // called malformed; every other parse failure keeps the runtime's own 4xx.
+  // called malformed. Returning null leaves the reply to malformedRequestResponse() above,
+  // which turns the runtime's error code into a reply of this program's own composing -
+  // 431 when the headers overflowed its limit, 408 when it timed the request out, 400 for
+  // anything else - so the runtime's own 4xx is never the one sent.
   if (error.code !== "HPE_INVALID_METHOD" || !Buffer.isBuffer(error.rawPacket)) {
     return null;
   }

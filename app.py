@@ -271,11 +271,15 @@ def stop_on_signal(signum, frame):
 def serve_health():
     server = None
     try:
-        # Armed inside this block, before the first step that can fail or block, so a
-        # signal arriving during startup - including while these two lines run - still
-        # leaves through the shutdown path below.
-        signal.signal(signal.SIGINT, stop_on_signal)
+        # Armed as the first statements of this block, before the first step that can fail
+        # or block, and SIGTERM first because its default action ends this process outright,
+        # while the interpreter's default action for SIGINT raises KeyboardInterrupt into
+        # this block and the shutdown path below answers that one. So from the first line
+        # below onwards, neither signal ends this process without that path running; before
+        # it, each still takes its default action, with nothing bound yet and nothing to
+        # release.
         signal.signal(signal.SIGTERM, stop_on_signal)
+        signal.signal(signal.SIGINT, stop_on_signal)
         try:
             host = health_host()
             port = health_port()
