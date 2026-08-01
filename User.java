@@ -1,14 +1,25 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class User {
     private static final String APP_NAME = "user-app";
@@ -40,6 +51,31 @@ public class User {
 
     private static final String HANDLER_THREAD_PREFIX = "-health-";
     private static final long FIRST_HANDLER_THREAD = 0;
+    private static final String ACCEPT_THREAD_SUFFIX = "-ingress";
+
+    // The listening socket this program answers on is its own, and the platform's server sits
+    // behind it on a port the system picks, reachable only over the loopback interface.
+    private static final int SYSTEM_ASSIGNED_PORT = 0;
+    private static final int BACKEND_CONNECT_MILLIS = 5000;
+
+    // Every connection forwarded to the server behind this listener is remembered by the local
+    // port it was forwarded from, so the server can tell those connections from any other.
+    private static final Set<Integer> FORWARDED_SOURCES = ConcurrentHashMap.newKeySet();
+
+    // The request line is read a line at a time to be examined, so the length examined is
+    // capped - at twice the 8 KiB the widely deployed servers settle on, and at the same 16 KiB
+    // the JavaScript application's runtime reads. A target longer than this cannot be judged,
+    // and is answered as an unknown one rather than buffered further.
+    private static final int MAX_REQUEST_LINE = 16384;
+    private static final int MAX_LINE_BUFFER = 128;
+    private static final String ROOT_TARGET = "/";
+    private static final String DEFAULT_REQUEST_VERSION = "HTTP/1.1";
+    private static final char SPACE = ' ';
+    private static final char CARRIAGE_RETURN = '\r';
+    private static final char LINE_FEED = '\n';
+    private static final char COLON = ':';
+    private static final char ZERO_DIGIT = '0';
+    private static final char NINE_DIGIT = '9';
 
     private static final String SERVE_FLAG = "--serve";
 
@@ -279,9 +315,10 @@ public class User {
         // Before the first call into the platform's server classes, because that is the only
         // point at which these settings are still read.
         limitRequestHandling();
-        HttpServer server;
+        ServerSocket ingress;
         try {
-            server = HttpServer.create(new InetSocketAddress(host, port), 0);
+            ingress = new ServerSocket();
+            ingress.bind(new InetSocketAddress(host, port), SYSTEM_ASSIGNED_PORT);
         } catch (IOException error) {
             // One readable line and a non-zero status instead of a stack trace.
             String where = DEFAULT_HOST.equals(host) ? host + ":" + port
@@ -289,32 +326,51 @@ public class User {
             report(APP_NAME + ": cannot bind " + where + ": " + bindReason(error));
             return 1;
         }
+        HttpServer server;
+        try {
+            // The requested address is already held above, so this one is left to the system
+            // and kept on the loopback interface: it is reached from this program only.
+            server = HttpServer.create(
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), SYSTEM_ASSIGNED_PORT),
+                SYSTEM_ASSIGNED_PORT);
+        } catch (IOException error) {
+            report(APP_NAME + ": cannot start the request server: " + bindReason(error));
+            closeIngress(ingress);
+            return 1;
+        }
+        int backendPort = server.getAddress().getPort();
         // Requests are answered on this listener's own threads rather than on the one it
         // dispatches from, so a client that stops sending holds nothing but its own thread.
         ExecutorService handlers = handlerPool();
         server.setExecutor(handlers);
-        // One context, at the root, so every request this program is handed is answered by
-        // sendJson() below - 200 and the health document for /health, 405 with Allow for a
-        // method not served there, 404 for every other target - and no other text ever
-        // leaves this program as a response body. Two families of request never reach it,
-        // because this platform answers them itself, with its own text/html page, before any
-        // context is consulted: a request line or target it cannot parse, and a target whose
-        // parsed path cannot match a context - an empty one, as //health has, or one that is
-        // not a path at all, as * and a target with no leading slash are. Neither is
-        // reachable from here, and neither can be made reachable through this API: that reply
-        // is written by a private class of a package this module does not export; a context
-        // path may not begin with anything but a slash, so no context can be registered that
-        // an empty parsed path would match; and every hook offered here - a filter, an
-        // authenticator, a handler predicate - runs only once a context has already been
-        // found. Reading the target off the request line from a listening socket of this
-        // program's own would answer those two families as well, but this application is
-        // specified to serve through this platform's server, so where its behaviour differs
-        // from the other two applications' the difference is recorded in the README rather
-        // than worked around. Those platform replies still carry the status this contract
-        // asks for, and carry no host, no path, no value from the environment and no stack
-        // trace.
+        // One context, at the root, so every request is answered by sendJson() below - 200 and
+        // the health document for /health, 405 with Allow for a method not served there, 404
+        // for every other target - and no other text ever leaves this program as a response
+        // body. Reaching that for every target is what the listener above is for. A context is
+        // matched on the path parsed out of the request target, and a context path must begin
+        // with a slash, so a target that parses to no such path matches nothing: //health
+        // parses to an empty path, * and a target with no leading slash parse to something
+        // that is not a path at all. Unmatched, those are answered by this platform itself,
+        // with its own text/html page, before any context is consulted - and that page cannot
+        // be replaced from here, because no context can be registered that an empty path would
+        // match and every hook offered - a filter, an authenticator, a handler predicate -
+        // runs only once a context has already been found. So the target is read off the
+        // request line as it arrives and, where it would match nothing, the root is forwarded
+        // in its place: the request reaches the handler below, which answers on the target's
+        // own terms, and the platform's page is never the reply. Nothing else about the request
+        // is rewritten, no reply is written anywhere but here, and this remains the one
+        // context that answers.
         server.createContext("/", exchange -> {
             try (HttpExchange open = exchange) {
+                if (!wasForwarded(open)) {
+                    // Not a connection this program's listener opened, so the health document
+                    // is not served on it and it is answered as an unknown target instead. The
+                    // address it arrived on is a loopback one the system assigns afresh at
+                    // every start, so reaching it means a process on this same host found it.
+                    sendJson(open, 404, statusPayload(STATUS_NOT_FOUND),
+                        !"HEAD".equals(open.getRequestMethod()), null, true);
+                    return;
+                }
                 handleRequest(open);
             } catch (IOException | RuntimeException error) {
                 // The condition is named on one line, without a trace, and the listener
@@ -325,8 +381,8 @@ public class User {
         });
         // Registered before start(), so a signal arriving in the same instant as the first
         // request still finds a hook that releases the port. A signal can also arrive before
-        // this line, because create() above binds the port rather than start() below: the
-        // listener is reachable while this method is still walking towards the hook. Shutdown
+        // this line, because the socket above is bound well before start() below: the address
+        // is taken while this method is still walking towards the hook. Shutdown
         // is then already under way, and this platform refuses that state twice over -
         // registering a hook once shutdown has begun, and starting a listener whose hook has
         // already stopped it, both throw. Left alone either throw would leave main by way of
@@ -338,6 +394,9 @@ public class User {
         try {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 report(APP_NAME + ": shutting down");
+                // The listening socket first, so nothing further is accepted into a server
+                // that is stopping.
+                closeIngress(ingress);
                 server.stop(0);
                 // Stopping the listener leaves the threads it handed work to running, so they
                 // are ended here as well; a request still in flight is abandoned, which is what
@@ -349,9 +408,10 @@ public class User {
         } catch (IllegalStateException shuttingDown) {
             if (!hooked) {
                 // The hook was refused, so nothing else will report this shutdown or close
-                // the socket create() opened; when it was accepted it does both itself, and
+                // the sockets opened above; when it was accepted it does both itself, and
                 // reporting here as well would announce the one shutdown twice.
                 report(APP_NAME + ": shutting down");
+                closeIngress(ingress);
                 server.stop(0);
                 handlers.shutdownNow();
             }
@@ -359,9 +419,312 @@ public class User {
             // and leaves the error stream carrying that one notice and nothing else.
             return 0;
         }
+        acceptConnections(ingress, backendPort, handlers);
         report(APP_NAME + " " + APP_VERSION + " serving " + HEALTH_PATH + " on http://"
             + host + ":" + port);
         return 0;
+    }
+
+    private static void acceptConnections(ServerSocket ingress, int backendPort,
+            ExecutorService connections) {
+        // One thread waits for connections; each one it takes is served on a thread of its
+        // own, so a client that connects and then says nothing delays no other client.
+        Thread accepting = new Thread(() -> {
+            while (!ingress.isClosed()) {
+                Socket client;
+                try {
+                    client = ingress.accept();
+                } catch (IOException closed) {
+                    // The socket was closed by the shutdown hook, or accepting failed on it;
+                    // either way there is nothing further to accept here.
+                    return;
+                }
+                try {
+                    connections.execute(() -> relay(client, backendPort, connections));
+                } catch (RuntimeException stopping) {
+                    // Shutdown has begun, so this connection will not be served; it is closed
+                    // now rather than left open on a client waiting for a reply.
+                    closeConnection(client);
+                    return;
+                }
+            }
+        }, APP_NAME + ACCEPT_THREAD_SUFFIX);
+        // Waiting for a connection must not be what keeps this process alive; the platform's
+        // own listener threads do that, and the shutdown hook is what ends it.
+        accepting.setDaemon(true);
+        accepting.start();
+    }
+
+    private static void relay(Socket client, int backendPort, ExecutorService connections) {
+        Integer source = null;
+        Future<?> requests = null;
+        // Both sockets are closed on the way out of this block, in every outcome below.
+        try (Socket clientSocket = client; Socket backend = new Socket()) {
+            backend.connect(
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), backendPort),
+                BACKEND_CONNECT_MILLIS);
+            source = backend.getLocalPort();
+            FORWARDED_SOURCES.add(source);
+            InputStream fromClient = new BufferedInputStream(clientSocket.getInputStream(),
+                MAX_REQUEST_LINE);
+            // Requests are forwarded on one thread and replies carried back on this one, so
+            // neither direction waits on the other and a kept-alive connection stays open.
+            requests = connections.submit(() -> {
+                forwardRequests(fromClient, backend);
+                return null;
+            });
+            backend.getInputStream().transferTo(clientSocket.getOutputStream());
+            clientSocket.getOutputStream().flush();
+            // The last reply has been carried back, so no further request will be answered on
+            // this connection: closing the receiving half ends the forwarding above at once
+            // rather than leaving it waiting on a client that is still holding the socket open.
+            clientSocket.shutdownInput();
+            requests.get();
+        } catch (IOException hungUp) {
+            // A client that disappears mid-connection is an ordinary condition for a listener,
+            // so it is named on one line without a trace and nothing else is disturbed.
+            report(APP_NAME + ": connection ended early: " + hungUp.getClass().getSimpleName());
+        } catch (ExecutionException failed) {
+            report(APP_NAME + ": connection ended early: " + causeName(failed));
+        } catch (InterruptedException interrupted) {
+            // Shutdown reached this thread while it was waiting; the interrupt is restored so
+            // the thread ends as interrupted rather than swallowing it.
+            Thread.currentThread().interrupt();
+        } catch (RuntimeException failed) {
+            report(APP_NAME + ": serving a connection failed: "
+                + failed.getClass().getSimpleName());
+        } finally {
+            if (requests != null) {
+                requests.cancel(true);
+            }
+            if (source != null) {
+                FORWARDED_SOURCES.remove(source);
+            }
+        }
+    }
+
+    private static String causeName(ExecutionException failed) {
+        Throwable cause = failed.getCause();
+        return cause == null ? failed.getClass().getSimpleName()
+            : cause.getClass().getSimpleName();
+    }
+
+    private static void closeIngress(ServerSocket ingress) {
+        try {
+            ingress.close();
+        } catch (IOException error) {
+            report(APP_NAME + ": releasing the listening socket failed: "
+                + error.getClass().getSimpleName());
+        }
+    }
+
+    private static void closeConnection(Socket client) {
+        try {
+            client.close();
+        } catch (IOException error) {
+            report(APP_NAME + ": closing a connection failed: "
+                + error.getClass().getSimpleName());
+        }
+    }
+
+    private static boolean wasForwarded(HttpExchange exchange) {
+        return FORWARDED_SOURCES.contains(exchange.getRemoteAddress().getPort());
+    }
+
+    private static void forwardRequests(InputStream fromClient, Socket backend)
+            throws IOException {
+        forward(fromClient, backend.getOutputStream());
+        // The end of the client's requests is passed on as well, so the server behind knows
+        // that no further request is coming.
+        backend.shutdownOutput();
+    }
+
+    private static void forward(InputStream fromClient, OutputStream toBackend)
+            throws IOException {
+        while (true) {
+            byte[] line = readLine(fromClient);
+            // An empty line where a request line is expected is skipped rather than read as
+            // one, which is what a server is asked to tolerate; forwarding it keeps this
+            // stream a copy of the one that arrived.
+            while (line != null && terminated(line) && blank(line)) {
+                toBackend.write(line);
+                line = readLine(fromClient);
+            }
+            if (line == null) {
+                toBackend.flush();
+                return;
+            }
+            if (!terminated(line)) {
+                byte[] shortened = shortenedRequestLine(line);
+                if (shortened == null) {
+                    // Not a request line at all within the length examined, so it is forwarded
+                    // as it stands and the rest of the connection with it.
+                    toBackend.write(line);
+                    fromClient.transferTo(toBackend);
+                    toBackend.flush();
+                    return;
+                }
+                // A target this long cannot be judged reachable, so the root goes in its place
+                // and the rest of the line is dropped: the request is answered as an unknown
+                // target, which is the answer a target of any length that matches nothing
+                // gets, and the reply is this program's rather than the platform's page.
+                toBackend.write(shortened);
+                discardLine(fromClient);
+            } else {
+                toBackend.write(reachableRequestLine(line));
+            }
+            boolean carriesPayload = false;
+            while (true) {
+                byte[] header = readLine(fromClient);
+                if (header == null) {
+                    toBackend.flush();
+                    return;
+                }
+                // Header lines are forwarded exactly as they arrived; only the request line is
+                // ever rewritten, and only its target.
+                toBackend.write(header);
+                if (!terminated(header)) {
+                    fromClient.transferTo(toBackend);
+                    toBackend.flush();
+                    return;
+                }
+                if (blank(header)) {
+                    break;
+                }
+                if (declaresPayload(header)) {
+                    carriesPayload = true;
+                }
+            }
+            toBackend.flush();
+            if (carriesPayload) {
+                // A declared payload closes the connection once it is answered, so this is
+                // the last request on it: the rest is forwarded without being read as lines,
+                // and a payload can never be mistaken for the request line after it.
+                fromClient.transferTo(toBackend);
+                toBackend.flush();
+                return;
+            }
+        }
+    }
+
+    private static byte[] readLine(InputStream fromClient) throws IOException {
+        ByteArrayOutputStream line = new ByteArrayOutputStream(MAX_LINE_BUFFER);
+        while (line.size() <= MAX_REQUEST_LINE) {
+            int octet = fromClient.read();
+            if (octet < 0) {
+                return line.size() == 0 ? null : line.toByteArray();
+            }
+            line.write(octet);
+            if (octet == LINE_FEED) {
+                return line.toByteArray();
+            }
+        }
+        return line.toByteArray();
+    }
+
+    private static boolean terminated(byte[] line) {
+        return line.length <= MAX_REQUEST_LINE && line[line.length - 1] == LINE_FEED;
+    }
+
+    private static boolean blank(byte[] line) {
+        for (int index = 0; index < line.length; index++) {
+            if (line[index] != CARRIAGE_RETURN && line[index] != LINE_FEED) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean declaresPayload(byte[] header) {
+        String text = new String(header, StandardCharsets.ISO_8859_1);
+        int colon = text.indexOf(COLON);
+        if (colon < 0) {
+            return false;
+        }
+        String name = trimBlanks(text.substring(0, colon));
+        if (name.equalsIgnoreCase(TRANSFER_ENCODING_HEADER)) {
+            return true;
+        }
+        if (!name.equalsIgnoreCase(CONTENT_LENGTH_HEADER)) {
+            return false;
+        }
+        // The same reading as declaresBody() applies here: a length that is absent or zero
+        // declares nothing, and anything else - including a length this program cannot read -
+        // is treated as a payload rather than assumed away.
+        String length = trimBlanks(text.substring(colon + 1));
+        if (length.isEmpty()) {
+            return false;
+        }
+        boolean zero = true;
+        for (int index = 0; index < length.length(); index++) {
+            char digit = length.charAt(index);
+            if (digit < ZERO_DIGIT || digit > NINE_DIGIT) {
+                return true;
+            }
+            if (digit != ZERO_DIGIT) {
+                zero = false;
+            }
+        }
+        return !zero;
+    }
+
+    private static byte[] reachableRequestLine(byte[] line) {
+        String text = new String(line, StandardCharsets.ISO_8859_1);
+        int end = text.length();
+        while (end > 0 && (text.charAt(end - 1) == LINE_FEED
+                || text.charAt(end - 1) == CARRIAGE_RETURN)) {
+            end--;
+        }
+        String terminator = text.substring(end);
+        String head = text.substring(0, end);
+        int method = head.indexOf(SPACE);
+        if (method < 0) {
+            // No target on this line at all, so there is none to make reachable and nothing
+            // here to rewrite.
+            return line;
+        }
+        int afterTarget = head.indexOf(SPACE, method + 1);
+        String target = afterTarget < 0 ? head.substring(method + 1)
+            : head.substring(method + 1, afterTarget);
+        boolean reachable = matchesRootContext(target);
+        if (reachable && afterTarget >= 0) {
+            return line;
+        }
+        // A request line with no version is the oldest form of the protocol; the version the
+        // other applications read it as is supplied here, so it is answered rather than
+        // refused.
+        String rest = afterTarget < 0 ? SPACE + DEFAULT_REQUEST_VERSION
+            : head.substring(afterTarget);
+        return (head.substring(0, method + 1) + (reachable ? target : ROOT_TARGET) + rest
+            + terminator).getBytes(StandardCharsets.ISO_8859_1);
+    }
+
+    private static byte[] shortenedRequestLine(byte[] line) {
+        String head = new String(line, StandardCharsets.ISO_8859_1);
+        int method = head.indexOf(SPACE);
+        if (method < 0) {
+            return null;
+        }
+        return (head.substring(0, method + 1) + ROOT_TARGET + SPACE + DEFAULT_REQUEST_VERSION
+            + CARRIAGE_RETURN + LINE_FEED).getBytes(StandardCharsets.ISO_8859_1);
+    }
+
+    private static void discardLine(InputStream fromClient) throws IOException {
+        int octet = fromClient.read();
+        while (octet >= 0 && octet != LINE_FEED) {
+            octet = fromClient.read();
+        }
+    }
+
+    private static boolean matchesRootContext(String target) {
+        // The one test the server behind applies: the path parsed out of the target, and
+        // whether a context registered at the root could match it.
+        try {
+            String path = new URI(target).getPath();
+            return path != null && path.startsWith(ROOT_TARGET);
+        } catch (URISyntaxException unparseable) {
+            return false;
+        }
     }
 
     private static void limitRequestHandling() {
@@ -371,8 +734,8 @@ public class User {
     }
 
     private static ExecutorService handlerPool() {
-        // One virtual thread per exchange rather than a fixed pool, so clients that stop
-        // sending cannot monopolise a small set of handler threads.
+        // One virtual thread per exchange and per connection rather than a fixed pool, so
+        // clients that stop sending cannot monopolise a small set of threads.
         return Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
             .name(APP_NAME + HANDLER_THREAD_PREFIX, FIRST_HANDLER_THREAD)
             .factory());

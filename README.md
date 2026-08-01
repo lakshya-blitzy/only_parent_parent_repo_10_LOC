@@ -57,9 +57,15 @@ disclose internal detail.
 
 A `HEAD` reply carries no body: it is the status line and the headers of its `GET` counterpart
 with nothing after them, on `/health` and on any other path alike. Every other method does
-receive the body named above. Two departures from that rule are the Java platform's own and both
-are noted below: `User.java` omits `Content-length` from a `HEAD` reply, and the one reply it
-does not write itself carries a body whatever the method.
+receive the body named above.
+
+Every request target that names a path is routed on those terms by all three applications, and a
+target that names no path they can match - `//health`, whose parsed path is empty, the asterisk
+form `*`, or one that is not a valid URI - is answered exactly as any other unmatched path is. A
+request line that an application's own runtime rejects before routing is answered by that runtime
+instead: `index.js` answers a target that is not addressed to a path, such as `foo`, with
+`400 Bad Request` and the body `{"status":"BAD_REQUEST"}`, carrying the same media type and cache
+policy as every other reply.
 
 ### Notes on the wire format
 
@@ -69,26 +75,23 @@ does not write itself carries a body whatever the method.
   media type any of them has to be taught.
 - `Cache-Control: no-store` is sent rather than a freshness lifetime, because `timestamp` is
   generated for each request and serving a cached copy would defeat it.
-- `User.java` serves through the Java platform's own HTTP server, `com.sun.net.httpserver`.
-  Three of its behaviours differ from the other two applications' and are properties of that
-  platform rather than omissions here:
+- `User.java` serves through the Java platform's own HTTP server, `com.sun.net.httpserver`, with
+  one handler registered at the root. That server routes on the request target parsed as a URI,
+  and a target that parses to no path - `//health`, whose path is empty, or `*`, which is not a
+  path at all - matches no route there. So the application owns the listening socket it is
+  reached on, reads the target off each request line as it arrives, and where a target names no
+  route it forwards the root in its place; the request reaches the handler, which answers it as
+  the tables above say an unmatched path is answered. The server itself listens on a loopback
+  address the system assigns at every start, reached by this application and by nothing off this
+  host; the port named under Configuration below is the one every client uses. Two of its
+  behaviours differ from the other two applications' and are properties of that platform rather
+  than omissions here:
   - It renders response field names with a single leading capital - `Content-type`,
     `Content-length`, `Cache-control`. Field names are case insensitive, so these responses
     carry the same headers as the other two applications'.
   - It sends no `Content-length` on a `HEAD` reply, because the no-body form of its API
     suppresses that field. This is a recorded limitation, and an acceptable one for a
     liveness probe.
-  - It routes on the request target parsed as a URI, and answers a target it cannot match to
-    a route with its own `text/html` page - whatever the request method, which makes this the
-    one reply on which a `HEAD` carries a body - before this application's handler is
-    reached. Two families of target are affected: one it cannot parse, and one whose parsed
-    path is empty or is not a path at all - a target opening with two slashes, such as
-    `//health`, or the asterisk form `*`. `app.py` and `index.js` read the target off the
-    request line and answer both families on the terms in the table above; `User.java`
-    cannot, because that reply is written before any handler, filter or authenticator of its
-    own can run. Every target that does reach this application is answered on those same
-    terms, and the platform's own reply still carries the status this contract asks for and
-    carries no host name, no file system path, no environment value and no stack trace.
 
 ## Example
 

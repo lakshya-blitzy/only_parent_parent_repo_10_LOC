@@ -99,10 +99,18 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
 
     def dispatch(self, with_body):
+        # A declared payload closes the connection rather than being read, so the bytes
+        # framing it can never be misread as the request after it on a kept-alive
+        # connection. Nothing on this path consumes a request payload, and the framework
+        # does not consume one either, so leaving the connection reusable would let a
+        # body of its own composing be parsed as a second request and answered a second
+        # time. Closing is what the rejected-method path below and the other two
+        # applications already do with a declared payload.
+        close = self.declares_body()
         if self.request_path() == HEALTH_PATH:
-            self.send_json(200, health_payload(), with_body=with_body)
+            self.send_json(200, health_payload(), with_body=with_body, close=close)
         else:
-            self.send_json(404, {"status": "NOT_FOUND"}, with_body=with_body)
+            self.send_json(404, {"status": "NOT_FOUND"}, with_body=with_body, close=close)
 
     def reject_method(self):
         # Closing after a rejected request means an unread request payload can
@@ -125,6 +133,30 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         if len(words) < 2:
             return ""
         return words[1].split("?", 1)[0]
+
+    def declares_body(self):
+        # Whether this request announced a payload, which is the question the framing of
+        # the request after it on this connection turns on. Every answer here is yes
+        # unless the request plainly announced nothing, so a header this program cannot
+        # read counts as a payload rather than as an absent one.
+        if self.headers.get_all("Transfer-Encoding"):
+            return True
+        declared = self.headers.get_all("Content-Length")
+        if not declared:
+            return False
+        if len(declared) > 1:
+            # More than one length frames the request more than one way, so it counts as
+            # a payload whatever the values are.
+            return True
+        length = declared[0].strip(ASCII_BLANKS)
+        if not length:
+            return False
+        # isascii() is what makes isdigit() mean [0-9], so no fullwidth digit passes as a
+        # length here. Tested digit by digit rather than converted, so a length too long
+        # for any conversion still answers this question instead of failing to parse.
+        if not (length.isascii() and length.isdigit()):
+            return True
+        return any(digit != "0" for digit in length)
 
     def send_response(self, code, message=None):
         # Sends the status line, the redacted access record, Date and the cache directive,
