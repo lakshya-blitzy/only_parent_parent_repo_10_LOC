@@ -190,6 +190,24 @@ releases the port. `app.py` and `index.js` exit `0`. `User.java` exits with the 
 128 + signal number a JVM reports when it is signalled - `143` for `SIGTERM` and `130` for
 `SIGINT` - which is expected behaviour and not an error.
 
+For `User.java` that holds for a signal it can receive, and one more property of the Java
+platform decides which those are: a signal already ignored when a JVM starts stays ignored,
+because the JVM does not install a handler over an inherited disposition of ignore, and a signal
+that is ignored is discarded before the process can see it. A shell running a script has no job
+control, and such a shell ignores `SIGINT` on behalf of every background job it starts, so a
+`java User --serve &` written inside a script cannot be stopped by `SIGINT` - send `SIGTERM`,
+which that shell leaves alone for a background job. `app.py` and `index.js` are unaffected:
+`signal.signal` and `process.on` each replace the inherited disposition, so both of them answer
+either signal in any launch mode.
+
+`User.java` says this itself rather than leaving it to be discovered, writing one line to
+standard error beside its startup banner and naming the signal that will stop it instead. It
+writes nothing when both signals can be delivered, and names `SIGKILL` when neither can.
+
+```console
+user-app: SIGINT is ignored by this process and cannot stop this listener; send SIGTERM instead
+```
+
 Startup banners, request records, failure diagnostics and shutdown notices all go to standard
 error, so standard output carries only each application's own original output.
 

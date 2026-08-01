@@ -5,6 +5,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.concurrent.ExecutorService;
@@ -44,6 +46,24 @@ public class User {
     // The one route this program registers, and the backlog it leaves to the system.
     private static final String ROOT_CONTEXT = "/";
     private static final int SYSTEM_BACKLOG = 0;
+
+    // Where this platform publishes the signals this process ignores, and the bits standing
+    // for the two the shutdown hook below exists to answer. A signal already ignored when a
+    // process of this platform starts stays ignored: it will not install a handler over an
+    // inherited disposition of ignore, so the kernel discards such a signal before this
+    // program can see it and the hook is never reached. Nothing in this platform's supported
+    // API reports that state, so the published mask is read instead, and only so the
+    // condition can be said out loud at startup rather than discovered when a stop attempt
+    // does nothing. A shell that starts a background job from a script ignores SIGINT on that
+    // job's behalf, which is the ordinary way a serving process arrives in this state.
+    private static final String IGNORED_SIGNALS_FILE = "/proc/self/status";
+    private static final String IGNORED_SIGNALS_FIELD = "SigIgn:";
+    private static final int IGNORED_SIGNALS_RADIX = 16;
+    private static final long NO_SIGNALS_IGNORED = 0L;
+
+    // Bit n - 1 of that mask stands for signal n, and these are SIGINT and SIGTERM.
+    private static final long SIGINT_BIT = 1L << 1;
+    private static final long SIGTERM_BIT = 1L << 14;
 
     private static final String SERVE_FLAG = "--serve";
 
@@ -366,7 +386,67 @@ public class User {
         }
         report(APP_NAME + " " + APP_VERSION + " serving " + HEALTH_PATH + " on http://"
             + host + ":" + port);
+        String undeliverable = ignoredSignalNotice();
+        if (undeliverable != null) {
+            // Said once, beside the banner, so whoever started this listener learns which
+            // signal will stop it before trying one this process can no longer receive.
+            report(APP_NAME + ": " + undeliverable);
+        }
         return 0;
+    }
+
+    private static String ignoredSignalNotice() {
+        // Only the two signals the hook above exists to answer are reported, and only while
+        // this process ignores them, because that is the one state in which a stop attempt is
+        // discarded instead of answered. Each notice names the signal that will work in its
+        // place, and the text is fixed here rather than assembled from anything outside this
+        // program.
+        long ignored = ignoredSignals();
+        boolean interrupt = (ignored & SIGINT_BIT) != 0;
+        boolean terminate = (ignored & SIGTERM_BIT) != 0;
+        if (interrupt && terminate) {
+            return "SIGINT and SIGTERM are ignored by this process and cannot stop this "
+                + "listener; send SIGKILL instead";
+        }
+        if (interrupt) {
+            return "SIGINT is ignored by this process and cannot stop this listener; send "
+                + "SIGTERM instead";
+        }
+        if (terminate) {
+            return "SIGTERM is ignored by this process and cannot stop this listener; send "
+                + "SIGINT instead";
+        }
+        return null;
+    }
+
+    private static long ignoredSignals() {
+        // A best-effort read, because the mask is a property of the platform rather than of
+        // this program. Every way it can come to nothing - no such file on a platform that
+        // publishes no mask, a file that cannot be read, or one carrying something other than
+        // the expected field and hex digits - answers that no signal is known to be ignored,
+        // so no notice is written and nothing else about this program changes.
+        Path published = Path.of(IGNORED_SIGNALS_FILE);
+        if (!Files.isReadable(published)) {
+            return NO_SIGNALS_IGNORED;
+        }
+        String status;
+        try {
+            status = Files.readString(published, StandardCharsets.UTF_8);
+        } catch (IOException | RuntimeException unreadable) {
+            return NO_SIGNALS_IGNORED;
+        }
+        for (String line : status.split("\n")) {
+            if (!line.startsWith(IGNORED_SIGNALS_FIELD)) {
+                continue;
+            }
+            String mask = trimBlanks(line.substring(IGNORED_SIGNALS_FIELD.length()));
+            try {
+                return Long.parseUnsignedLong(mask, IGNORED_SIGNALS_RADIX);
+            } catch (NumberFormatException unreadable) {
+                return NO_SIGNALS_IGNORED;
+            }
+        }
+        return NO_SIGNALS_IGNORED;
     }
 
     private static void limitRequestHandling() {
