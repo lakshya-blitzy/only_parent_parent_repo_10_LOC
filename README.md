@@ -59,13 +59,15 @@ A `HEAD` reply carries no body: it is the status line and the headers of its `GE
 with nothing after them, on `/health` and on any other path alike. Every other method does
 receive the body named above.
 
-Every request target that names a path is routed on those terms by all three applications, and a
-target that names no path they can match - `//health`, whose parsed path is empty, the asterisk
-form `*`, or one that is not a valid URI - is answered exactly as any other unmatched path is. A
-request line that an application's own runtime rejects before routing is answered by that runtime
-instead: `index.js` answers a target that is not addressed to a path, such as `foo`, with
-`400 Bad Request` and the body `{"status":"BAD_REQUEST"}`, carrying the same media type and cache
-policy as every other reply.
+A request target is compared exactly as the request line carried it, so nothing is an alias of
+`/health`: `///health`, `//x/health` and an absolute-form `http://host/health` all answer as any
+other unmatched path does, in all three applications. `app.py` routes every target it is given,
+including the asterisk form `*` and one that is not addressed to a path at all. Where a request
+line is rejected by an application's own runtime before routing, that runtime answers it:
+`index.js` answers a target that is not addressed to a path, such as `foo`, with `400 Bad Request`
+and the body `{"status":"BAD_REQUEST"}`, carrying the same media type and cache policy as every
+other reply. `User.java` answers three target forms through the Java platform's server rather than
+through the table and the paragraph above; they are named in the wire format notes below.
 
 ### Notes on the wire format
 
@@ -75,23 +77,25 @@ policy as every other reply.
   media type any of them has to be taught.
 - `Cache-Control: no-store` is sent rather than a freshness lifetime, because `timestamp` is
   generated for each request and serving a cached copy would defeat it.
-- `User.java` serves through the Java platform's own HTTP server, `com.sun.net.httpserver`, with
-  one handler registered at the root. That server routes on the request target parsed as a URI,
-  and a target that parses to no path - `//health`, whose path is empty, or `*`, which is not a
-  path at all - matches no route there. So the application owns the listening socket it is
-  reached on, reads the target off each request line as it arrives, and where a target names no
-  route it forwards the root in its place; the request reaches the handler, which answers it as
-  the tables above say an unmatched path is answered. The server itself listens on a loopback
-  address the system assigns at every start, reached by this application and by nothing off this
-  host; the port named under Configuration below is the one every client uses. Two of its
-  behaviours differ from the other two applications' and are properties of that platform rather
-  than omissions here:
+- `User.java` serves through the Java platform's own HTTP server, `com.sun.net.httpserver`,
+  bound directly to the configured address with one handler registered at the root. Three of its
+  behaviours are properties of that platform rather than omissions here:
   - It renders response field names with a single leading capital - `Content-type`,
     `Content-length`, `Cache-control`. Field names are case insensitive, so these responses
     carry the same headers as the other two applications'.
   - It sends no `Content-length` on a `HEAD` reply, because the no-body form of its API
-    suppresses that field. This is a recorded limitation, and an acceptable one for a
-    liveness probe.
+    suppresses that field. That is a recorded limitation of that reply.
+  - It matches a handler on the path it parses out of the request target, and a handler path must
+    begin with a slash. Three target forms parse to no such path - `//health`, whose path parses
+    empty, the asterisk form `*`, and a target carrying no leading slash - and that server answers
+    those itself, with `404` and its own `text/html` page - a page, not an empty body, even for a
+    `HEAD` - before the handler is reached. Those three are the only targets on which `User.java`
+    does not answer as this section describes; every other target reaches the handler, which
+    answers on the terms set out above. The platform's reply cannot be replaced from inside
+    that server: no handler can be registered for an empty path, and every hook it offers - a
+    filter, an authenticator, a handler predicate - runs only once a handler has already been
+    matched. Answering those three forms here instead would mean placing a second listener in
+    front of the platform's server, which this repository does not do.
 
 ## Example
 
