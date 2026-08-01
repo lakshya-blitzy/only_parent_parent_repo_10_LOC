@@ -304,11 +304,20 @@ public class User {
         // for a method not served there, 404 for every other path - so no other text leaves this
         // program as a response body. A context is matched on the path parsed out of the request
         // target and a context path must begin with a slash, so the root matches every path a
-        // client can address. A target that parses to no path at all - //health, whose path
-        // parses empty, the asterisk form, or one carrying no leading slash - is answered by this
-        // platform itself before any context is consulted; that is a property of the platform's
-        // server rather than a route left unwritten here, and it is not worked around, because
-        // doing so would mean putting something other than this server in front of it.
+        // client can address.
+        //
+        // What this platform will not route it answers itself, before any context is consulted:
+        // a request line it cannot split into three tokens or whose tokens are separated by more
+        // than one blank, a target that is not a legal URI, a target it can parse but whose path
+        // matches no context - //health, whose path parses empty, the asterisk form, or one
+        // carrying no leading slash - a Content-Length it cannot read as a number or two of them
+        // that disagree, and a header key holding an illegal character. Each of those gets its
+        // own text/html page, 400 or 404 according to the step that refused it, carrying neither
+        // Date nor Cache-Control; a request arriving with more than two hundred header fields
+        // gets no reply at all. That is a property of the platform's server rather than a route
+        // left unwritten here, and it is not worked around, because doing so would mean putting
+        // something other than this server in front of it. The README records the same set, and
+        // the two must be kept in step.
         server.createContext(ROOT_CONTEXT, exchange -> {
             try (HttpExchange open = exchange) {
                 handleRequest(open);

@@ -29,6 +29,11 @@ Every application answers the same request on its own port.
 | `Content-Length` | set on the `GET` response |
 | Encoding | UTF-8 |
 
+Every value in this table is a property of the responses these applications compose for
+themselves, `Cache-Control: no-store` included. `User.java` also has request forms that the
+Java platform answers before its handler runs, and those replies carry neither `Cache-Control`
+nor `Date`; they are set out in the wire format notes below.
+
 ### Response body
 
 The body is a JSON object carrying exactly four members, all of them strings, emitted in this
@@ -53,6 +58,7 @@ disclose internal detail.
 | Any other method on `/health` | `405 Method Not Allowed` with `Allow: GET, HEAD` and the body `{"status":"METHOD_NOT_ALLOWED"}` |
 | `GET` on any other path | `404 Not Found` with the body `{"status":"NOT_FOUND"}` |
 | `HEAD` on any other path | `404 Not Found` with the same headers and an empty body |
+| A request an application's own runtime refuses before routing | that runtime's own status with a JSON body; the shape differs by language and is named below |
 | A port that cannot be bound at startup | one readable diagnostic on standard error and a non-zero exit status, with no traceback and no stack trace |
 
 A `HEAD` reply carries no body: it is the status line and the headers of its `GET` counterpart
@@ -62,12 +68,27 @@ receive the body named above.
 A request target is compared exactly as the request line carried it, so nothing is an alias of
 `/health`: `///health`, `//x/health` and an absolute-form `http://host/health` all answer as any
 other unmatched path does, in all three applications. `app.py` routes every target it is given,
-including the asterisk form `*` and one that is not addressed to a path at all. Where a request
-line is rejected by an application's own runtime before routing, that runtime answers it:
-`index.js` answers a target that is not addressed to a path, such as `foo`, with `400 Bad Request`
-and the body `{"status":"BAD_REQUEST"}`, carrying the same media type and cache policy as every
-other reply. `User.java` answers three target forms through the Java platform's server rather than
-through the table and the paragraph above; they are named in the wire format notes below.
+including the asterisk form `*` and one that is not addressed to a path at all.
+
+Where an application's own runtime refuses a request before routing, that runtime answers it,
+and the shape of that reply differs by language.
+
+- `app.py` answers `{"status":"ERROR","code":N}`, naming the status it chose: `400` for a
+  request line it cannot read, `414` for a request target longer than it accepts, `431` from a
+  hundred header fields upwards, `505` for an HTTP version it does not implement.
+- `index.js` answers `{"status":"BAD_REQUEST"}` with `400`, which is what a target not
+  addressed to a path, such as `foo`, receives there; `{"status":"REQUEST_TIMEOUT"}` with `408`
+  when a client stops sending part-way through; and
+  `{"status":"REQUEST_HEADER_FIELDS_TOO_LARGE"}` with `431` once the header block passes the
+  size its runtime accepts.
+- `User.java` answers such a request through the Java platform's server instead, which is the
+  subject of the wire format notes below.
+
+Both of the JSON shapes above carry `application/json` and `Cache-Control: no-store` like every
+other reply, and neither ever puts request text into a body. `app.py` and `User.java` answer a
+client that stops sending nothing at all: each closes the connection after about ten seconds.
+The `User.java` forms are worth reading in full, because several of them look ordinary and
+several of them are served normally by the other two applications.
 
 ### Notes on the wire format
 
@@ -78,24 +99,50 @@ through the table and the paragraph above; they are named in the wire format not
 - `Cache-Control: no-store` is sent rather than a freshness lifetime, because `timestamp` is
   generated for each request and serving a cached copy would defeat it.
 - `User.java` serves through the Java platform's own HTTP server, `com.sun.net.httpserver`,
-  bound directly to the configured address with one handler registered at the root. Three of its
-  behaviours are properties of that platform rather than omissions here:
-  - It renders response field names with a single leading capital - `Content-type`,
-    `Content-length`, `Cache-control`. Field names are case insensitive, so these responses
-    carry the same headers as the other two applications'.
+  bound directly to the configured address with one handler registered at the root. Some of its
+  behaviour is a property of that platform rather than an omission here:
+  - It renders the response field names it is given with a single leading capital -
+    `Content-type`, `Content-length`, `Cache-control`. Field names are case insensitive, so a
+    reply its handler produced carries the same headers as the other two applications'.
   - It sends no `Content-length` on a `HEAD` reply, because the no-body form of its API
     suppresses that field. That is a recorded limitation of that reply.
-  - It matches a handler on the path it parses out of the request target, and a handler path must
-    begin with a slash. Three target forms parse to no such path - `//health`, whose path parses
-    empty, the asterisk form `*`, and a target carrying no leading slash - and that server answers
-    those itself, with `404` and its own `text/html` page - a page, not an empty body, even for a
-    `HEAD` - before the handler is reached. Those three are the only targets on which `User.java`
-    does not answer as this section describes; every other target reaches the handler, which
-    answers on the terms set out above. The platform's reply cannot be replaced from inside
-    that server: no handler can be registered for an empty path, and every hook it offers - a
-    filter, an authenticator, a handler predicate - runs only once a handler has already been
-    matched. Answering those three forms here instead would mean placing a second listener in
-    front of the platform's server, which this repository does not do.
+  - Some requests never reach the handler at all. That server splits the request line into
+    three tokens, parses the request target as a URI, and then matches a handler on the path it
+    parses out of that target. A handler path must begin with a slash, so the handler at the
+    root matches every parsed path that does. A request the server cannot carry through those
+    steps, or whose parsed path does not begin with a slash, is answered by the platform itself
+    before the handler is reached, with its own `text/html` page - a page, not an empty body,
+    even for a `HEAD`. The forms measured to do so are:
+    - a target that is not a legal URI, such as `/he^alth`, `/a{b}`, `/a|b` or `/a%zz`: `400`.
+      The other two applications answer `404` with `{"status":"NOT_FOUND"}`.
+    - a target it can parse but whose path matches no handler - `//health`, whose parsed path
+      is empty, the asterisk form `*`, or one carrying no leading slash such as `foo`: `404`.
+    - a request line that does not split into three tokens, such as `GET /health` with no HTTP
+      version, or a bare `GET`: `400`. **The other two applications serve `GET /health` with no
+      version as an ordinary request, answering `200` and the health document.**
+    - a request line whose tokens are separated by more than one blank, such as
+      `GET  /health  HTTP/1.1`: `404`. **The other two serve that as an ordinary request too.**
+    - a `Content-Length` it cannot read as a number, two of them that disagree, or a header key
+      holding an illegal character: `400`. This one does not depend on the request target at all.
+    - a request carrying more than two hundred header fields: **no reply at all**, the
+      connection is closed. `app.py` refuses such a request too, but with `431` and a JSON
+      body, from a hundred fields upwards; `index.js` serves it, because its own limit is on
+      the total size of the header block rather than on how many fields it holds.
+
+    Those replies carry **no `Cache-Control` and no `Date`**, and their field names are in the
+    conventional form - `Content-Length`, `Content-Type`, `Connection` - rather than the
+    single-leading-capital form described above, so the endpoint table's header values do not
+    describe them. Two of the pages name the Java exception type the platform caught,
+    `URISyntaxException` or `NumberFormatException`, which is a platform fingerprint; none of
+    them carries a stack trace, a host name, a file system path or any environment value.
+
+    The platform's reply cannot be replaced from inside that server: no handler can be
+    registered for an empty path, and every hook it offers - a filter, an authenticator, a
+    handler predicate - runs only once a handler has already been matched. Answering these forms
+    here instead would mean placing a second listener in front of the platform's server, which
+    this repository does not do. `app.py` and `index.js` are not affected: each of them routes
+    every target it is given, and where its own runtime refuses a request line outright it
+    answers with that runtime's status and a JSON body, as the section above describes.
 
 ## Example
 
@@ -157,11 +204,15 @@ directly from the process environment.
 | `HEALTH_PORT` | listen port for the health listener | `8000` for `app.py`, `3000` for `index.js`, `8080` for `User.java` |
 
 Binding is loopback-only by default, which is the intended secure default: the listener is
-reachable from the host it runs on and from nowhere else unless `HEALTH_HOST` says
-otherwise. A variable that is set but unusable - a port written in anything but one to five
-decimal digits or falling outside 1 to 65535, or a host containing blanks or control
-characters - stops startup with one diagnostic on standard error and a non-zero exit status,
-rather than silently binding the default.
+reachable from the host it runs on and from nowhere else unless `HEALTH_HOST` says otherwise.
+
+Surrounding ASCII blanks are trimmed from both variables, and a value that is empty or entirely
+blank counts as unset: it falls back to the built-in default above rather than stopping startup.
+What does stop startup - with one diagnostic on standard error and a non-zero exit status - is a
+value with something left after trimming that still fails the grammar: a port that is not one to
+five decimal digits, or that falls outside 1 to 65535, or a host with a blank or a control
+character inside it. All three applications apply that grammar identically and word a rejection
+the same way, and none of them quotes the rejected value back.
 
 **The endpoint requires no configuration file.** This repository contains no `package.json`, no
 `requirements.txt`, no `pyproject.toml`, no `pom.xml`, no `build.gradle`, no `.env` and no

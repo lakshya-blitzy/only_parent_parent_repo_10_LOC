@@ -104,8 +104,10 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         # connection. Nothing on this path consumes a request payload, and the framework
         # does not consume one either, so leaving the connection reusable would let a
         # body of its own composing be parsed as a second request and answered a second
-        # time. Closing is what the rejected-method path below and the other two
-        # applications already do with a declared payload.
+        # time. Closing is what the rejected-method path below does as well, and what
+        # User.java does with a declared payload. index.js needs no equivalent: its runtime
+        # accounts for a body left unread, so those bytes never reach its parser as the
+        # request after this one, and it keeps the connection.
         close = self.declares_body()
         if self.request_path() == HEALTH_PATH:
             self.send_json(200, health_payload(), with_body=with_body, close=close)
