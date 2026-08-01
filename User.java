@@ -24,50 +24,38 @@ public class User {
     private static final String STATUS_NOT_FOUND = "NOT_FOUND";
     private static final String STATUS_METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED";
 
-    // The two fields HTTP frames a request payload with. A liveness answer needs no payload,
-    // so a request announcing one is answered without its payload being read: reading a body
-    // is the one thing a client can make this program wait for.
     private static final String CONTENT_LENGTH_HEADER = "Content-Length";
     private static final String TRANSFER_ENCODING_HEADER = "Transfer-Encoding";
 
-    // Three platform settings this listener cannot leave at their defaults, because each
-    // default lets one unfinished request hold the thread serving it for as long as its
-    // sender likes: an unread request body is otherwise read and discarded when the exchange
-    // closes (64k), and nothing bounds how long a request may take to arrive or a reply to
-    // be read (no deadline at all). Discarding nothing and closing a connection that stops
-    // progressing is what keeps this endpoint answerable while such a client is connected.
-    // They are properties rather than API calls, and the platform reads them once as its
-    // server classes initialise, so they are set before the first call into them.
+    // Platform properties rather than API calls, and only honoured if set before the server
+    // is created: nothing is drained on this program's behalf, and a request or reply that
+    // stops progressing is bounded, so no one client can hold a handler thread indefinitely.
     private static final String DRAIN_AMOUNT_PROPERTY = "sun.net.httpserver.drainAmount";
     private static final String MAX_REQUEST_TIME_PROPERTY = "sun.net.httpserver.maxReqTime";
     private static final String MAX_RESPONSE_TIME_PROPERTY = "sun.net.httpserver.maxRspTime";
     private static final String DRAIN_AMOUNT = "0";
 
-    // Seconds, matching the read timeout the Python listener applies to the same contract.
     private static final String MAX_REQUEST_SECONDS = "10";
     private static final String MAX_RESPONSE_SECONDS = "10";
 
-    // What every thread this listener creates is called, numbered from the suffix onwards.
     private static final String HANDLER_THREAD_PREFIX = "-health-";
     private static final long FIRST_HANDLER_THREAD = 0;
 
     private static final String SERVE_FLAG = "--serve";
 
     // One explicit grammar for the overrides - ASCII blanks trimmed, and a port written in
-    // ASCII decimal digits only - so every application reading them accepts the same
-    // values. The vertical tab is written as an octal escape because Java has no \v.
+    // ASCII decimal digits only - so every application reading them accepts the same values.
     private static final String ASCII_BLANKS = " \t\n\013\f\r";
     private static final int PORT_MAX_DIGITS = 5;
     private static final int PORT_MIN = 1;
     private static final int PORT_MAX = 65535;
 
-    // What healthPort() answers for a present but unusable override, which no port is.
     private static final int PORT_REJECTED = -1;
 
     public static void main(String[] args) {
         String name = "Test";
         System.out.println(name);
-        // Opt-in: without --serve the line above is the whole program, exactly as before.
+        // Opt-in: without --serve the line above is the whole program.
         if (hasServeFlag(args)) {
             // Flushed before this process becomes long-running, so the line above reaches a
             // redirected descriptor 1 now rather than at exit.
@@ -76,15 +64,11 @@ public class User {
             if (status != 0) {
                 System.exit(status);
             }
-            // Started: the listener's own non-daemon thread keeps this process alive and the
-            // shutdown hook releases the port when a signal arrives. Returning here instead
-            // of exiting is what leaves the status a signal produces untouched.
+            // Returning rather than exiting leaves the status a signal produces untouched.
         }
     }
 
     private static boolean hasServeFlag(String[] args) {
-        // The first read this program has ever made of its argument vector; anything else
-        // on the command line is ignored.
         for (int index = 0; index < args.length; index++) {
             if (SERVE_FLAG.equals(args[index])) {
                 return true;
@@ -98,10 +82,8 @@ public class User {
         // not the contract's milliseconds.
         String rendered = Instant.now().truncatedTo(ChronoUnit.MILLIS).toString();
         if (rendered.indexOf('.') < 0) {
-            // ISO_INSTANT prints the fewest digits it can, so an instant landing on a whole
-            // second arrives with no fraction at all - about one request in a thousand. The
-            // three zeros are restored here, because a value whose width changed that often
-            // would not be the fixed-width timestamp the other two applications emit.
+            // An instant landing on a whole second renders with no fraction at all, so the
+            // three zeros are restored to keep the timestamp fixed-width.
             return rendered.substring(0, rendered.length() - 1) + ".000Z";
         }
         return rendered;
@@ -119,8 +101,6 @@ public class User {
     }
 
     private static String statusPayload(String status) {
-        // The one shape every reply that is not a health document takes, so no request text
-        // and no internal detail can reach a response body.
         return "{\"status\":" + jsonString(status) + "}";
     }
 
@@ -152,8 +132,6 @@ public class User {
                     break;
                 default:
                     if (character < ' ') {
-                        // Every remaining control character has no shorthand of its own, so
-                        // it is written as the six-character escape JSON requires.
                         escaped.append(unicodeEscape(character));
                     } else {
                         escaped.append(character);
@@ -173,16 +151,13 @@ public class User {
     }
 
     private static String requestPath(HttpExchange exchange) {
-        // getRawPath() excludes the query string and leaves the target exactly as it
-        // arrived, so /health?probe=1 matches while /health/ and an encoded /%68ealth are
-        // targets this program does not serve - the same rule the other two apply.
+        // getRawPath() drops the query string and leaves the target undecoded, so
+        // /health?probe=1 matches while /health/ and an encoded /%68ealth do not.
         String path = exchange.getRequestURI().getRawPath();
         return path == null ? "" : path;
     }
 
     private static boolean declaresBody(HttpExchange exchange) {
-        // HTTP announces a request payload with one of two fields, so their presence is the
-        // whole test: any Transfer-Encoding at all, or a Content-Length above zero.
         if (exchange.getRequestHeaders().getFirst(TRANSFER_ENCODING_HEADER) != null) {
             return true;
         }
@@ -206,7 +181,6 @@ public class User {
                 return true;
             }
         }
-        // A declared length of zero frames no payload, so such a request is served normally.
         return false;
     }
 
@@ -217,17 +191,12 @@ public class User {
         // more, so a request stream left unread closes the connection instead.
         InputStream request = exchange.getRequestBody();
         if (request.read() != -1) {
-            // A byte HTTP's own framing rules say cannot be there. It is discarded and the
-            // stream closed rather than read on, because no request payload has any part in
-            // a liveness answer.
             request.close();
         }
     }
 
     private static void sendJson(HttpExchange exchange, int status, String payload,
             boolean withBody, String allow, boolean close) throws IOException {
-        // Every reply leaves through here, so there is one place where the wire contract is
-        // stated and one place it can be read from.
         byte[] body = payload.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "application/json");
         exchange.getResponseHeaders().set("Cache-Control", "no-store");
@@ -239,8 +208,6 @@ public class User {
             // start of the next request on this connection.
             exchange.getResponseHeaders().set("Connection", "close");
         } else {
-            // This connection is to stay open, which it only can once the request it is
-            // carrying has been read to its end.
             endRequest(exchange);
         }
         if (!withBody) {
@@ -261,19 +228,12 @@ public class User {
         String method = exchange.getRequestMethod();
         String path = requestPath(exchange);
         boolean withBody = !"HEAD".equals(method);
-        // The method is tested before the path so that a rejected method is answered the
-        // same way on every target, not only on the one resource this program serves. Those
-        // replies already end their connection, so they need no payload test of their own.
         if (!"GET".equals(method) && !"HEAD".equals(method)) {
             rejectMethod(exchange, path, withBody);
             return;
         }
-        // Read once and carried into both replies below. A declared payload changes nothing
-        // about which reply a request receives - the status and body are the ones this
-        // contract specifies either way - only whether the connection survives it: the
-        // payload is never read, because waiting for a body a sender never sends is exactly
-        // how one client could keep this endpoint from answering, and bytes left unread on a
-        // kept-alive connection would be misread as the request after it.
+        // A declared payload is closed rather than read, so it can neither stall this reply
+        // nor be misread as the request after it on a kept-alive connection.
         boolean carriesPayload = declaresBody(exchange);
         if (!HEALTH_PATH.equals(path)) {
             sendJson(exchange, 404, statusPayload(STATUS_NOT_FOUND), withBody, null,
@@ -285,8 +245,6 @@ public class User {
 
     private static void rejectMethod(HttpExchange exchange, String path, boolean withBody)
             throws IOException {
-        // The served resource answers 405 with its Allow header, every other target the
-        // same 404, and either way the connection is closed.
         if (!HEALTH_PATH.equals(path)) {
             sendJson(exchange, 404, statusPayload(STATUS_NOT_FOUND), withBody, null, true);
             return;
@@ -318,28 +276,22 @@ public class User {
         try {
             server = HttpServer.create(new InetSocketAddress(host, port), 0);
         } catch (IOException error) {
-            // One readable line and a non-zero status instead of a stack trace. A host that
-            // arrived in HEALTH_HOST is named by its variable rather than quoted back, since
-            // only the resolver can discover that the word names nothing.
+            // One readable line and a non-zero status instead of a stack trace.
             String where = DEFAULT_HOST.equals(host) ? host + ":" + port
                 : "the address named by HEALTH_HOST, port " + port;
             report(APP_NAME + ": cannot bind " + where + ": " + bindReason(error));
             return 1;
         }
-        // Requests are answered on threads of this listener's own rather than on the one
-        // thread it dispatches from, and on one such thread each, so a client that stops
-        // sending holds nothing but the thread reading it and the endpoint keeps answering
-        // everyone else.
+        // Requests are answered on this listener's own threads rather than on the one it
+        // dispatches from, so a client that stops sending holds nothing but its own thread.
         ExecutorService handlers = handlerPool();
         server.setExecutor(handlers);
-        // One context at the root and one handler: the rule in handleRequest is the whole
-        // route table, so every target reaches the same decision.
         server.createContext("/", exchange -> {
             try (HttpExchange open = exchange) {
                 handleRequest(open);
             } catch (IOException | RuntimeException error) {
-                // A probe hanging up mid-reply is routine, so the condition is named on one
-                // line, without a trace, and the listener carries on serving.
+                // The condition is named on one line, without a trace, and the listener
+                // carries on serving.
                 report(APP_NAME + ": request handling failed: "
                     + error.getClass().getSimpleName());
             }
@@ -361,25 +313,14 @@ public class User {
     }
 
     private static void limitRequestHandling() {
-        // Nothing is discarded on this program's behalf, and a request that stops arriving or
-        // a reply that stops being read is given a deadline instead of the platform's none,
-        // so the work one client can create for this listener is finite.
         System.setProperty(DRAIN_AMOUNT_PROPERTY, DRAIN_AMOUNT);
         System.setProperty(MAX_REQUEST_TIME_PROPERTY, MAX_REQUEST_SECONDS);
         System.setProperty(MAX_RESPONSE_TIME_PROPERTY, MAX_RESPONSE_SECONDS);
     }
 
     private static ExecutorService handlerPool() {
-        // One thread per exchange rather than a fixed set of them, because the platform reads
-        // a request head on the thread it hands the exchange to: with a fixed set, that many
-        // clients that stop sending mid-head occupy every thread and this endpoint answers
-        // nobody until their deadline expires - the same denial a single client could cause
-        // when handling ran on the dispatch thread. A virtual thread is what makes one per
-        // exchange affordable: it costs a few kilobytes rather than a megabyte of stack, it
-        // releases its carrier while a read waits, and it is always a daemon, so what keeps
-        // this process alive is still the listener's own thread and the status a signal
-        // produces is unchanged. What bounds the work one client can create is the request
-        // and response deadline set in limitRequestHandling(), not a thread count.
+        // One virtual thread per exchange rather than a fixed pool, so clients that stop
+        // sending cannot monopolise a small set of handler threads.
         return Executors.newThreadPerTaskExecutor(Thread.ofVirtual()
             .name(APP_NAME + HANDLER_THREAD_PREFIX, FIRST_HANDLER_THREAD)
             .factory());
@@ -408,8 +349,6 @@ public class User {
             return DEFAULT_HOST;
         }
         for (int index = 0; index < requested.length(); index++) {
-            // A host name or address carries no blanks and no control characters, so
-            // anything else is refused rather than repaired.
             if (isUnprintable(requested.charAt(index))) {
                 return null;
             }
@@ -422,8 +361,8 @@ public class User {
                 || Character.isSpaceChar(character)) {
             return true;
         }
-        // The remaining categories that render nothing at all: format, surrogate, private
-        // use and unassigned code points.
+        // Refused as well, to keep a host value unambiguous: format, surrogate, private use
+        // and unassigned code points.
         int category = Character.getType(character);
         return category == Character.FORMAT || category == Character.SURROGATE
             || category == Character.PRIVATE_USE || category == Character.UNASSIGNED;
@@ -434,9 +373,6 @@ public class User {
         if (requested.isEmpty()) {
             return DEFAULT_PORT;
         }
-        // One to five ASCII decimal digits and nothing else, checked before any conversion,
-        // so no sign, hexadecimal or fullwidth form can reach the parse below - and five
-        // digits cannot overflow the value it returns.
         if (requested.length() > PORT_MAX_DIGITS || !isAsciiDigits(requested)) {
             return PORT_REJECTED;
         }
@@ -455,8 +391,7 @@ public class User {
     }
 
     private static String bindReason(IOException error) {
-        // A bind failure names its condition without quoting the address, so its message
-        // stands as it is; one that carries no message is named by its type instead.
+        // A failure that carries no message is named by its type instead.
         String message = error.getMessage();
         if (message == null || message.isEmpty()) {
             return error.getClass().getSimpleName();
