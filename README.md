@@ -26,7 +26,7 @@ Every application answers the same request on its own port.
 | Status when healthy | `200 OK` |
 | `Content-Type` | `application/json` |
 | `Cache-Control` | `no-store` |
-| `Content-Length` | set on the `GET` response |
+| `Content-Length` | set on the `GET` response, and on the `HEAD` response as the length the withheld body would have had |
 | Encoding | UTF-8 |
 
 ### Response body
@@ -52,6 +52,7 @@ disclose internal detail.
 | `HEAD /health` | `200` with the same headers and an empty body |
 | Any other method on `/health` | `405 Method Not Allowed` with `Allow: GET, HEAD` and the body `{"status":"METHOD_NOT_ALLOWED"}` |
 | Any other path | `404 Not Found` with the body `{"status":"NOT_FOUND"}` |
+| A request an application cannot read as sent | an error status - which one depends on the fault, `400` most often - with a JSON body naming the refusal, never an HTML error page |
 | A port that cannot be bound at startup | one readable diagnostic on standard error and a non-zero exit status, with no traceback and no stack trace |
 
 ### Notes on the wire format
@@ -61,10 +62,15 @@ disclose internal detail.
   every client without special handling.
 - `Cache-Control: no-store` is sent rather than a freshness lifetime, because `timestamp` is
   generated for each request and serving a cached copy would defeat it.
-- `User.java` renders response field names with a single leading capital - `Content-type`,
-  `Content-length`, `Cache-control` - and sends no `Content-length` on a `HEAD` reply. Both are
-  properties of the Java platform's own HTTP server rather than omissions here; field names are
-  case insensitive, so these responses carry the same headers as the other two applications'.
+- All three applications spell every response field name the same way - `Content-Type`,
+  `Content-Length`, `Cache-Control` - and a `HEAD` reply carries the same fields as the `GET` it
+  stands in for, `Content-Length` among them, withholding only the body.
+- `User.java` writes its replies itself, on a listening socket of its own, rather than handing
+  the port to the Java platform's own HTTP server. That server routes on a request target
+  parsed as a URI, which leaves a target such as `//health` with no path to route on and
+  answers it with a platform HTML page before any handler is reached. Reading the target from
+  the request line instead is what lets every request target this application is sent - that
+  one included - be answered with the JSON above.
 
 ## Example
 
