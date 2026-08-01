@@ -58,6 +58,14 @@ def report(text):
 class HealthRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    # A request line carrying no version leaves the version at this default, and the
+    # framework suppresses the status line and every header whenever that default is the
+    # 0.9 one it ships. Naming 1.1 here is what lets a version-less or unreadable request
+    # line be answered with a status line, application/json and Cache-Control instead of a
+    # bare body. A request line that does carry a version overwrites this before any
+    # response is written, so nothing else about the contract changes.
+    default_request_version = "HTTP/1.1"
+
     # A bounded read timeout keeps an idle or half-open client from holding a
     # worker thread for the lifetime of the process.
     timeout = 10
@@ -105,17 +113,37 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"status": "NOT_FOUND"}, close=True)
 
     def request_path(self):
+        # The target exactly as the request line carried it, because the parsed target is
+        # not it: the framework rewrites a target that opens with two slashes down to one
+        # before any handler is reached, so //health, ///health and //x/health would all be
+        # answered as aliases of /health that this contract does not declare. The request
+        # line is recorded before that rewrite, so the target is read back from it here.
         # Only the query string is dropped, so /health?probe=1 matches while /health/ and
-        # /health#extra are targets this program does not serve.
-        return self.path.split("?", 1)[0]
+        # /health#extra are targets this program does not serve - the same rule the other
+        # two applications apply to their own request target.
+        words = self.requestline.split()
+        if len(words) < 2:
+            return ""
+        return words[1].split("?", 1)[0]
 
     def send_response(self, code, message=None):
-        # Sends the status line, the redacted access record and Date, but not the inherited
-        # Server header, whose value would name the library and interpreter version on
-        # every response. Overridden here so it holds for send_error() responses too.
+        # Sends the status line, the redacted access record, Date and the cache directive,
+        # but not the inherited Server header, whose value would name the library and
+        # interpreter version on every response. Every response this program writes passes
+        # through here, including the framework's own send_error() ones, which is why the
+        # cache directive is set here rather than alongside the other headers: the document
+        # is generated per request, so none of them may be served from a cache.
+        #
+        # The reason phrase is dropped rather than passed on, so the status line always
+        # carries the one registered for the code. The framework composes its own phrase for
+        # a request it cannot parse by quoting the request line inside it, which would
+        # reflect whatever bytes a client sent back to that client on the first line of the
+        # response; withholding it keeps request text out of every part of every reply, not
+        # only the body.
         self.log_request(code)
-        self.send_response_only(code, message)
+        self.send_response_only(code)
         self.send_header("Date", self.date_time_string())
+        self.send_header("Cache-Control", "no-store")
 
     def send_json(self, status, payload, with_body=True, allow=None, close=False):
         # Compact separators are part of the wire contract: the default ", " and ": "
@@ -124,7 +152,6 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
         if allow is not None:
             self.send_header("Allow", allow)
         if close:

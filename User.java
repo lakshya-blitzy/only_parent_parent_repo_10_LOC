@@ -151,10 +151,17 @@ public class User {
     }
 
     private static String requestPath(HttpExchange exchange) {
-        // getRawPath() drops the query string and leaves the target undecoded, so
-        // /health?probe=1 matches while /health/ and an encoded /%68ealth do not.
-        String path = exchange.getRequestURI().getRawPath();
-        return path == null ? "" : path;
+        // The target exactly as the request line carried it, because the parsed path is not
+        // the target: this platform parses the target as a URI, so //x/health arrives with
+        // its authority in a separate component and a parsed path of /health, and ///health
+        // and an absolute-form target do the same. Routing on the parsed path would answer
+        // all of them as aliases of /health, which the contract does not declare. Only the
+        // query string is dropped, so /health?probe=1 matches while /health/ and an encoded
+        // /%68ealth do not - the same rule the other two applications apply to their own
+        // request target.
+        String target = exchange.getRequestURI().toString();
+        int query = target.indexOf('?');
+        return query < 0 ? target : target.substring(0, query);
     }
 
     private static boolean declaresBody(HttpExchange exchange) {
@@ -286,6 +293,19 @@ public class User {
         // dispatches from, so a client that stops sending holds nothing but its own thread.
         ExecutorService handlers = handlerPool();
         server.setExecutor(handlers);
+        // One context, at the root, so every request this program is given is answered by
+        // sendJson() below and no other text ever leaves as a response body. Two families of
+        // request never reach it, because this platform answers them itself with its own
+        // text/html page before any context is consulted: a request line or target it cannot
+        // parse, and a target whose parsed path cannot match a context - an empty one, as
+        // //health has, or one that is not a path at all, as * and a target with no leading
+        // slash are. Neither is reachable from here. The reply is written by a private class
+        // of a package this module does not export; a context path may not begin with
+        // anything but a slash, so no context can be registered that an empty parsed path
+        // would match; and every hook this API offers - a filter, an authenticator, a handler
+        // predicate - runs only once a context has already been found. Those replies still
+        // carry the status this contract asks for, and carry no host, no path, no value from
+        // the environment and no stack trace.
         server.createContext("/", exchange -> {
             try (HttpExchange open = exchange) {
                 handleRequest(open);
@@ -297,16 +317,41 @@ public class User {
             }
         });
         // Registered before start(), so a signal arriving in the same instant as the first
-        // request still finds a hook that releases the port.
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            report(APP_NAME + ": shutting down");
-            server.stop(0);
-            // Stopping the listener leaves the threads it handed work to running, so they
-            // are ended here as well; a request still in flight is abandoned, which is what
-            // a signalled shutdown asks for.
-            handlers.shutdownNow();
-        }));
-        server.start();
+        // request still finds a hook that releases the port. A signal can also arrive before
+        // this line, because create() above binds the port rather than start() below: the
+        // listener is reachable while this method is still walking towards the hook. Shutdown
+        // is then already under way, and this platform refuses that state twice over -
+        // registering a hook once shutdown has begun, and starting a listener whose hook has
+        // already stopped it, both throw. Left alone either throw would leave main by way of
+        // the default handler, which prints a trace to the error stream and would be cut off
+        // mid-sentence by the exit racing it. Neither is a condition to hand the user a trace
+        // for, so each is answered instead with the one notice and the released port a
+        // completed startup would have given them.
+        boolean hooked = false;
+        try {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                report(APP_NAME + ": shutting down");
+                server.stop(0);
+                // Stopping the listener leaves the threads it handed work to running, so they
+                // are ended here as well; a request still in flight is abandoned, which is what
+                // a signalled shutdown asks for.
+                handlers.shutdownNow();
+            }));
+            hooked = true;
+            server.start();
+        } catch (IllegalStateException shuttingDown) {
+            if (!hooked) {
+                // The hook was refused, so nothing else will report this shutdown or close
+                // the socket create() opened; when it was accepted it does both itself, and
+                // reporting here as well would announce the one shutdown twice.
+                report(APP_NAME + ": shutting down");
+                server.stop(0);
+                handlers.shutdownNow();
+            }
+            // Returning rather than exiting leaves the status the signal produces untouched,
+            // and leaves the error stream carrying that one notice and nothing else.
+            return 0;
+        }
         report(APP_NAME + " " + APP_VERSION + " serving " + HEALTH_PATH + " on http://"
             + host + ":" + port);
         return 0;
