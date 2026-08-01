@@ -58,8 +58,15 @@ disclose internal detail.
 | Any other method on `/health` | `405 Method Not Allowed` with `Allow: GET, HEAD` and the body `{"status":"METHOD_NOT_ALLOWED"}` |
 | `GET` on any other path | `404 Not Found` with the body `{"status":"NOT_FOUND"}` |
 | `HEAD` on any other path | `404 Not Found` with the same headers and an empty body |
-| A request an application's own runtime refuses before routing | that runtime's own status with a JSON body; the shape differs by language and is named below |
+| A request an application's own runtime refuses before routing | that runtime's own status, and a reply of that runtime's own shape rather than this table's: `app.py` and `index.js` answer with a JSON body, while `User.java`'s platform answers with its own `text/html` page. Every measured form is named below |
 | A port that cannot be bound at startup | one readable diagnostic on standard error and a non-zero exit status, with no traceback and no stack trace |
+
+The first four rows describe the replies each application composes for itself. The fifth is the
+exception, and it is not a footnote: a request the runtime beneath an application refuses before
+routing never reaches the code that composes those rows, so its status, headers and body are that
+runtime's rather than this table's. For `User.java` the forms that go that way include `//health`,
+which its platform answers with a `text/html` page carrying no `Cache-Control`, and not with the
+JSON `404` the other two applications return for it.
 
 A `HEAD` reply carries no body: it is the status line and the headers of its `GET` counterpart
 with nothing after them, on `/health` and on any other path alike. Every other method does
@@ -68,10 +75,12 @@ receive the body named above.
 A request target is compared exactly as the request line carried it, so nothing is an alias of
 `/health`: `///health`, `//x/health` and an absolute-form `http://host/health` all answer as any
 other unmatched path does, in all three applications. `app.py` routes every target it is given,
-including the asterisk form `*` and one that is not addressed to a path at all.
+including the asterisk form `*` and one that is not addressed to a path at all. `index.js` routes
+`*` as well, and its runtime refuses a target carrying no leading slash, such as `foo`, with
+`400`. `User.java` is the one application whose platform answers `//health`, `*` and `foo` itself,
+before its handler runs.
 
-Where an application's own runtime refuses a request before routing, that runtime answers it,
-and the shape of that reply differs by language.
+The shapes those runtime-refused replies take, application by application:
 
 - `app.py` answers `{"status":"ERROR","code":N}`, naming the status it chose: `400` for a
   request line it cannot read, `414` for a request target longer than it accepts, `431` from a
@@ -115,8 +124,12 @@ several of them are served normally by the other two applications.
     even for a `HEAD`. The forms measured to do so are:
     - a target that is not a legal URI, such as `/he^alth`, `/a{b}`, `/a|b` or `/a%zz`: `400`.
       The other two applications answer `404` with `{"status":"NOT_FOUND"}`.
-    - a target it can parse but whose path matches no handler - `//health`, whose parsed path
-      is empty, the asterisk form `*`, or one carrying no leading slash such as `foo`: `404`.
+    - a target it can parse but whose path matches no handler: `404`. `//health` is the form
+      worth knowing, because it looks like the endpoint and is not - a target opening with two
+      slashes parses as a network-path reference, so `health` is read as its authority and its
+      path is left empty. The asterisk form `*` and a target carrying no leading slash such as
+      `foo` reach the same refusal, their paths being `*` and `foo`, neither of which a handler
+      path can match.
     - a request line that does not split into three tokens, such as `GET /health` with no HTTP
       version, or a bare `GET`: `400`. **The other two applications serve `GET /health` with no
       version as an ordinary request, answering `200` and the health document.**
@@ -200,12 +213,30 @@ which that shell leaves alone for a background job. `app.py` and `index.js` are 
 `signal.signal` and `process.on` each replace the inherited disposition, so both of them answer
 either signal in any launch mode.
 
-`User.java` says this itself rather than leaving it to be discovered, writing one line to
-standard error beside its startup banner and naming the signal that will stop it instead. It
-writes nothing when both signals can be delivered, and names `SIGKILL` when neither can.
+That state is decided by the launch, before this program runs, so the launch is where it is
+undone. Either of these leaves `SIGINT` deliverable, after which `User.java` answers it exactly
+as the other two do - shutdown notice on standard error, port released, exit `130`:
 
 ```console
-user-app: SIGINT is ignored by this process and cannot stop this listener; send SIGTERM instead
+$ java User --serve        # foreground: Ctrl-C, or a SIGINT sent from elsewhere, stops it
+$ set -m                   # in a script: turn job control on before the launch, then
+$ java User --serve &      # this job keeps SIGINT, so kill -INT on its pid stops it
+```
+
+Asking the platform for a signal handler instead does not work, and is therefore not done here:
+its unsupported signal API reports the inherited ignore straight back and installs nothing, so
+the signal stays undeliverable - and naming that API in this file would cost the warning-free
+`javac -Xlint:all` build this repository keeps. `SIGTERM` needs none of this, because a shell
+leaves it alone for a background job, so a script that stops the listener with `SIGTERM` works
+in every launch mode.
+
+`User.java` says this itself rather than leaving it to be discovered, writing one line to
+standard error beside its startup banner that names both the signal that will stop it as
+launched and the launch that would make the ignored one work. It writes nothing when both
+signals can be delivered, and names `SIGKILL` when neither can.
+
+```console
+user-app: SIGINT is ignored by this process and cannot stop this listener; send SIGTERM instead, or start it where SIGINT is not ignored - in the foreground, or with job control enabled (set -m)
 ```
 
 Startup banners, request records, failure diagnostics and shutdown notices all go to standard

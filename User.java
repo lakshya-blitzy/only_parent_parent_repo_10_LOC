@@ -51,11 +51,16 @@ public class User {
     // for the two the shutdown hook below exists to answer. A signal already ignored when a
     // process of this platform starts stays ignored: it will not install a handler over an
     // inherited disposition of ignore, so the kernel discards such a signal before this
-    // program can see it and the hook is never reached. Nothing in this platform's supported
-    // API reports that state, so the published mask is read instead, and only so the
-    // condition can be said out loud at startup rather than discovered when a stop attempt
-    // does nothing. A shell that starts a background job from a script ignores SIGINT on that
-    // job's behalf, which is the ordinary way a serving process arrives in this state.
+    // program can see it and the hook is never reached. Requesting a handler through this
+    // platform's unsupported signal API does not change that: it reports the inherited
+    // ignore back and installs nothing, so the signal stays undeliverable. Nothing in this
+    // platform's supported API reports that state either, so the published mask is read
+    // instead, and only so the condition can be said out loud at startup rather than
+    // discovered when a stop attempt does nothing. A shell that starts a background job from
+    // a script ignores SIGINT on that job's behalf, which is the ordinary way a serving
+    // process arrives in this state; a shell with job control enabled does not, so the same
+    // job started in the foreground, or with job control, leaves SIGINT deliverable and the
+    // hook below reachable. The notice written at startup names both remedies.
     private static final String IGNORED_SIGNALS_FILE = "/proc/self/status";
     private static final String IGNORED_SIGNALS_FIELD = "SigIgn:";
     private static final int IGNORED_SIGNALS_RADIX = 16;
@@ -389,7 +394,8 @@ public class User {
         String undeliverable = ignoredSignalNotice();
         if (undeliverable != null) {
             // Said once, beside the banner, so whoever started this listener learns which
-            // signal will stop it before trying one this process can no longer receive.
+            // signal will stop it - and how to start it so the other one would too - before
+            // trying one this process can no longer receive.
             report(APP_NAME + ": " + undeliverable);
         }
         return 0;
@@ -398,23 +404,26 @@ public class User {
     private static String ignoredSignalNotice() {
         // Only the two signals the hook above exists to answer are reported, and only while
         // this process ignores them, because that is the one state in which a stop attempt is
-        // discarded instead of answered. Each notice names the signal that will work in its
-        // place, and the text is fixed here rather than assembled from anything outside this
-        // program.
+        // discarded instead of answered. Each notice carries both remedies: the signal that
+        // will stop this listener as it stands, and the way to start it so the ignored one
+        // reaches it after all. The text is fixed here rather than assembled from anything
+        // outside this program.
         long ignored = ignoredSignals();
         boolean interrupt = (ignored & SIGINT_BIT) != 0;
         boolean terminate = (ignored & SIGTERM_BIT) != 0;
         if (interrupt && terminate) {
             return "SIGINT and SIGTERM are ignored by this process and cannot stop this "
-                + "listener; send SIGKILL instead";
+                + "listener; send SIGKILL instead, or start it again where neither signal "
+                + "is ignored";
         }
         if (interrupt) {
             return "SIGINT is ignored by this process and cannot stop this listener; send "
-                + "SIGTERM instead";
+                + "SIGTERM instead, or start it where SIGINT is not ignored - in the "
+                + "foreground, or with job control enabled (set -m)";
         }
         if (terminate) {
             return "SIGTERM is ignored by this process and cannot stop this listener; send "
-                + "SIGINT instead";
+                + "SIGINT instead, or start it again where SIGTERM is not ignored";
         }
         return null;
     }
